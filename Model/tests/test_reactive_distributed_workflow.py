@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import ast
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,50 @@ pytest.importorskip("flytekit")
 from flytekit.types.directory import FlyteDirectory
 
 from Platform.pipelines import distributed_training, workflows
+
+
+def test_flyte_entrypoints_do_not_use_mutable_defaults():
+    pipelines_root = Path(workflows.__file__).parent
+    mutable_defaults = []
+
+    for source_path in sorted(pipelines_root.glob("*.py")):
+        tree = ast.parse(source_path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                continue
+            decorators = set()
+            for decorator in node.decorator_list:
+                target = decorator.func if isinstance(
+                    decorator,
+                    ast.Call,
+                ) else decorator
+                if isinstance(target, ast.Name):
+                    decorators.add(target.id)
+                elif isinstance(target, ast.Attribute):
+                    decorators.add(target.attr)
+            if not decorators.intersection(
+                {"task", "workflow", "dynamic"},
+            ):
+                continue
+
+            arguments = node.args.posonlyargs + node.args.args
+            defaults = [None] * (
+                len(arguments) - len(node.args.defaults)
+            ) + list(node.args.defaults)
+            for argument, default in zip(arguments, defaults):
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    mutable_defaults.append(
+                        (
+                            source_path.name,
+                            node.name,
+                            argument.arg,
+                        )
+                    )
+
+    assert mutable_defaults == []
 
 
 def test_reviewed_ray_topologies_have_fixed_worker_groups():
