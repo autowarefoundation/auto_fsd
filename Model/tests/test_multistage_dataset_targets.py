@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import json
+import ast
 import hashlib
 import io
+import json
+from pathlib import Path
 import tarfile
 import types
 
@@ -13,6 +15,7 @@ import numpy as np
 import pytest
 
 import data_parsing.l2d.navigation as l2d_navigation
+import data_parsing.l2d.osm_graph_builder as osm_graph_builder
 from data_parsing.l2d.osm_graph_builder import (
     L2D_OSM_GRAPH_ADAPTER_VERSION,
     OSMWayRecord,
@@ -381,6 +384,37 @@ def test_osm_graph_snapshot_encoding_is_order_independent():
     assert payload["adapter_version"] == L2D_OSM_GRAPH_ADAPTER_VERSION
     assert [node["id"] for node in payload["nodes"]] == ["1", "2", "3"]
     assert len(payload["edges"]) == 3
+
+
+def test_osm_graph_snapshot_indexes_normalized_nodes_once():
+    source = Path(osm_graph_builder.__file__).read_text()
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "encode_l2d_osm_graph_snapshot"
+    )
+    index_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "set"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "normalized_nodes"
+    ]
+    way_loop = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "way"
+    )
+
+    assert len(index_calls) == 1
+    assert index_calls[0].lineno < way_loop.lineno
 
 
 def test_nuplan_visibility_helpers_use_metric_geometry():
