@@ -42,6 +42,7 @@ else:  # Python 3.10 (local dev venv); CI runs 3.12
     from typing_extensions import NotRequired
 
 from data_processing.contract_versions import UID_SCHEMA_VERSION
+from data_processing.source_revisions import L2D_DATA_REVISION
 
 from .camera import CAMERA_NAMES, MAP_VIEW_NAME
 from .egomotion import (
@@ -86,6 +87,7 @@ class L2DDataset(Dataset):
 
     Args:
         repo_id: HuggingFace repo ID for the dataset.
+        revision: Immutable HuggingFace dataset commit SHA.
         episodes: Optional list of episode indices to load. If None, all
             episodes are used.
         local_files_only: Accepted for backward compatibility; lerobot 0.5.x
@@ -101,6 +103,7 @@ class L2DDataset(Dataset):
     def __init__(
         self,
         repo_id: str = "yaak-ai/L2D",
+        revision: str = L2D_DATA_REVISION,
         episodes: list[int] | None = None,
         local_files_only: bool = False,
         include_world_model_windows: bool = False,
@@ -166,17 +169,17 @@ class L2DDataset(Dataset):
         # legacy flag onto that: local_files_only=True means "don't force a
         # remote sync", which is already the default, so it is simply not passed.
         #
-        # revision="main" forces lerobot to fetch from the ACTIVE branch instead of
-        # the CODEBASE_VERSION tag (v3.0 for lerobot 0.5.0). The `v3.0` tag on
+        # The pinned revision resolves the audited active branch instead of the
+        # CODEBASE_VERSION tag (v3.0 for lerobot 0.5.0). The `v3.0` tag on
         # yaak-ai/L2D points to a stale/broken snapshot (2026-07-14 audit:
         # tasks.parquet is 1485 bytes / 1 row at v3.0 vs 135484 bytes / 4219 rows
         # on main; data parquet 59MB vs 62MB). Reading v3.0 blows up in the label
         # pod: iloc[task_idx].name → IndexError, and _absolute_to_relative_idx →
         # KeyError, because meta.tasks + episodes.parquet on the tag are shorter
-        # than the actual dataset. Pin to main so we always get the live L2D
-        # revision — the entire pipeline was authored against main.
+        # than the actual dataset. The immutable commit prevents later changes to
+        # main from silently changing an experiment.
         _kwargs: dict[str, Any] = {"repo_id": repo_id, "episodes": episodes,
-                                    "revision": "main"}
+                                    "revision": revision}
         if root is not None:
             # Point lerobot at the partition's materialized raw dir so it loads
             # from there instead of re-downloading to the shared HF cache (#121
