@@ -125,6 +125,7 @@ def encode_l2d_osm_graph_snapshot(
             raise ValueError("OSM node coordinate is invalid")
         normalized_nodes[node_id] = (longitude, latitude)
 
+    normalized_node_ids = set(normalized_nodes)
     used_nodes: set[str] = set()
     edges: list[dict[str, Any]] = []
     for way in sorted(ways, key=lambda item: item.way_id):
@@ -133,7 +134,7 @@ def encode_l2d_osm_graph_snapshot(
         node_ids = tuple(str(node_id) for node_id in way.node_ids)
         if len(node_ids) < 2:
             continue
-        missing = set(node_ids) - set(normalized_nodes)
+        missing = set(node_ids) - normalized_node_ids
         if missing:
             raise ValueError(
                 f"OSM way {way.way_id!r} references missing nodes"
