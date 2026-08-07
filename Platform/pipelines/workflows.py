@@ -6517,16 +6517,7 @@ def train_reactive_multitask_stage(
     training_seed: int = 149,
     bev_weight: float = 1.0,
     route_weight: float = 1.0,
-    bev_pos_weights: List[float] = [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-    ],
+    bev_pos_weights: Optional[List[float]] = None,
     corridor_pos_weight: float = 1.0,
 ) -> TrainOutput:
     """Train one locked Reactive stage on already packed immutable shards."""
@@ -6591,9 +6582,14 @@ def train_reactive_multitask_stage(
         raise ValueError("val_fraction must be between zero and one")
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
-    if len(bev_pos_weights) != 8 or any(
+    normalized_bev_pos_weights = (
+        [1.0] * 8
+        if bev_pos_weights is None
+        else bev_pos_weights
+    )
+    if len(normalized_bev_pos_weights) != 8 or any(
         not np.isfinite(value) or value <= 0.0
-        for value in bev_pos_weights
+        for value in normalized_bev_pos_weights
     ):
         raise ValueError("bev_pos_weights must contain eight positive values")
     if not 0 <= training_seed <= 2**32 - 1:
@@ -6721,7 +6717,7 @@ def train_reactive_multitask_stage(
     configure_model_for_stage(model, training_stage)
     objective = ReactiveMultitaskObjective(
         training_stage,
-        bev_pos_weight=bev_pos_weights,
+        bev_pos_weight=normalized_bev_pos_weights,
         bev_weight=bev_weight,
         route_weight=route_weight,
         corridor_pos_weight=corridor_pos_weight,
@@ -10471,7 +10467,7 @@ def wf_precompute_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     sampler: str = "model-default",
@@ -10490,6 +10486,11 @@ def wf_precompute_overlays(
         prepare_overlay_set,
         resolve_overlay_model,
     )
+    normalized_base_seeds = (
+        [0]
+        if base_seeds is None
+        else base_seeds
+    )
 
     resolved = resolve_overlay_model(
         registered_model_name=registered_model_name,
@@ -10507,7 +10508,7 @@ def wf_precompute_overlays(
         artifacts_bucket=artifacts_bucket,
         dynamo_table=dynamo_table,
         aws_region=aws_region,
-        base_seeds=base_seeds,
+        base_seeds=normalized_base_seeds,
         sampler=sampler,
     )
     result = precompute_overlay_partition(
@@ -10524,7 +10525,7 @@ def wf_precompute_overlays(
         artifacts_bucket=artifacts_bucket,
         dynamo_table=dynamo_table,
         aws_region=aws_region,
-        base_seeds=base_seeds,
+        base_seeds=normalized_base_seeds,
         batch_size=batch_size,
         num_workers=num_workers,
         sampler=sampler,
@@ -10603,7 +10604,7 @@ def wf_publish_and_precompute_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -10663,7 +10664,7 @@ def wf_publish_full_run_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -10715,7 +10716,7 @@ def wf_publish_selected_checkpoint_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -10781,7 +10782,7 @@ def wf_create_publish_and_precompute_overlays(
     registered_model_name: str = "auto-e2e-driving-policy",
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -10834,7 +10835,7 @@ def wf_export_trajectory_report(
     dataset_manifest: FlyteFile,
     overlay_manifest: FlyteFile,
     selection_manifest: Optional[FlyteFile] = None,
-    scene_uids: List[str] = [],
+    scene_uids: Optional[List[str]] = None,
     seed_index: int = 0,
     camera_index: int = 0,
     max_frames_per_scene: int = 300,
