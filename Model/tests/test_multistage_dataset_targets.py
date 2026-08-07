@@ -270,6 +270,90 @@ def test_l2d_navigation_uses_only_route_waypoints(monkeypatch):
     assert targets.route_node_count == 10
 
 
+def test_l2d_spatial_index_matches_full_graph_rasterization():
+    graph = nx.MultiDiGraph()
+    base_lon = 8.0
+    base_lat = 52.0
+    for node in range(10):
+        graph.add_node(
+            f"near-{node}",
+            x=base_lon,
+            y=base_lat + node * 0.00001,
+        )
+    for node in range(9):
+        graph.add_edge(
+            f"near-{node}",
+            f"near-{node + 1}",
+            key="0",
+            length=1.1,
+            lanes=2,
+        )
+    for node in range(101):
+        graph.add_node(
+            f"far-{node}",
+            x=base_lon + 1.0,
+            y=base_lat + node * 0.00001,
+        )
+    for node in range(100):
+        graph.add_edge(
+            f"far-{node}",
+            f"far-{node + 1}",
+            key="0",
+            length=1.1,
+            lanes=2,
+        )
+    waypoints = np.asarray(
+        [
+            [base_lon, base_lat + node * 0.00001]
+            for node in range(10)
+        ],
+        dtype=np.float64,
+    )
+    spatial_index = l2d_navigation._build_graph_spatial_index(graph)
+
+    full_targets = l2d_navigation.build_l2d_navigation_targets(
+        graph,
+        waypoints,
+        ego_lat=base_lat,
+        ego_lon=base_lon,
+        heading_deg_cw_from_north=0.0,
+        geometry=_geometry(),
+    )
+    indexed_targets = l2d_navigation.build_l2d_navigation_targets(
+        graph,
+        waypoints,
+        ego_lat=base_lat,
+        ego_lon=base_lon,
+        heading_deg_cw_from_north=0.0,
+        geometry=_geometry(),
+        spatial_index=spatial_index,
+    )
+    candidate_edges = l2d_navigation._candidate_edge_refs(
+        graph,
+        spatial_index,
+        ego_lat=base_lat,
+        ego_lon=base_lon,
+        geometry=_geometry(),
+    )
+
+    np.testing.assert_array_equal(
+        indexed_targets.map_context,
+        full_targets.map_context,
+    )
+    np.testing.assert_array_equal(
+        indexed_targets.route_target,
+        full_targets.route_target,
+    )
+    np.testing.assert_array_equal(
+        indexed_targets.route_channel_valid,
+        full_targets.route_channel_valid,
+    )
+    assert indexed_targets.matched_node_count == 10
+    assert indexed_targets.route_node_count == 10
+    assert len(candidate_edges) == 9
+    assert len(candidate_edges) < graph.number_of_edges()
+
+
 def test_l2d_osm_snapshot_encodes_common_navigation_members(tmp_path):
     base_lon = 8.0
     base_lat = 52.0
@@ -307,6 +391,9 @@ def test_l2d_osm_snapshot_encodes_common_navigation_members(tmp_path):
     snapshot = l2d_navigation.load_l2d_osm_graph_snapshot(
         snapshot_path
     )
+    assert snapshot.spatial_index.node_coordinates_lon_lat.shape == (10, 2)
+    assert not snapshot.spatial_index.node_coordinates_lon_lat.flags.writeable
+    assert len(snapshot.spatial_index.edge_refs) == 9
     waypoints = np.asarray(
         [
             [base_lon, base_lat + index * 0.00001]
