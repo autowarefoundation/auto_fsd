@@ -267,6 +267,33 @@ def test_contract_version_import_is_fail_closed():
     }
 
 
+def test_data_processing_uses_module_scoped_path():
+    tree = ast.parse(Path(workflows.__file__).read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "data_processing"
+    )
+    local_path_imports = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "pathlib"
+        and any(alias.name == "Path" for alias in node.names)
+    ]
+    module_path_imports = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "pathlib"
+        and any(alias.name == "Path" for alias in node.names)
+    ]
+
+    assert not local_path_imports
+    assert len(module_path_imports) == 1
+
+
 def test_navigation_contracts_invalidate_old_pack_caches():
     assert workflows._cache_versions_for_contracts(
         uid="v1",
