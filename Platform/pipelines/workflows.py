@@ -10,6 +10,7 @@ entries. Two experiments: imitation-learning and offline-rl.
 """
 import enum
 import functools
+from pathlib import Path
 from flytekit import (
     task, workflow, dynamic, map_task, Resources, Secret, BatchSize,
 )
@@ -2254,7 +2255,6 @@ def data_processing(
     labels_by_id = {}
     _record_to_json = None
     if reasoning_labels is not None:
-        from pathlib import Path
         from data_processing.reasoning_label_generation.targets import (
             load_records_by_sample_id, record_to_json,
         )
