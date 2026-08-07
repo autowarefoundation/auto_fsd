@@ -25,6 +25,7 @@ from data_processing.contract_versions import (
     SHARD_SCHEMA_VERSION as _SHARD_V,
     UID_SCHEMA_VERSION as _UID_V,
 )
+from data_processing.source_revisions import L2D_DATA_REVISION
 from Platform.pipelines.dataset_publication import DatasetPublication
 from Platform.pipelines.overlay_tasks import (
     register_selected_overlay_checkpoint,
@@ -65,7 +66,7 @@ KITSCENES_NAVIGATION_OBJECTIVE_VERSION = (
 ROLLOUT_ALIGNED_OBJECTIVE_VERSION = "rollout_aligned_planner_v1"
 ROLLOUT_ALIGNED_CONTROL_OBJECTIVE_VERSION = "rollout_aligned_control_v1"
 SIMPLE_XY_IMITATION_OBJECTIVE_VERSION = "simple_xy_imitation_v1"
-L2D_SOURCE_REVISION = "main"
+L2D_SOURCE_REVISION = L2D_DATA_REVISION
 KITSCENES_SOURCE_REVISION = "6fde0034446669e2ed7235e4c7fe323cd23d599d"
 
 # The per-sample S3 label cache is REMOVED (#121 §3.4): at full L2D it was ~10M
@@ -1588,6 +1589,14 @@ def _reasoning_label_indices(ds, label_stride: int) -> List[int]:
     return sorted(selected)
 
 
+def _packed_episode_count(
+    episodes: int,
+    group_ids: Optional[List[str]],
+) -> int:
+    """Return the exact source-group count represented by one packed shard."""
+    return len(group_ids) if group_ids is not None else episodes
+
+
 # ============================================================
 # Task: Resolve the immutable fan-out inventory
 # ============================================================
@@ -1681,8 +1690,8 @@ def plan_fanout_partitions(
     elif dataset == Dataset.L2D:
         if source_revision != L2D_SOURCE_REVISION:
             raise ValueError(
-                "L2D currently supports only revision='main' because the v3.0 "
-                f"tag is stale; got {source_revision!r}"
+                "L2D requires the audited source revision "
+                f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
             )
         if episodes == 0 or start_ep >= 0:
             try:
@@ -1928,16 +1937,18 @@ def data_ingest(
     from huggingface_hub import hf_hub_download
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
-    # revision="main" — lerobot 0.5.0 defaults to CODEBASE_VERSION="v3.0", but
+    # The audited commit resolves the active branch content. lerobot 0.5.0
+    # defaults to CODEBASE_VERSION="v3.0", but
     # yaak-ai/L2D's v3.0 TAG points to a stale/broken snapshot (tasks.parquet
     # is 1485 bytes / 1 row at v3.0 vs 135484 bytes / 4219 rows on main;
     # episodes/data parquets are ~20% smaller too). Reading v3.0 causes
     # downstream KeyError in _absolute_to_relative_idx and IndexError in
-    # iloc[task_idx]. Pin to main so we always get the live L2D revision.
+    # iloc[task_idx]. Pin the audited main commit so later branch movement
+    # cannot change an experiment.
     if source_revision != L2D_SOURCE_REVISION:
         raise ValueError(
-            "L2D ingest supports revision='main' only because its v3.0 tag is "
-            f"stale; got {source_revision!r}"
+            "L2D ingest requires the audited source revision "
+            f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
         )
     _meta = LeRobotDatasetMetadata(
         repo_id=dataset.value,
@@ -2200,8 +2211,8 @@ def data_processing(
     else:
         if dataset == Dataset.L2D and source_revision != L2D_SOURCE_REVISION:
             raise ValueError(
-                "L2D pack supports revision='main' only because its v3.0 tag is "
-                f"stale; got {source_revision!r}"
+                "L2D pack requires the audited source revision "
+                f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
             )
         ep_list = ([int(g) for g in group_ids] if group_ids is not None
                    else (list(range(episodes)) if episodes > 0 else None))
@@ -2234,8 +2245,13 @@ def data_processing(
             # World-Model windows (#16/#13) are only produced when requested, so the
             # imitation-only path stays cheap (no extra frame decode). root=raw_path:
             # read the partition's materialized raw, don't re-hit HF.
-            ds = L2DDataset(repo_id=dataset.value, episodes=ep_list,
-                            include_world_model_windows=world_model, root=raw_path)
+            ds = L2DDataset(
+                repo_id=dataset.value,
+                revision=source_revision,
+                episodes=ep_list,
+                include_world_model_windows=world_model,
+                root=raw_path,
+            )
         n_samples = len(ds)
         idx_iter = range(n_samples)
     except ValueError as e:
@@ -2498,6 +2514,7 @@ def data_processing(
             from data_parsing.l2d import L2DDataset
             ds_asm = L2DDataset(
                 repo_id=dataset.value,
+                revision=source_revision,
                 episodes=ep_list,
                 include_world_model_windows=False,
                 root=raw_path,
@@ -2774,7 +2791,7 @@ def data_processing(
                 "hz": hz, "image_size": image_size, "dataset": dataset.value,
                 "source_revision": source_revision,
                 "dataset_version": dataset_version,
-                "episodes": episodes,
+                "episodes": _packed_episode_count(episodes, group_ids),
                 "reactive_targets_requested": reactive_targets,
                 "contracts": contract_versions(),
                 # num_views = real cameras only; the map view is stored under a
@@ -3146,8 +3163,8 @@ def generate_reasoning_labels(
     else:
         if dataset == Dataset.L2D and source_revision != L2D_SOURCE_REVISION:
             raise ValueError(
-                "L2D labeling supports revision='main' only because its v3.0 "
-                f"tag is stale; got {source_revision!r}"
+                "L2D labeling requires the audited source revision "
+                f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
             )
         ep_list = ([int(g) for g in group_ids] if group_ids is not None
                    else (list(range(episodes)) if episodes > 0 else None))
@@ -3179,8 +3196,13 @@ def generate_reasoning_labels(
         else:
             from data_parsing.l2d import L2DDataset
             # root=raw_path: read the partition's materialized raw, don't re-hit HF.
-            ds = L2DDataset(repo_id=dataset.value, episodes=ep_list,
-                            reasoning_clip_only=True, root=raw_path)
+            ds = L2DDataset(
+                repo_id=dataset.value,
+                revision=source_revision,
+                episodes=ep_list,
+                reasoning_clip_only=True,
+                root=raw_path,
+            )
         n_samples = len(ds)
         label_indices = _reasoning_label_indices(ds, label_stride)
     except ValueError as e:
