@@ -302,13 +302,54 @@ def test_old_geometry_pack_cache_is_not_aliased():
         (workflows.Dataset.KITSCENES, 1, 1),
         (workflows.Dataset.KITSCENES, 2, 2),
         (workflows.Dataset.KITSCENES, 10_000, 2),
-        (workflows.Dataset.L2D, 10_000, 16),
+        (workflows.Dataset.L2D, 10_000, 4),
     ),
 )
-def test_row_decode_workers_bound_kitscenes_memory(
+def test_row_decode_workers_bound_dataset_memory(
     dataset, row_count, expected
 ):
     assert workflows._row_decode_worker_count(dataset, row_count) == expected
+
+
+@pytest.mark.parametrize(
+    (
+        "dataset",
+        "has_samples",
+        "world_model",
+        "reactive_targets",
+        "expected",
+    ),
+    (
+        (workflows.Dataset.L2D, True, False, True, True),
+        (workflows.Dataset.L2D, True, True, False, True),
+        (workflows.Dataset.L2D, True, False, False, False),
+        (workflows.Dataset.KITSCENES, True, False, False, True),
+        (
+            workflows.Dataset.NVIDIA_PHYSICAL_AI,
+            True,
+            True,
+            True,
+            False,
+        ),
+        (workflows.Dataset.L2D, False, True, True, False),
+    ),
+)
+def test_parent_assembly_pack_selection(
+    dataset,
+    has_samples,
+    world_model,
+    reactive_targets,
+    expected,
+):
+    assert (
+        workflows._use_parent_assembly_pack(
+            dataset,
+            has_samples=has_samples,
+            world_model=world_model,
+            reactive_targets=reactive_targets,
+        )
+        is expected
+    )
 
 
 def test_future_contracts_get_new_cache_versions():
