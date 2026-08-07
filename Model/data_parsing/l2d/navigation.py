@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import math
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,9 @@ from navigation.geometry import (
 
 EARTH_RADIUS_M = 6_378_137.0
 L2D_OSM_GRAPH_SCHEMA_VERSION = "l2d_osm_graph_v1"
+L2D_SPATIAL_CELL_DEGREES = 0.005
+L2D_SPATIAL_QUERY_MARGIN_M = 40.0
+_MAX_INDEXED_CELLS_PER_EDGE = 4_096
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,14 +44,139 @@ class L2DNavigationTargets:
 
 
 @dataclasses.dataclass(frozen=True)
+class L2DGraphSpatialIndex:
+    node_ids: tuple[Any, ...]
+    node_coordinates_lon_lat: np.ndarray
+    node_cells: dict[tuple[int, int], tuple[int, ...]]
+    node_cell_bounds: tuple[int, int, int, int]
+    edge_refs: tuple[tuple[Any, Any, Any], ...]
+    edge_bounds_lon_lat: np.ndarray
+    edge_cells: dict[tuple[int, int], tuple[int, ...]]
+    overflow_edge_indices: tuple[int, ...]
+    cell_size_degrees: float
+
+
+@dataclasses.dataclass(frozen=True)
 class L2DOSMGraphSnapshot:
     graph: nx.MultiDiGraph
+    spatial_index: L2DGraphSpatialIndex
     source_sha256: str
     source_revision: str
     source_artifact_sha256: str
     source_date: str
     adapter_version: str
     attribution: str
+
+
+def _grid_cell(value: float, cell_size_degrees: float) -> int:
+    return math.floor(value / cell_size_degrees)
+
+
+def _freeze_array(value: np.ndarray) -> np.ndarray:
+    value.setflags(write=False)
+    return value
+
+
+def _build_graph_spatial_index(
+    graph: nx.MultiDiGraph,
+    *,
+    cell_size_degrees: float = L2D_SPATIAL_CELL_DEGREES,
+) -> L2DGraphSpatialIndex:
+    if not math.isfinite(cell_size_degrees) or cell_size_degrees <= 0.0:
+        raise ValueError("spatial index cell size must be positive")
+
+    node_ids = tuple(graph.nodes)
+    if not node_ids:
+        raise ValueError("OSM graph contains no nodes")
+    node_coordinates = _freeze_array(
+        np.asarray(
+            [
+                (
+                    float(graph.nodes[node]["x"]),
+                    float(graph.nodes[node]["y"]),
+                )
+                for node in node_ids
+            ],
+            dtype=np.float64,
+        )
+    )
+    node_cells_mutable: dict[tuple[int, int], list[int]] = defaultdict(
+        list
+    )
+    for index, (longitude, latitude) in enumerate(node_coordinates):
+        node_cells_mutable[
+            (
+                _grid_cell(float(longitude), cell_size_degrees),
+                _grid_cell(float(latitude), cell_size_degrees),
+            )
+        ].append(index)
+    node_cells = {
+        cell: tuple(indices)
+        for cell, indices in node_cells_mutable.items()
+    }
+    node_cell_x = [cell[0] for cell in node_cells]
+    node_cell_y = [cell[1] for cell in node_cells]
+
+    edge_refs: list[tuple[Any, Any, Any]] = []
+    edge_bounds: list[tuple[float, float, float, float]] = []
+    edge_cells_mutable: dict[tuple[int, int], list[int]] = defaultdict(
+        list
+    )
+    overflow_edge_indices: list[int] = []
+    for source, destination, key, data in graph.edges(
+        keys=True,
+        data=True,
+    ):
+        lon_lat = _edge_lon_lat(graph, source, destination, data)
+        minimum = lon_lat.min(axis=0)
+        maximum = lon_lat.max(axis=0)
+        edge_index = len(edge_refs)
+        edge_refs.append((source, destination, key))
+        edge_bounds.append(
+            (
+                float(minimum[0]),
+                float(minimum[1]),
+                float(maximum[0]),
+                float(maximum[1]),
+            )
+        )
+        minimum_x = _grid_cell(float(minimum[0]), cell_size_degrees)
+        maximum_x = _grid_cell(float(maximum[0]), cell_size_degrees)
+        minimum_y = _grid_cell(float(minimum[1]), cell_size_degrees)
+        maximum_y = _grid_cell(float(maximum[1]), cell_size_degrees)
+        cell_count = (maximum_x - minimum_x + 1) * (
+            maximum_y - minimum_y + 1
+        )
+        if cell_count > _MAX_INDEXED_CELLS_PER_EDGE:
+            overflow_edge_indices.append(edge_index)
+            continue
+        for cell_x in range(minimum_x, maximum_x + 1):
+            for cell_y in range(minimum_y, maximum_y + 1):
+                edge_cells_mutable[(cell_x, cell_y)].append(edge_index)
+
+    edge_bounds_array = np.asarray(edge_bounds, dtype=np.float64).reshape(
+        -1,
+        4,
+    )
+    return L2DGraphSpatialIndex(
+        node_ids=node_ids,
+        node_coordinates_lon_lat=node_coordinates,
+        node_cells=node_cells,
+        node_cell_bounds=(
+            min(node_cell_x),
+            max(node_cell_x),
+            min(node_cell_y),
+            max(node_cell_y),
+        ),
+        edge_refs=tuple(edge_refs),
+        edge_bounds_lon_lat=_freeze_array(edge_bounds_array),
+        edge_cells={
+            cell: tuple(indices)
+            for cell, indices in edge_cells_mutable.items()
+        },
+        overflow_edge_indices=tuple(overflow_edge_indices),
+        cell_size_degrees=cell_size_degrees,
+    )
 
 
 def load_l2d_osm_graph_snapshot(
@@ -155,6 +284,7 @@ def load_l2d_osm_graph_snapshot(
         )
     return L2DOSMGraphSnapshot(
         graph=graph,
+        spatial_index=_build_graph_spatial_index(graph),
         source_sha256=hashlib.sha256(payload_bytes).hexdigest(),
         source_revision=source_revision,
         source_artifact_sha256=source_artifact_sha256,
@@ -187,7 +317,85 @@ def _nearest_node(
     graph: nx.MultiDiGraph,
     longitude: float,
     latitude: float,
+    spatial_index: L2DGraphSpatialIndex | None = None,
 ) -> Any:
+    if spatial_index is not None:
+        cell_size = spatial_index.cell_size_degrees
+        query_x = _grid_cell(longitude, cell_size)
+        query_y = _grid_cell(latitude, cell_size)
+        minimum_x, maximum_x, minimum_y, maximum_y = (
+            spatial_index.node_cell_bounds
+        )
+        if (
+            minimum_x <= query_x <= maximum_x
+            and minimum_y <= query_y <= maximum_y
+        ):
+            candidate_indices: list[int] = []
+            maximum_radius = max(
+                query_x - minimum_x,
+                maximum_x - query_x,
+                query_y - minimum_y,
+                maximum_y - query_y,
+            )
+            longitude_scale = math.cos(math.radians(latitude))
+            for radius in range(maximum_radius + 1):
+                if radius == 0:
+                    cells: tuple[tuple[int, int], ...] = (
+                        (query_x, query_y),
+                    )
+                else:
+                    cells = tuple(
+                        (cell_x, cell_y)
+                        for cell_x in range(
+                            query_x - radius,
+                            query_x + radius + 1,
+                        )
+                        for cell_y in range(
+                            query_y - radius,
+                            query_y + radius + 1,
+                        )
+                        if (
+                            abs(cell_x - query_x) == radius
+                            or abs(cell_y - query_y) == radius
+                        )
+                    )
+                for cell in cells:
+                    candidate_indices.extend(
+                        spatial_index.node_cells.get(cell, ())
+                    )
+                if not candidate_indices:
+                    continue
+                candidate_array = np.asarray(
+                    candidate_indices,
+                    dtype=np.int64,
+                )
+                coordinates = spatial_index.node_coordinates_lon_lat[
+                    candidate_array
+                ]
+                distance = (
+                    (
+                        (coordinates[:, 0] - longitude)
+                        * longitude_scale
+                    )
+                    ** 2
+                    + (coordinates[:, 1] - latitude) ** 2
+                )
+                nearest_offset = int(np.argmin(distance))
+                best_distance = float(distance[nearest_offset])
+                left = (
+                    longitude - (query_x - radius) * cell_size
+                ) * longitude_scale
+                right = (
+                    (query_x + radius + 1) * cell_size - longitude
+                ) * longitude_scale
+                bottom = latitude - (query_y - radius) * cell_size
+                top = (query_y + radius + 1) * cell_size - latitude
+                boundary_distance = min(left, right, bottom, top)
+                if best_distance <= boundary_distance**2:
+                    return spatial_index.node_ids[
+                        int(candidate_array[nearest_offset])
+                    ]
+
     nodes = list(graph.nodes)
     if not nodes:
         raise ValueError("OSM graph contains no nodes")
@@ -209,9 +417,15 @@ def _nearest_node(
 def _map_match_waypoints(
     graph: nx.MultiDiGraph,
     waypoints_lon_lat: np.ndarray,
+    spatial_index: L2DGraphSpatialIndex | None = None,
 ) -> tuple[list[Any], list[Any]]:
     matched = [
-        _nearest_node(graph, float(longitude), float(latitude))
+        _nearest_node(
+            graph,
+            float(longitude),
+            float(latitude),
+            spatial_index,
+        )
         for longitude, latitude in waypoints_lon_lat
     ]
     route: list[Any] = []
@@ -320,6 +534,90 @@ def _road_width_m(data: dict[str, Any]) -> float:
     return 3.5 * lanes
 
 
+def _navigation_query_bounds_lon_lat(
+    *,
+    ego_lat: float,
+    ego_lon: float,
+    geometry: NavigationRasterGeometry,
+) -> tuple[float, float, float, float]:
+    maximum_radius_m = (
+        max(
+            math.hypot(longitudinal, lateral)
+            for longitudinal in (geometry.x_min_m, geometry.x_max_m)
+            for lateral in (geometry.y_min_m, geometry.y_max_m)
+        )
+        + L2D_SPATIAL_QUERY_MARGIN_M
+    )
+    degrees_to_meters = EARTH_RADIUS_M * math.pi / 180.0
+    latitude_delta = maximum_radius_m / degrees_to_meters
+    longitude_scale = max(abs(math.cos(math.radians(ego_lat))), 1e-6)
+    longitude_delta = maximum_radius_m / (
+        degrees_to_meters * longitude_scale
+    )
+    return (
+        ego_lon - longitude_delta,
+        ego_lat - latitude_delta,
+        ego_lon + longitude_delta,
+        ego_lat + latitude_delta,
+    )
+
+
+def _candidate_edge_refs(
+    graph: nx.MultiDiGraph,
+    spatial_index: L2DGraphSpatialIndex | None,
+    *,
+    ego_lat: float,
+    ego_lon: float,
+    geometry: NavigationRasterGeometry,
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    if spatial_index is None:
+        return [
+            (source, destination, data)
+            for source, destination, data in graph.edges(data=True)
+        ]
+
+    minimum_lon, minimum_lat, maximum_lon, maximum_lat = (
+        _navigation_query_bounds_lon_lat(
+            ego_lat=ego_lat,
+            ego_lon=ego_lon,
+            geometry=geometry,
+        )
+    )
+    cell_size = spatial_index.cell_size_degrees
+    candidate_indices = set(spatial_index.overflow_edge_indices)
+    for cell_x in range(
+        _grid_cell(minimum_lon, cell_size),
+        _grid_cell(maximum_lon, cell_size) + 1,
+    ):
+        for cell_y in range(
+            _grid_cell(minimum_lat, cell_size),
+            _grid_cell(maximum_lat, cell_size) + 1,
+        ):
+            candidate_indices.update(
+                spatial_index.edge_cells.get((cell_x, cell_y), ())
+            )
+
+    selected: list[tuple[Any, Any, dict[str, Any]]] = []
+    bounds = spatial_index.edge_bounds_lon_lat
+    for edge_index in sorted(candidate_indices):
+        edge_minimum_lon, edge_minimum_lat, edge_maximum_lon, (
+            edge_maximum_lat
+        ) = bounds[edge_index]
+        if (
+            edge_maximum_lon < minimum_lon
+            or edge_minimum_lon > maximum_lon
+            or edge_maximum_lat < minimum_lat
+            or edge_minimum_lat > maximum_lat
+        ):
+            continue
+        source, destination, key = spatial_index.edge_refs[edge_index]
+        data = graph.get_edge_data(source, destination, key)
+        if data is None:
+            raise ValueError("OSM spatial index references a missing edge")
+        selected.append((source, destination, data))
+    return selected
+
+
 def _destination_heatmap(
     destination_xy: np.ndarray,
     geometry: NavigationRasterGeometry,
@@ -360,23 +658,33 @@ def build_l2d_navigation_targets(
     ego_lon: float,
     heading_deg_cw_from_north: float,
     geometry: NavigationRasterGeometry = AUTOE2E_NAVIGATION_GEOMETRY,
+    spatial_index: L2DGraphSpatialIndex | None = None,
 ) -> L2DNavigationTargets:
     """Build map/route inputs without reading the imitation future."""
     waypoints = np.asarray(route_waypoints_lon_lat, dtype=np.float64)
     if waypoints.shape != (10, 2) or not np.isfinite(waypoints).all():
         raise ValueError("L2D route waypoints must be finite [10,2]")
-    matched_nodes, route_nodes = _map_match_waypoints(graph, waypoints)
+    matched_nodes, route_nodes = _map_match_waypoints(
+        graph,
+        waypoints,
+        spatial_index,
+    )
 
     map_context = np.zeros(
         (MAP_CHANNEL_COUNT, geometry.height_px, geometry.width_px),
         dtype=np.float32,
     )
     drivable = np.zeros(map_context.shape[1:], dtype=np.uint8)
-    known_polylines = []
     direction_sin = np.zeros(map_context.shape[1:], dtype=np.float32)
     direction_cos = np.zeros_like(direction_sin)
     direction_count = np.zeros_like(direction_sin)
-    for source, destination, data in graph.edges(data=True):
+    for source, destination, data in _candidate_edge_refs(
+        graph,
+        spatial_index,
+        ego_lat=ego_lat,
+        ego_lon=ego_lon,
+        geometry=geometry,
+    ):
         lon_lat = _edge_lon_lat(graph, source, destination, data)
         ego_points = _ego_flu_from_lon_lat(
             lon_lat,
@@ -386,7 +694,6 @@ def build_l2d_navigation_targets(
         )
         if len(ego_points) < 2:
             continue
-        known_polylines.append(ego_points)
         drivable = np.maximum(
             drivable,
             _polyline_mask(
@@ -395,14 +702,19 @@ def build_l2d_navigation_targets(
                 width_m=_road_width_m(data),
             ),
         )
+        centerline_uint8 = _polyline_mask(
+            ego_points,
+            geometry,
+            width_m=geometry.meters_per_pixel,
+        )
+        map_context[MapChannel.LANE_CENTERLINE] = np.maximum(
+            map_context[MapChannel.LANE_CENTERLINE],
+            centerline_uint8,
+        )
         delta = ego_points[-1] - ego_points[0]
         norm = float(np.linalg.norm(delta))
         if norm > 1e-6:
-            centerline = _polyline_mask(
-                ego_points,
-                geometry,
-                width_m=geometry.meters_per_pixel,
-            ).astype(bool)
+            centerline = centerline_uint8.astype(bool)
             direction_sin[centerline] += delta[1] / norm
             direction_cos[centerline] += delta[0] / norm
             direction_count[centerline] += 1.0
@@ -410,15 +722,6 @@ def build_l2d_navigation_targets(
     if bool(drivable.any()):
         map_context[MapChannel.DRIVABLE_AREA] = drivable
         map_context[MapChannel.KNOWN_MAP_AREA] = drivable
-    for polyline in known_polylines:
-        map_context[MapChannel.LANE_CENTERLINE] = np.maximum(
-            map_context[MapChannel.LANE_CENTERLINE],
-            _polyline_mask(
-                polyline,
-                geometry,
-                width_m=geometry.meters_per_pixel,
-            ),
-        )
     direction_valid = direction_count > 0
     map_context[MapChannel.TRAFFIC_DIRECTION_VALID] = direction_valid
     map_context[MapChannel.TRAFFIC_DIRECTION_SIN][direction_valid] = (
@@ -506,6 +809,7 @@ def l2d_reactive_navigation_members(
             pose_current["heading_deg_cw_from_north"]
         ),
         geometry=geometry,
+        spatial_index=snapshot.spatial_index,
     )
     return encode_reactive_navigation(
         targets.map_context,
