@@ -191,8 +191,29 @@ def _row_decode_worker_count(dataset: Dataset, row_count: int) -> int:
     """Bound row decoders by each parser's per-process memory footprint."""
     # Each KITScenes child reparses the scene's Lanelet2 map and calibration.
     # Large scenes exceeded the 64 GiB pod limit with the generic 16-worker cap.
-    max_workers = 2 if dataset == Dataset.KITSCENES else 16
+    # Each L2D child owns video decoders for seven streams. Four workers retain
+    # useful decode parallelism without approaching the 64 GiB pod limit.
+    max_workers = 2 if dataset == Dataset.KITSCENES else 4
     return max(1, min(max_workers, row_count))
+
+
+def _use_parent_assembly_pack(
+    dataset: Dataset,
+    *,
+    has_samples: bool,
+    world_model: bool,
+    reactive_targets: bool,
+) -> bool:
+    """Select the memory-bounded row-decode path for structured targets."""
+    return (
+        dataset != Dataset.NVIDIA_PHYSICAL_AI
+        and has_samples
+        and (
+            world_model
+            or dataset == Dataset.KITSCENES
+            or reactive_targets
+        )
+    )
 
 
 # NOTE: view fusion is no longer selectable. The reactive-refactor (PR #94)
@@ -2031,8 +2052,9 @@ def data_ingest(
 @task(
     container_image=DATA_PREP_IMAGE,
     pod_template=_data_prep_pod_template(),
-    # Process-parallel pack workers use the pod's available cores for camera
-    # decode/JPEG. The deduplicated WM path decodes each physical row once.
+    # Process-parallel camera workers decode/JPEG each physical row once for WM,
+    # KITScenes, and Reactive target packs. L2D uses four decoder processes so
+    # each process can own its video readers without exceeding the pod limit.
     # KITScenes one-scene partitions use the same schedulable Guaranteed profile
     # as ingest. The raw scene plus deduplicated 256px camera pool stays below
     # the default NodeClass's allocatable ephemeral storage.
@@ -2388,10 +2410,11 @@ def data_processing(
     bev_segmentation_count = 0
     reactive_navigation_count = 0
 
-    if (
-        dataset != Dataset.NVIDIA_PHYSICAL_AI
-        and idx_list
-        and (world_model or dataset == Dataset.KITSCENES)
+    if _use_parent_assembly_pack(
+        dataset,
+        has_samples=bool(idx_list),
+        world_model=world_model,
+        reactive_targets=reactive_targets,
     ):
         # ── DECODE-DEDUP path: decode each UNIQUE physical row once ──
         # (#121 §3.4d) Previous approach decoded all 48 window frames per sample
