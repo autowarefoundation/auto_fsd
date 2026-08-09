@@ -2521,7 +2521,14 @@ def data_processing(
         # reasoning JOIN) from the pool — zero video decode.
         print(f"Packing {len(idx_list)} samples, parent-assembly mode "
               f"(row-level camera workers, world_model={world_model})...")
-        row_init = (dataset.value, ep_list, raw_path, image_size)
+        row_init = (
+            dataset.value,
+            ep_list,
+            raw_path,
+            image_size,
+            source_split,
+            source_revision,
+        )
 
         # Pass A: unique rows. ds is still alive here (not yet deleted).
         all_rows: set = set()
