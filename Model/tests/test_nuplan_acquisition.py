@@ -14,6 +14,7 @@ from Platform.pipelines.nuplan_acquisition import (
     build_snapshot_manifest,
     canonical_json_bytes,
     load_source_manifest_bytes,
+    official_nuplan_open_data_region,
     snapshot_manifest_key,
     upload_stream_multipart,
     validate_s3_source_head,
@@ -186,6 +187,30 @@ def test_s3_source_head_validates_size_and_exact_etag():
             },
             archive,
         )
+
+
+def test_only_official_nuplan_prefix_uses_anonymous_open_data_access():
+    assert (
+        official_nuplan_open_data_region(
+            "motional-nuplan",
+            "public/nuplan-v1.1/nuplan-v1.1_mini.zip",
+        )
+        == "ap-northeast-1"
+    )
+    assert (
+        official_nuplan_open_data_region(
+            "motional-nuplan",
+            "private/nuplan-v1.1/nuplan-v1.1_mini.zip",
+        )
+        is None
+    )
+    assert (
+        official_nuplan_open_data_region(
+            "operator-owned-source",
+            "public/nuplan-v1.1/nuplan-v1.1_mini.zip",
+        )
+        is None
+    )
 
 
 def test_snapshot_manifest_redacts_authorized_source_urls():
