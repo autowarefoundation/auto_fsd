@@ -12,6 +12,7 @@ env:
     SOURCE_MANIFEST_URI: ""
     DATASETS_BUCKET: ""
     IMPORT_CONCURRENCY: "4"
+    WAIT_FOR_COMPLETION: "true"
     WAIT_TIMEOUT_SECONDS: "86400"
 
 phases:
@@ -29,6 +30,7 @@ phases:
       - printf '%s' "${EXECUTION_NAME}" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
       - test "${#EXECUTION_NAME}" -le 63
       - printf '%s' "${IMPORT_CONCURRENCY}" | grep -Eq '^[1-9][0-9]*$'
+      - printf '%s' "${WAIT_FOR_COMPLETION}" | grep -Eq '^(true|false)$'
       - printf '%s' "${WAIT_TIMEOUT_SECONDS}" | grep -Eq '^[1-9][0-9]*$'
       - |
         cat > /tmp/flyte.yaml << EOF
@@ -58,6 +60,9 @@ phases:
         workflow_name = os.environ["WORKFLOW_NAME"]
         version = os.environ["FLYTE_VERSION"]
         execution_name = os.environ["EXECUTION_NAME"]
+        wait_for_completion = (
+            os.environ["WAIT_FOR_COMPLETION"] == "true"
+        )
         timeout_seconds = int(os.environ["WAIT_TIMEOUT_SECONDS"])
         inputs = {
             "source_manifest": FlyteFile(
@@ -136,6 +141,10 @@ phases:
                 time.sleep(5)
 
         print(f"FLYTE_EXECUTION_ID={execution.id.name}", flush=True)
+        if not wait_for_completion:
+            print("FLYTE_EXECUTION_DETACHED=true", flush=True)
+            raise SystemExit(0)
+
         wait_deadline = time.monotonic() + timeout_seconds
         terminal_phases = {
             WorkflowExecutionPhase.ABORTED,
