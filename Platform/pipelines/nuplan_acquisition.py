@@ -18,7 +18,9 @@ SNAPSHOT_SCHEMA_VERSION = "nuplan_raw_snapshot_v1"
 REQUIRED_COMPONENTS = frozenset({"maps", "database", "sensor_blobs"})
 MIN_MULTIPART_PART_SIZE = 5 * 1024 * 1024
 DEFAULT_MULTIPART_PART_SIZE = 128 * 1024 * 1024
+DEFAULT_COPY_PART_SIZE = 1024 * 1024 * 1024
 MAX_MULTIPART_PARTS = 10_000
+MAX_COPY_PART_SIZE = 5 * 1024 * 1024 * 1024
 OFFICIAL_NUPLAN_OPEN_DATA_BUCKET = "motional-nuplan"
 OFFICIAL_NUPLAN_OPEN_DATA_PREFIX = "public/nuplan-v1.1/"
 OFFICIAL_NUPLAN_OPEN_DATA_REGION = "ap-northeast-1"
@@ -278,15 +280,25 @@ def validate_source_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
                 expected_etag,
                 f"archives[{index}].expected_etag",
             )
-        if not expected_sha256 and not expected_md5 and not expected_etag:
-            raise ValueError(
-                f"archives[{index}] must declare expected_sha256, "
-                "expected_md5, or expected_etag"
-            )
         source_uri = _validate_source_uri(raw_archive.get("source_uri"))
-        if expected_etag and urlsplit(source_uri).scheme != "s3":
+        source_scheme = urlsplit(source_uri).scheme
+        if expected_etag and source_scheme != "s3":
             raise ValueError(
                 f"archives[{index}].expected_etag is only valid for s3:// sources"
+            )
+        if source_scheme == "s3" and not expected_etag:
+            raise ValueError(
+                f"archives[{index}] s3 source must declare expected_etag"
+            )
+        if source_scheme == "s3" and (expected_sha256 or expected_md5):
+            raise ValueError(
+                f"archives[{index}] s3 source must use expected_etag "
+                "without expected_sha256 or expected_md5"
+            )
+        if source_scheme == "https" and not expected_sha256 and not expected_md5:
+            raise ValueError(
+                f"archives[{index}] https source must declare "
+                "expected_sha256 or expected_md5"
             )
         archives.append({
             "archive_id": archive_id,
@@ -420,7 +432,7 @@ def validate_archive_digest(
         )
 
 
-def upload_stream_multipart(
+def upload_https_stream_multipart(
     *,
     s3_client: Any,
     stream: BinaryIO,
@@ -432,7 +444,7 @@ def upload_stream_multipart(
     expected_md5: str = "",
     part_size: int = DEFAULT_MULTIPART_PART_SIZE,
 ) -> dict[str, Any]:
-    """Stream one source archive to S3 while verifying its declared integrity."""
+    """Stream one HTTPS archive to S3 while verifying its declared integrity."""
     if part_size < MIN_MULTIPART_PART_SIZE:
         raise ValueError("part_size must satisfy the S3 multipart minimum")
     required_parts = (expected_size_bytes + part_size - 1) // part_size
@@ -517,6 +529,114 @@ def upload_stream_multipart(
     return result
 
 
+def copy_s3_object_multipart(
+    *,
+    s3_client: Any,
+    source_bucket: str,
+    source_key: str,
+    source_etag: str,
+    destination_bucket: str,
+    destination_key: str,
+    metadata: Mapping[str, str],
+    expected_size_bytes: int,
+    part_size: int = DEFAULT_COPY_PART_SIZE,
+) -> dict[str, Any]:
+    """Copy one pinned S3 object without routing data through the caller."""
+    if part_size < MIN_MULTIPART_PART_SIZE:
+        raise ValueError("part_size must satisfy the S3 multipart minimum")
+    if part_size > MAX_COPY_PART_SIZE:
+        raise ValueError("part_size must not exceed the S3 copy-part maximum")
+    if expected_size_bytes <= 0:
+        raise ValueError("expected_size_bytes must be positive")
+    required_parts = (expected_size_bytes + part_size - 1) // part_size
+    if required_parts > MAX_MULTIPART_PARTS:
+        raise ValueError(
+            "archive requires more than the S3 multipart limit of "
+            f"{MAX_MULTIPART_PARTS} parts"
+        )
+    normalized_source_etag = normalize_s3_etag(
+        source_etag,
+        "source_etag",
+    )
+    create_response = s3_client.create_multipart_upload(
+        Bucket=destination_bucket,
+        Key=destination_key,
+        ContentType="application/octet-stream",
+        Metadata=dict(metadata),
+        ChecksumAlgorithm="CRC64NVME",
+        ChecksumType="FULL_OBJECT",
+    )
+    upload_id = create_response["UploadId"]
+    parts: list[dict[str, Any]] = []
+    try:
+        for part_number in range(1, required_parts + 1):
+            start = (part_number - 1) * part_size
+            end = min(expected_size_bytes - 1, start + part_size - 1)
+            response = s3_client.upload_part_copy(
+                Bucket=destination_bucket,
+                Key=destination_key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                CopySource={
+                    "Bucket": source_bucket,
+                    "Key": source_key,
+                },
+                CopySourceIfMatch=f'"{normalized_source_etag}"',
+                CopySourceRange=f"bytes={start}-{end}",
+            )
+            parts.append({
+                "ETag": response["CopyPartResult"]["ETag"],
+                "PartNumber": part_number,
+            })
+        completed = s3_client.complete_multipart_upload(
+            Bucket=destination_bucket,
+            Key=destination_key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+            MpuObjectSize=expected_size_bytes,
+            ChecksumType="FULL_OBJECT",
+        )
+    except BaseException:
+        s3_client.abort_multipart_upload(
+            Bucket=destination_bucket,
+            Key=destination_key,
+            UploadId=upload_id,
+        )
+        raise
+
+    head = s3_client.head_object(
+        Bucket=destination_bucket,
+        Key=destination_key,
+        ChecksumMode="ENABLED",
+    )
+    if int(head["ContentLength"]) != expected_size_bytes:
+        raise ValueError(
+            "server-side copied object size differs for "
+            f"{destination_key}: expected {expected_size_bytes}, "
+            f"got {head['ContentLength']}"
+        )
+    checksum = head.get("ChecksumCRC64NVME")
+    if not isinstance(checksum, str) or not checksum:
+        raise ValueError(
+            f"server-side copied object lacks CRC64NVME: {destination_key}"
+        )
+    completed_checksum = completed.get("ChecksumCRC64NVME")
+    if completed_checksum and completed_checksum != checksum:
+        raise ValueError(
+            "server-side copied object checksum differs after completion: "
+            f"{destination_key}"
+        )
+    return {
+        "checksum_crc64nvme": checksum,
+        "destination_etag": str(head["ETag"]).strip('"').lower(),
+        "md5": "",
+        "sha256": "",
+        "size_bytes": expected_size_bytes,
+        "source_etag": normalized_source_etag,
+        "transfer_mode": "s3_server_side_multipart_copy",
+    }
+
+
 def build_snapshot_manifest(
     *,
     source_manifest: Mapping[str, Any],
@@ -567,15 +687,31 @@ def build_snapshot_manifest(
             )
         if archive["expected_md5"] and receipt["md5"] != archive["expected_md5"]:
             raise ValueError(f"receipt MD5 mismatch for {archive['archive_id']!r}")
+        if receipt.get("transfer_mode") == "s3_server_side_multipart_copy":
+            if receipt.get("source_etag") != archive["expected_etag"]:
+                raise ValueError(
+                    f"receipt source ETag mismatch for {archive['archive_id']!r}"
+                )
+            if not receipt.get("checksum_crc64nvme"):
+                raise ValueError(
+                    "server-side copy receipt lacks CRC64NVME for "
+                    f"{archive['archive_id']!r}"
+                )
         archives.append({
             "archive_id": archive["archive_id"],
+            "checksum_crc64nvme": receipt.get("checksum_crc64nvme", ""),
             "component": archive["component"],
+            "destination_etag": receipt.get("destination_etag", ""),
             "extract_to": archive["extract_to"],
             "filename": archive["filename"],
             "md5": receipt["md5"],
             "object_uri": receipt["object_uri"],
             "sha256": receipt["sha256"],
             "size_bytes": int(receipt["size_bytes"]),
+            "transfer_mode": receipt.get(
+                "transfer_mode",
+                "legacy_stream_hash",
+            ),
             **(
                 {"source_etag": archive["expected_etag"]}
                 if archive["expected_etag"]
