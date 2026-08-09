@@ -24,6 +24,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MD5_RE = re.compile(r"^[0-9a-f]{32}$")
+_ETAG_RE = re.compile(r"^[0-9a-f]{32}(?:-[1-9][0-9]{0,4})?$")
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -131,6 +132,44 @@ def validate_public_https_uri(uri: str) -> str:
     return validated
 
 
+def normalize_s3_etag(value: Any, field: str = "ETag") -> str:
+    """Return a lowercase unquoted S3 ETag suitable for If-Match checks."""
+    etag = _require_text(value, field).strip('"').lower()
+    if _ETAG_RE.fullmatch(etag) is None:
+        raise ValueError(f"{field} has an invalid S3 ETag: {value!r}")
+    return etag
+
+
+def validate_s3_source_head(
+    head: Mapping[str, Any],
+    archive: Mapping[str, Any],
+) -> str:
+    """Validate one declared S3 source and return its quoted If-Match value."""
+    content_length = head.get("ContentLength")
+    if (
+        isinstance(content_length, bool)
+        or not isinstance(content_length, int)
+        or content_length != int(archive["expected_size_bytes"])
+    ):
+        raise ValueError(
+            "source S3 object size differs for "
+            f"{archive['archive_id']!r}: expected "
+            f"{archive['expected_size_bytes']}, got {content_length}"
+        )
+    actual_etag = normalize_s3_etag(
+        head.get("ETag"),
+        f"{archive['archive_id']}.source_etag",
+    )
+    expected_etag = archive.get("expected_etag", "")
+    if expected_etag and actual_etag != expected_etag:
+        raise ValueError(
+            "source S3 object ETag differs for "
+            f"{archive['archive_id']!r}: expected {expected_etag}, "
+            f"got {actual_etag}"
+        )
+    return f'"{actual_etag}"'
+
+
 def validate_source_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
     if payload.get("schema_version") != SOURCE_SCHEMA_VERSION:
         raise ValueError(
@@ -208,6 +247,7 @@ def validate_source_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
             )
         expected_sha256 = raw_archive.get("expected_sha256", "")
         expected_md5 = raw_archive.get("expected_md5", "")
+        expected_etag = raw_archive.get("expected_etag", "")
         if expected_sha256:
             _require_text(
                 expected_sha256,
@@ -220,13 +260,25 @@ def validate_source_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
                 f"archives[{index}].expected_md5",
                 pattern=_MD5_RE,
             )
-        if not expected_sha256 and not expected_md5:
+        if expected_etag:
+            expected_etag = normalize_s3_etag(
+                expected_etag,
+                f"archives[{index}].expected_etag",
+            )
+        if not expected_sha256 and not expected_md5 and not expected_etag:
             raise ValueError(
-                f"archives[{index}] must declare expected_sha256 or expected_md5"
+                f"archives[{index}] must declare expected_sha256, "
+                "expected_md5, or expected_etag"
+            )
+        source_uri = _validate_source_uri(raw_archive.get("source_uri"))
+        if expected_etag and urlsplit(source_uri).scheme != "s3":
+            raise ValueError(
+                f"archives[{index}].expected_etag is only valid for s3:// sources"
             )
         archives.append({
             "archive_id": archive_id,
             "component": component,
+            "expected_etag": expected_etag,
             "expected_md5": expected_md5,
             "expected_sha256": expected_sha256,
             "expected_size_bytes": expected_size_bytes,
@@ -235,7 +287,7 @@ def validate_source_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
                 component,
             ),
             "filename": filename,
-            "source_uri": _validate_source_uri(raw_archive.get("source_uri")),
+            "source_uri": source_uri,
         })
 
     components = {archive["component"] for archive in archives}
@@ -511,6 +563,11 @@ def build_snapshot_manifest(
             "object_uri": receipt["object_uri"],
             "sha256": receipt["sha256"],
             "size_bytes": int(receipt["size_bytes"]),
+            **(
+                {"source_etag": archive["expected_etag"]}
+                if archive["expected_etag"]
+                else {}
+            ),
         })
 
     archives.sort(key=lambda item: item["archive_id"])
