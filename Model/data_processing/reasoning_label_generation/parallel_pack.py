@@ -108,6 +108,7 @@ def init_row_worker(
     image_size: int,
     source_split: str,
     source_revision: str,
+    benchmark_protocol: bool = False,
 ) -> None:
     """Build this process's PLAIN-mode dataset for row-level decode (#121 decode-dedup).
 
@@ -143,6 +144,7 @@ def init_row_worker(
             include_world_model_windows=False,
             include_navigation=False,
             source_revision=source_revision,
+            benchmark_protocol=benchmark_protocol,
         )
     else:
         from data_parsing.l2d import L2DDataset
