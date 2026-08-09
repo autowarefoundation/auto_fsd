@@ -13,10 +13,11 @@ from Platform.pipelines.nuplan_acquisition import (
     archive_object_key,
     build_snapshot_manifest,
     canonical_json_bytes,
+    copy_s3_object_multipart,
     load_source_manifest_bytes,
     official_nuplan_open_data_region,
     snapshot_manifest_key,
-    upload_stream_multipart,
+    upload_https_stream_multipart,
     validate_s3_source_head,
     validate_public_https_uri,
     validate_source_manifest,
@@ -38,7 +39,7 @@ def _source_manifest():
             {
                 "archive_id": "mini-db",
                 "component": "database",
-                "expected_md5": "b" * 32,
+                "expected_etag": "b" * 32 + "-2",
                 "expected_size_bytes": 20,
                 "extract_to": "nuplan-v1.1/splits/mini",
                 "filename": "nuplan-v1.1-mini.zip",
@@ -68,6 +69,10 @@ def _receipts(manifest, source_contract_sha):
         archive["archive_id"]: archive["expected_size_bytes"]
         for archive in manifest["archives"]
     }
+    source_etags = {
+        archive["archive_id"]: archive["expected_etag"]
+        for archive in manifest["archives"]
+    }
     return [
         {
             "archive_id": "maps-v1",
@@ -81,13 +86,17 @@ def _receipts(manifest, source_contract_sha):
         },
         {
             "archive_id": "mini-db",
+            "checksum_crc64nvme": "crc64-mini-db",
             "component": "database",
-            "md5": "b" * 32,
+            "destination_etag": "d" * 32 + "-2",
+            "md5": "",
             "object_uri": "s3://datasets/mini-db.zip",
             "schema_version": ARCHIVE_RECEIPT_SCHEMA_VERSION,
-            "sha256": "2" * 64,
+            "sha256": "",
             "size_bytes": sizes["mini-db"],
             "source_contract_sha256": source_contract_sha,
+            "source_etag": source_etags["mini-db"],
+            "transfer_mode": "s3_server_side_multipart_copy",
         },
         {
             "archive_id": "mini-sensors",
@@ -141,7 +150,6 @@ def test_source_manifest_rejects_unsafe_archive_fields(field, value, message):
 def test_source_manifest_accepts_multipart_etag_for_s3_source():
     manifest = _source_manifest()
     archive = manifest["archives"][1]
-    archive.pop("expected_md5")
     archive["expected_etag"] = '"08ABC074DB9227E758CC41C6B1EE223C-1020"'
 
     normalized = validate_source_manifest(manifest)
@@ -150,6 +158,24 @@ def test_source_manifest_accepts_multipart_etag_for_s3_source():
         normalized["archives"][1]["expected_etag"]
         == "08abc074db9227e758cc41c6b1ee223c-1020"
     )
+
+
+def test_source_manifest_rejects_s3_source_without_etag():
+    manifest = _source_manifest()
+    archive = manifest["archives"][1]
+    archive.pop("expected_etag")
+    archive["expected_md5"] = "b" * 32
+
+    with pytest.raises(ValueError, match="s3 source must declare expected_etag"):
+        validate_source_manifest(manifest)
+
+
+def test_source_manifest_rejects_stream_hashes_for_s3_source():
+    manifest = _source_manifest()
+    manifest["archives"][1]["expected_md5"] = "b" * 32
+
+    with pytest.raises(ValueError, match="must use expected_etag"):
+        validate_source_manifest(manifest)
 
 
 def test_source_manifest_rejects_etag_for_https_source():
@@ -230,7 +256,14 @@ def test_snapshot_manifest_redacts_authorized_source_urls():
         "maps": 1,
         "sensor_blobs": 1,
     }
-    assert all("source_etag" not in item for item in snapshot["archives"])
+    by_id = {item["archive_id"]: item for item in snapshot["archives"]}
+    assert "source_etag" not in by_id["maps-v1"]
+    assert "source_etag" not in by_id["mini-sensors"]
+    assert by_id["mini-db"]["source_etag"] == "b" * 32 + "-2"
+    assert by_id["mini-db"]["transfer_mode"] == (
+        "s3_server_side_multipart_copy"
+    )
+    assert by_id["mini-db"]["checksum_crc64nvme"] == "crc64-mini-db"
     assert snapshot["total_size_bytes"] == 60
     assert archive_object_key(
         manifest,
@@ -244,7 +277,6 @@ def test_snapshot_manifest_redacts_authorized_source_urls():
 
 def test_snapshot_manifest_publishes_pinned_s3_source_etag():
     source = _source_manifest()
-    source["archives"][1].pop("expected_md5")
     source["archives"][1]["expected_etag"] = (
         "08abc074db9227e758cc41c6b1ee223c-1020"
     )
@@ -318,7 +350,7 @@ def test_streaming_multipart_upload_verifies_content_hashes():
     md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
     s3 = _MultipartS3()
 
-    result = upload_stream_multipart(
+    result = upload_https_stream_multipart(
         s3_client=s3,
         stream=io.BytesIO(payload),
         bucket="datasets",
@@ -345,7 +377,7 @@ def test_streaming_multipart_upload_aborts_before_completion_on_mismatch():
     s3 = _MultipartS3()
 
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        upload_stream_multipart(
+        upload_https_stream_multipart(
             s3_client=s3,
             stream=io.BytesIO(payload),
             bucket="datasets",
@@ -364,7 +396,7 @@ def test_streaming_multipart_rejects_more_than_s3_part_limit_before_upload():
     s3 = _MultipartS3()
 
     with pytest.raises(ValueError, match="multipart limit"):
-        upload_stream_multipart(
+        upload_https_stream_multipart(
             s3_client=s3,
             stream=io.BytesIO(b""),
             bucket="datasets",
@@ -372,6 +404,122 @@ def test_streaming_multipart_rejects_more_than_s3_part_limit_before_upload():
             metadata={"snapshot-id": "mini"},
             expected_size_bytes=10_001 * 5 * 1024 * 1024,
             expected_sha256="f" * 64,
+            part_size=5 * 1024 * 1024,
+        )
+
+    assert not hasattr(s3, "create_request")
+
+
+class _MultipartCopyS3:
+    def __init__(self, *, fail_part: int | None = None):
+        self.copy_requests: list[dict[str, object]] = []
+        self.completed = False
+        self.aborted = False
+        self.fail_part = fail_part
+
+    def create_multipart_upload(self, **kwargs):
+        self.create_request = kwargs
+        return {"UploadId": "copy-upload-1"}
+
+    def upload_part_copy(self, **kwargs):
+        self.copy_requests.append(kwargs)
+        if kwargs["PartNumber"] == self.fail_part:
+            raise RuntimeError("copy failed")
+        return {
+            "CopyPartResult": {
+                "ETag": f'"copy-etag-{kwargs["PartNumber"]}"',
+            },
+        }
+
+    def complete_multipart_upload(self, **kwargs):
+        self.complete_request = kwargs
+        self.completed = True
+        return {"ChecksumCRC64NVME": "crc64-result"}
+
+    def abort_multipart_upload(self, **kwargs):
+        self.abort_request = kwargs
+        self.aborted = True
+
+    def head_object(self, **kwargs):
+        self.head_request = kwargs
+        return {
+            "ChecksumCRC64NVME": "crc64-result",
+            "ContentLength": 5 * 1024 * 1024 + 17,
+            "ETag": '"destination-etag-2"',
+        }
+
+
+def test_s3_multipart_copy_uses_ranges_etag_and_full_object_checksum():
+    s3 = _MultipartCopyS3()
+
+    result = copy_s3_object_multipart(
+        s3_client=s3,
+        source_bucket="motional-nuplan",
+        source_key="public/nuplan-v1.1/archive.zip",
+        source_etag="a" * 32 + "-2",
+        destination_bucket="datasets",
+        destination_key="nuplan/archive.zip",
+        metadata={"snapshot-id": "full"},
+        expected_size_bytes=5 * 1024 * 1024 + 17,
+        part_size=5 * 1024 * 1024,
+    )
+
+    assert result == {
+        "checksum_crc64nvme": "crc64-result",
+        "destination_etag": "destination-etag-2",
+        "md5": "",
+        "sha256": "",
+        "size_bytes": 5 * 1024 * 1024 + 17,
+        "source_etag": "a" * 32 + "-2",
+        "transfer_mode": "s3_server_side_multipart_copy",
+    }
+    assert [request["CopySourceRange"] for request in s3.copy_requests] == [
+        f"bytes=0-{5 * 1024 * 1024 - 1}",
+        f"bytes={5 * 1024 * 1024}-{5 * 1024 * 1024 + 16}",
+    ]
+    assert {
+        request["CopySourceIfMatch"] for request in s3.copy_requests
+    } == {'"' + "a" * 32 + '-2"'}
+    assert s3.create_request["ChecksumAlgorithm"] == "CRC64NVME"
+    assert s3.complete_request["ChecksumType"] == "FULL_OBJECT"
+    assert s3.head_request["ChecksumMode"] == "ENABLED"
+    assert s3.completed is True
+    assert s3.aborted is False
+
+
+def test_s3_multipart_copy_aborts_on_part_failure():
+    s3 = _MultipartCopyS3(fail_part=2)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        copy_s3_object_multipart(
+            s3_client=s3,
+            source_bucket="motional-nuplan",
+            source_key="public/nuplan-v1.1/archive.zip",
+            source_etag="a" * 32 + "-2",
+            destination_bucket="datasets",
+            destination_key="nuplan/archive.zip",
+            metadata={"snapshot-id": "full"},
+            expected_size_bytes=5 * 1024 * 1024 + 17,
+            part_size=5 * 1024 * 1024,
+        )
+
+    assert s3.completed is False
+    assert s3.aborted is True
+
+
+def test_s3_multipart_copy_rejects_part_limit_before_upload():
+    s3 = _MultipartCopyS3()
+
+    with pytest.raises(ValueError, match="multipart limit"):
+        copy_s3_object_multipart(
+            s3_client=s3,
+            source_bucket="motional-nuplan",
+            source_key="public/nuplan-v1.1/archive.zip",
+            source_etag="a" * 32 + "-2",
+            destination_bucket="datasets",
+            destination_key="nuplan/archive.zip",
+            metadata={"snapshot-id": "full"},
+            expected_size_bytes=10_001 * 5 * 1024 * 1024,
             part_size=5 * 1024 * 1024,
         )
 
