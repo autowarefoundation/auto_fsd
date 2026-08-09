@@ -331,6 +331,14 @@ SemanticOccupancyPrecomputeOutput = NamedTuple(
     shard_count=int,
     sample_count=int,
 )
+NuPlanRawSnapshotOutput = NamedTuple(
+    "NuPlanRawSnapshotOutput",
+    manifest=FlyteFile,
+    manifest_sha256=str,
+    snapshot_prefix=str,
+    archive_count=int,
+    total_size_bytes=int,
+)
 # wf_create_dataset returns just the ready-to-train WebDataset shards (train_il
 # reads reasoning supervision from in-shard reasoning.json members). The
 # versioned reasoning-label artifact persists independently in S3 (the
@@ -6497,6 +6505,396 @@ def train_il(
 
 
 # ============================================================
+# Task: authorized nuPlan source -> immutable raw snapshot
+# ============================================================
+@task(
+    container_image=DATA_PREP_IMAGE,
+    pod_template=_data_prep_pod_template(),
+    requests=Resources(
+        cpu="2",
+        mem="4Gi",
+        ephemeral_storage="4Gi",
+    ),
+    limits=Resources(
+        cpu="2",
+        mem="4Gi",
+        ephemeral_storage="4Gi",
+    ),
+    retries=2,
+)
+def acquire_nuplan_archive(
+    source_manifest: FlyteFile,
+    archive_index: int,
+    datasets_bucket: str,
+    aws_region: str = "us-west-2",
+) -> FlyteFile:
+    """Stream one authorized nuPlan archive into an immutable S3 snapshot."""
+    import json
+    import tempfile
+    from contextlib import closing
+    from pathlib import Path
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urlsplit
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    import boto3
+    from botocore.exceptions import ClientError
+
+    from Platform.pipelines.nuplan_acquisition import (
+        ARCHIVE_RECEIPT_SCHEMA_VERSION,
+        archive_object_key,
+        archive_receipt_key,
+        canonical_json_bytes,
+        digest_stream,
+        load_source_manifest_bytes,
+        upload_stream_multipart,
+        validate_archive_digest,
+        validate_public_https_uri,
+    )
+
+    if (
+        not datasets_bucket
+        or datasets_bucket.startswith("s3://")
+        or "/" in datasets_bucket
+    ):
+        raise ValueError("datasets_bucket must be one S3 bucket name")
+    if archive_index < 0:
+        raise ValueError("archive_index must be non-negative")
+
+    source_bytes = Path(source_manifest.download()).read_bytes()
+    manifest, source_contract_sha256 = load_source_manifest_bytes(source_bytes)
+    if archive_index >= len(manifest["archives"]):
+        raise IndexError(
+            f"archive_index {archive_index} is outside "
+            f"{len(manifest['archives'])} source archives"
+        )
+    archive = manifest["archives"][archive_index]
+    object_key = archive_object_key(manifest, archive)
+    receipt_key = archive_receipt_key(manifest, archive)
+    s3 = boto3.client("s3", region_name=aws_region)
+
+    def receipt_output(payload: bytes) -> FlyteFile:
+        path = Path(tempfile.mkdtemp(prefix="nuplan-archive-receipt-"))
+        output = path / "receipt.json"
+        output.write_bytes(payload)
+        return FlyteFile(str(output))
+
+    try:
+        response = s3.get_object(
+            Bucket=datasets_bucket,
+            Key=receipt_key,
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "404",
+            "NoSuchKey",
+        }:
+            raise
+    else:
+        with closing(response["Body"]) as receipt_stream:
+            receipt_bytes = receipt_stream.read()
+        receipt = json.loads(receipt_bytes)
+        if (
+            receipt.get("schema_version")
+            != ARCHIVE_RECEIPT_SCHEMA_VERSION
+            or receipt.get("archive_id") != archive["archive_id"]
+            or receipt.get("source_contract_sha256")
+            != source_contract_sha256
+            or receipt.get("object_uri")
+            != f"s3://{datasets_bucket}/{object_key}"
+        ):
+            raise ValueError(
+                f"existing nuPlan receipt conflicts with {archive['archive_id']!r}"
+            )
+        head = s3.head_object(Bucket=datasets_bucket, Key=object_key)
+        if int(head["ContentLength"]) != int(receipt["size_bytes"]):
+            raise ValueError(
+                f"existing nuPlan object size differs from receipt: {object_key}"
+            )
+        return receipt_output(receipt_bytes)
+
+    upload = None
+    try:
+        head = s3.head_object(Bucket=datasets_bucket, Key=object_key)
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "404",
+            "NoSuchKey",
+        }:
+            raise
+    else:
+        if int(head["ContentLength"]) != int(archive["expected_size_bytes"]):
+            raise ValueError(
+                f"existing nuPlan object has the wrong size: {object_key}"
+            )
+        existing_object = s3.get_object(
+            Bucket=datasets_bucket,
+            Key=object_key,
+        )
+        with closing(existing_object["Body"]) as existing_stream:
+            upload = digest_stream(existing_stream)
+        validate_archive_digest(
+            upload,
+            expected_size_bytes=archive["expected_size_bytes"],
+            expected_sha256=archive["expected_sha256"],
+            expected_md5=archive["expected_md5"],
+            label=object_key,
+        )
+        print(
+            "Recovered nuPlan archive receipt from existing verified object "
+            f"id={archive['archive_id']}"
+        )
+
+    if upload is None:
+        parsed = urlsplit(archive["source_uri"])
+        if parsed.scheme == "s3":
+            source_response = s3.get_object(
+                Bucket=parsed.netloc,
+                Key=parsed.path.lstrip("/"),
+            )
+            if int(source_response["ContentLength"]) != int(
+                archive["expected_size_bytes"]
+            ):
+                raise ValueError(
+                    f"source S3 object size differs for "
+                    f"{archive['archive_id']!r}"
+                )
+            source_context = closing(source_response["Body"])
+        else:
+            validate_public_https_uri(archive["source_uri"])
+
+            class PublicHTTPSRedirectHandler(HTTPRedirectHandler):
+                def redirect_request(
+                    self,
+                    request,
+                    file_pointer,
+                    code,
+                    message,
+                    headers,
+                    new_url,
+                ):
+                    validate_public_https_uri(new_url)
+                    return super().redirect_request(
+                        request,
+                        file_pointer,
+                        code,
+                        message,
+                        headers,
+                        new_url,
+                    )
+
+            request = Request(
+                archive["source_uri"],
+                headers={
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "auto-e2e-nuplan-acquisition/1",
+                },
+            )
+            try:
+                source_response = build_opener(
+                    PublicHTTPSRedirectHandler()
+                ).open(
+                    request,
+                    timeout=120,
+                )
+            except HTTPError as error:
+                raise RuntimeError(
+                    "authorized HTTPS source returned "
+                    f"status={error.code} archive_id={archive['archive_id']}"
+                ) from None
+            except URLError as error:
+                raise RuntimeError(
+                    "authorized HTTPS source connection failed "
+                    f"archive_id={archive['archive_id']} "
+                    f"reason_type={type(error.reason).__name__}"
+                ) from None
+            source_context = closing(source_response)
+
+        with source_context as source_stream:
+            upload = upload_stream_multipart(
+                s3_client=s3,
+                stream=source_stream,
+                bucket=datasets_bucket,
+                key=object_key,
+                metadata={
+                    "archive-id": archive["archive_id"],
+                    "snapshot-id": manifest["snapshot_id"],
+                    "source-contract-sha256": source_contract_sha256,
+                },
+                expected_size_bytes=archive["expected_size_bytes"],
+                expected_sha256=archive["expected_sha256"],
+                expected_md5=archive["expected_md5"],
+            )
+
+    head = s3.head_object(Bucket=datasets_bucket, Key=object_key)
+    if int(head["ContentLength"]) != int(upload["size_bytes"]):
+        raise ValueError(
+            f"uploaded nuPlan archive size differs after completion: {object_key}"
+        )
+    receipt = {
+        "archive_id": archive["archive_id"],
+        "component": archive["component"],
+        "md5": upload["md5"],
+        "object_uri": f"s3://{datasets_bucket}/{object_key}",
+        "schema_version": ARCHIVE_RECEIPT_SCHEMA_VERSION,
+        "sha256": upload["sha256"],
+        "size_bytes": upload["size_bytes"],
+        "source_contract_sha256": source_contract_sha256,
+    }
+    receipt_bytes = canonical_json_bytes(receipt)
+    try:
+        s3.put_object(
+            Bucket=datasets_bucket,
+            Key=receipt_key,
+            Body=receipt_bytes,
+            ContentType="application/json",
+            IfNoneMatch="*",
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "PreconditionFailed",
+            "412",
+        }:
+            raise
+        existing = s3.get_object(
+            Bucket=datasets_bucket,
+            Key=receipt_key,
+        )["Body"].read()
+        if existing != receipt_bytes:
+            raise ValueError(
+                f"concurrent nuPlan receipt differs for {archive['archive_id']!r}"
+            ) from error
+    print(
+        "Imported nuPlan archive "
+        f"id={archive['archive_id']} component={archive['component']} "
+        f"size_bytes={upload['size_bytes']} sha256={upload['sha256']}"
+    )
+    return receipt_output(receipt_bytes)
+
+
+@task(
+    container_image=DATA_PREP_IMAGE,
+    pod_template=_data_prep_pod_template(),
+    requests=Resources(cpu="1", mem="2Gi", ephemeral_storage="2Gi"),
+    limits=Resources(cpu="1", mem="2Gi", ephemeral_storage="2Gi"),
+)
+def finalize_nuplan_raw_snapshot(
+    source_manifest: FlyteFile,
+    archive_receipts: List[FlyteFile],
+    datasets_bucket: str,
+    aws_region: str = "us-west-2",
+) -> NuPlanRawSnapshotOutput:
+    """Publish the redacted canonical manifest after every archive is verified."""
+    import json
+    from pathlib import Path
+
+    import boto3
+    from botocore.exceptions import ClientError
+
+    from Platform.pipelines.nuplan_acquisition import (
+        build_snapshot_manifest,
+        canonical_json_bytes,
+        load_source_manifest_bytes,
+        sha256_bytes,
+        snapshot_manifest_key,
+        snapshot_prefix,
+    )
+
+    source_bytes = Path(source_manifest.download()).read_bytes()
+    manifest, source_contract_sha256 = load_source_manifest_bytes(source_bytes)
+    receipts = [
+        json.loads(Path(receipt.download()).read_text(encoding="utf-8"))
+        for receipt in archive_receipts
+    ]
+    snapshot = build_snapshot_manifest(
+        source_manifest=manifest,
+        source_contract_sha256=source_contract_sha256,
+        receipts=receipts,
+    )
+    payload = canonical_json_bytes(snapshot)
+    payload_sha256 = sha256_bytes(payload)
+    key = snapshot_manifest_key(manifest)
+    s3 = boto3.client("s3", region_name=aws_region)
+    try:
+        s3.put_object(
+            Bucket=datasets_bucket,
+            Key=key,
+            Body=payload,
+            ContentType="application/json",
+            Metadata={"manifest-sha256": payload_sha256},
+            IfNoneMatch="*",
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "PreconditionFailed",
+            "412",
+        }:
+            raise
+        existing = s3.get_object(Bucket=datasets_bucket, Key=key)["Body"].read()
+        if existing != payload:
+            raise ValueError(
+                "existing nuPlan snapshot manifest differs for "
+                f"{manifest['snapshot_id']!r}"
+            ) from error
+    manifest_uri = f"s3://{datasets_bucket}/{key}"
+    print(
+        "Published nuPlan raw snapshot "
+        f"id={manifest['snapshot_id']} archives={len(receipts)} "
+        f"total_size_bytes={snapshot['total_size_bytes']} "
+        f"manifest_sha256={payload_sha256}"
+    )
+    return NuPlanRawSnapshotOutput(
+        manifest=FlyteFile(manifest_uri),
+        manifest_sha256=payload_sha256,
+        snapshot_prefix=(
+            f"s3://{datasets_bucket}/{snapshot_prefix(manifest)}"
+        ),
+        archive_count=len(receipts),
+        total_size_bytes=int(snapshot["total_size_bytes"]),
+    )
+
+
+@dynamic(
+    container_image=DATA_PREP_IMAGE,
+    environment={"AUTO_E2E_DATA_PREP_IMAGE": DATA_PREP_IMAGE},
+)
+def _acquire_nuplan_raw_snapshot(
+    source_manifest: FlyteFile,
+    datasets_bucket: str,
+    aws_region: str,
+    concurrency: int,
+) -> NuPlanRawSnapshotOutput:
+    """Fan out authorized archive imports without exposing signed URLs."""
+    from pathlib import Path
+
+    from Platform.pipelines.nuplan_acquisition import load_source_manifest_bytes
+
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+    manifest, _ = load_source_manifest_bytes(
+        Path(source_manifest.download()).read_bytes()
+    )
+    importer = map_task(
+        functools.partial(
+            acquire_nuplan_archive,
+            source_manifest=source_manifest,
+            datasets_bucket=datasets_bucket,
+            aws_region=aws_region,
+        ),
+        concurrency=concurrency,
+    )
+    receipts = importer(
+        archive_index=list(range(len(manifest["archives"])))
+    )
+    return finalize_nuplan_raw_snapshot(
+        source_manifest=source_manifest,
+        archive_receipts=receipts,
+        datasets_bucket=datasets_bucket,
+        aws_region=aws_region,
+    )
+
+
+# ============================================================
 # Task: raw nuPlan -> immutable Reactive shards
 # ============================================================
 @task(
@@ -9993,6 +10391,22 @@ def audit_kitscenes_target_reconstruction(
 # ============================================================
 # Workflows
 # ============================================================
+@workflow
+def wf_acquire_nuplan_raw_snapshot(
+    source_manifest: FlyteFile,
+    datasets_bucket: str,
+    aws_region: str = "us-west-2",
+    concurrency: int = 4,
+) -> NuPlanRawSnapshotOutput:
+    """Acquire authorized nuPlan archives once into an immutable S3 snapshot."""
+    return _acquire_nuplan_raw_snapshot(
+        source_manifest=source_manifest,
+        datasets_bucket=datasets_bucket,
+        aws_region=aws_region,
+        concurrency=concurrency,
+    )
+
+
 @workflow
 def wf_pack_nuplan_reactive_dataset(
     data_root: FlyteDirectory,
