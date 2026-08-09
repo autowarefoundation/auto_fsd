@@ -6550,6 +6550,7 @@ def acquire_nuplan_archive(
         upload_stream_multipart,
         validate_archive_digest,
         validate_public_https_uri,
+        validate_s3_source_head,
     )
 
     if (
@@ -6627,6 +6628,25 @@ def acquire_nuplan_archive(
             raise ValueError(
                 f"existing nuPlan object has the wrong size: {object_key}"
             )
+        expected_metadata = {
+            "archive-id": archive["archive_id"],
+            "snapshot-id": manifest["snapshot_id"],
+            "source-contract-sha256": source_contract_sha256,
+            **(
+                {"source-etag": archive["expected_etag"]}
+                if archive["expected_etag"]
+                else {}
+            ),
+        }
+        actual_metadata = head.get("Metadata", {})
+        if any(
+            actual_metadata.get(key) != value
+            for key, value in expected_metadata.items()
+        ):
+            raise ValueError(
+                "existing nuPlan object metadata differs from its source "
+                f"contract: {object_key}"
+            )
         existing_object = s3.get_object(
             Bucket=datasets_bucket,
             Key=object_key,
@@ -6648,17 +6668,18 @@ def acquire_nuplan_archive(
     if upload is None:
         parsed = urlsplit(archive["source_uri"])
         if parsed.scheme == "s3":
-            source_response = s3.get_object(
+            source_s3 = boto3.client("s3")
+            source_head = source_s3.head_object(
                 Bucket=parsed.netloc,
                 Key=parsed.path.lstrip("/"),
             )
-            if int(source_response["ContentLength"]) != int(
-                archive["expected_size_bytes"]
-            ):
-                raise ValueError(
-                    f"source S3 object size differs for "
-                    f"{archive['archive_id']!r}"
-                )
+            if_match = validate_s3_source_head(source_head, archive)
+            source_response = source_s3.get_object(
+                Bucket=parsed.netloc,
+                Key=parsed.path.lstrip("/"),
+                IfMatch=if_match,
+            )
+            validate_s3_source_head(source_response, archive)
             source_context = closing(source_response["Body"])
         else:
             validate_public_https_uri(archive["source_uri"])
@@ -6720,6 +6741,11 @@ def acquire_nuplan_archive(
                     "archive-id": archive["archive_id"],
                     "snapshot-id": manifest["snapshot_id"],
                     "source-contract-sha256": source_contract_sha256,
+                    **(
+                        {"source-etag": archive["expected_etag"]}
+                        if archive["expected_etag"]
+                        else {}
+                    ),
                 },
                 expected_size_bytes=archive["expected_size_bytes"],
                 expected_sha256=archive["expected_sha256"],
