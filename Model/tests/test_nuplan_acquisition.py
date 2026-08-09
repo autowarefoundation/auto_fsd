@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+from pathlib import Path
 
 import pytest
 
@@ -524,3 +525,21 @@ def test_s3_multipart_copy_rejects_part_limit_before_upload():
         )
 
     assert not hasattr(s3, "create_request")
+
+
+def test_flyte_role_can_read_only_the_official_nuplan_v11_prefix():
+    terraform = (
+        Path(__file__).parents[2]
+        / "Platform"
+        / "infra"
+        / "modules"
+        / "flyte"
+        / "main.tf"
+    ).read_text(encoding="utf-8")
+
+    assert '"s3:GetObject"' in terraform
+    assert (
+        '"arn:aws:s3:::motional-nuplan/public/nuplan-v1.1/*"'
+        in terraform
+    )
+    assert '"arn:aws:s3:::motional-nuplan/*"' not in terraform
