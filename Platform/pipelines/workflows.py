@@ -6538,6 +6538,8 @@ def acquire_nuplan_archive(
     from urllib.request import HTTPRedirectHandler, Request, build_opener
 
     import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
     from botocore.exceptions import ClientError
 
     from Platform.pipelines.nuplan_acquisition import (
@@ -6547,6 +6549,7 @@ def acquire_nuplan_archive(
         canonical_json_bytes,
         digest_stream,
         load_source_manifest_bytes,
+        official_nuplan_open_data_region,
         upload_stream_multipart,
         validate_archive_digest,
         validate_public_https_uri,
@@ -6668,15 +6671,28 @@ def acquire_nuplan_archive(
     if upload is None:
         parsed = urlsplit(archive["source_uri"])
         if parsed.scheme == "s3":
-            source_s3 = boto3.client("s3")
+            source_bucket = parsed.netloc
+            source_key = parsed.path.lstrip("/")
+            open_data_region = official_nuplan_open_data_region(
+                source_bucket,
+                source_key,
+            )
+            if open_data_region is None:
+                source_s3 = boto3.client("s3")
+            else:
+                source_s3 = boto3.client(
+                    "s3",
+                    region_name=open_data_region,
+                    config=Config(signature_version=UNSIGNED),
+                )
             source_head = source_s3.head_object(
-                Bucket=parsed.netloc,
-                Key=parsed.path.lstrip("/"),
+                Bucket=source_bucket,
+                Key=source_key,
             )
             if_match = validate_s3_source_head(source_head, archive)
             source_response = source_s3.get_object(
-                Bucket=parsed.netloc,
-                Key=parsed.path.lstrip("/"),
+                Bucket=source_bucket,
+                Key=source_key,
                 IfMatch=if_match,
             )
             validate_s3_source_head(source_response, archive)
