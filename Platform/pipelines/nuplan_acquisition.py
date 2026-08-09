@@ -19,6 +19,9 @@ REQUIRED_COMPONENTS = frozenset({"maps", "database", "sensor_blobs"})
 MIN_MULTIPART_PART_SIZE = 5 * 1024 * 1024
 DEFAULT_MULTIPART_PART_SIZE = 128 * 1024 * 1024
 MAX_MULTIPART_PARTS = 10_000
+OFFICIAL_NUPLAN_OPEN_DATA_BUCKET = "motional-nuplan"
+OFFICIAL_NUPLAN_OPEN_DATA_PREFIX = "public/nuplan-v1.1/"
+OFFICIAL_NUPLAN_OPEN_DATA_REGION = "ap-northeast-1"
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -138,6 +141,16 @@ def normalize_s3_etag(value: Any, field: str = "ETag") -> str:
     if _ETAG_RE.fullmatch(etag) is None:
         raise ValueError(f"{field} has an invalid S3 ETag: {value!r}")
     return etag
+
+
+def official_nuplan_open_data_region(bucket: str, key: str) -> str | None:
+    """Return the source region only for the pinned official nuPlan prefix."""
+    if (
+        bucket == OFFICIAL_NUPLAN_OPEN_DATA_BUCKET
+        and key.startswith(OFFICIAL_NUPLAN_OPEN_DATA_PREFIX)
+    ):
+        return OFFICIAL_NUPLAN_OPEN_DATA_REGION
+    return None
 
 
 def validate_s3_source_head(
