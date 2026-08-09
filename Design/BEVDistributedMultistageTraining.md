@@ -93,6 +93,10 @@ every HTTPS archive. An S3 source MAY instead declare the exact S3 ETag. In
 that case the import task MUST validate the source with `HEAD`, bind the read
 with `If-Match`, and compute SHA-256 and MD5 while streaming into the private
 snapshot.
+The official `s3://motional-nuplan/public/nuplan-v1.1/` prefix MUST be read
+anonymously in `ap-northeast-1`, because its AWS Open Data bucket policy does
+not accept the Platform Pod's IAM-signed request. All other S3 sources retain
+the default IAM-signed access path.
 
 Signed URLs remain only inside the private source manifest. They MUST NOT appear
 in task inputs, logs, archive receipts, or the published snapshot manifest. URL
