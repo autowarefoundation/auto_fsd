@@ -203,40 +203,62 @@ def test_benchmark_manifest_task_scans_only_packed_metadata(tmp_path):
         def __str__(self):
             return self.remote_source
 
-    def build_shard(name, source_split, scene_id):
+    def build_shard(
+        name,
+        source_split,
+        scene_id,
+        *,
+        empty=False,
+        num_views=None,
+        malformed_empty=False,
+    ):
         shard_dir = tmp_path / name
         shard_dir.mkdir()
         tar_name = "shard-000000.tar"
-        with tarfile.open(shard_dir / tar_name, "w") as archive:
-            for index in range(100):
-                frame_index = 64 + index * 90
-                sample_uid = (
-                    f"kitscenes-v1-{scene_id}-f{frame_index:06d}"
-                )
-                payload = json.dumps({
-                    "frame_idx": frame_index,
-                    "sample_uid": sample_uid,
-                    "split_group_uid": f"kitscenes-{scene_id}",
-                }).encode("ascii")
-                info = tarfile.TarInfo(f"{sample_uid}.meta.json")
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
+        if not empty:
+            with tarfile.open(shard_dir / tar_name, "w") as archive:
+                for index in range(100):
+                    frame_index = 64 + index * 90
+                    sample_uid = (
+                        f"kitscenes-v1-{scene_id}-f{frame_index:06d}"
+                    )
+                    payload = json.dumps({
+                        "frame_idx": frame_index,
+                        "sample_uid": sample_uid,
+                        "split_group_uid": f"kitscenes-{scene_id}",
+                    }).encode("ascii")
+                    info = tarfile.TarInfo(f"{sample_uid}.meta.json")
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+        shard_names = [] if empty else [tar_name]
+        shard_count = 1 if malformed_empty else len(shard_names)
+        shard_sample_counts = (
+            {tar_name: 1}
+            if malformed_empty
+            else ({tar_name: 100} if not empty else {})
+        )
         manifest = {
             "data_role": "benchmark",
             "dataset": workflows.Dataset.KITSCENES.value,
             "dataset_version": (
                 workflows.KITSCENES_BENCHMARK_DATASET_VERSION
             ),
-            "has_gps": True,
-            "has_map": True,
-            "has_navigation": True,
+            "has_gps": not empty,
+            "has_map": not empty,
+            "has_navigation": not empty,
             "hz": 10,
-            "num_views": 6,
+            "num_views": (
+                num_views
+                if num_views is not None
+                else (0 if empty else 6)
+            ),
             "partition_id": name,
-            "shard_names": [tar_name],
+            "shard_names": shard_names,
+            "shard_sample_counts": shard_sample_counts,
+            "shards": shard_count,
             "source_revision": workflows.KITSCENES_SOURCE_REVISION,
             "source_split": source_split,
-            "total_samples": 100,
+            "total_samples": 0 if empty else 100,
         }
         (shard_dir / "manifest.json").write_text(
             json.dumps(manifest),
@@ -254,10 +276,16 @@ def test_benchmark_manifest_task_scans_only_packed_metadata(tmp_path):
         "overlap_train_val",
         "fedcba98-7654-3210-fedc-ba9876543210",
     )
+    empty_val = build_shard(
+        "empty-val-scene",
+        "val",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        empty=True,
+    )
 
     result = (
         workflows.create_kitscenes_paper_approximation_manifest.task_function(
-            val_shards=[val],
+            val_shards=[val, empty_val],
             overlap_shards=[overlap],
             release_id="test-paper-approx-v1",
         )
@@ -269,13 +297,129 @@ def test_benchmark_manifest_task_scans_only_packed_metadata(tmp_path):
     assert payload["sample_count"] == 200
     assert payload["selection"]["candidate_count"] == 200
     assert payload["selection"]["metric_or_target_values_read"] is False
+    assert payload["selection"]["empty_partition_count"] == 1
+    assert payload["selection"]["empty_partition_count_by_split"] == {
+        "overlap-train-val": 0,
+        "val": 1,
+    }
+    assert payload["selection"]["empty_partition_ids_by_split"] == {
+        "overlap-train-val": [],
+        "val": ["empty-val-scene"],
+    }
     assert payload["selection"]["selected_count_by_split"] == {
         "overlap-train-val": 100,
         "val": 100,
     }
+    assert {
+        source["partition_id"]: source["empty"]
+        for source in payload["packed_sources"]["val"]
+    } == {
+        "empty-val-scene": True,
+        "val-scene": False,
+    }
     assert result.manifest_sha256 == hashlib.sha256(
         manifest_path.read_bytes()
     ).hexdigest()
+
+
+def test_benchmark_manifest_rejects_nonempty_zero_view_partition(tmp_path):
+    class _Shard:
+        def __init__(self, path):
+            self.path = path
+            self.remote_source = f"s3://benchmark/{path.name}"
+
+        def download(self):
+            return str(self.path)
+
+    shard_dir = tmp_path / "nonempty-zero-view"
+    shard_dir.mkdir()
+    tar_name = "shard-000000.tar"
+    with tarfile.open(shard_dir / tar_name, "w") as archive:
+        payload = json.dumps({
+            "frame_idx": 64,
+            "sample_uid": (
+                "kitscenes-v1-01234567-89ab-cdef-0123-456789abcdef-"
+                "f000064"
+            ),
+            "split_group_uid": (
+                "kitscenes-01234567-89ab-cdef-0123-456789abcdef"
+            ),
+        }).encode("ascii")
+        info = tarfile.TarInfo("sample.meta.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    (shard_dir / "manifest.json").write_text(
+        json.dumps({
+            "data_role": "benchmark",
+            "dataset": workflows.Dataset.KITSCENES.value,
+            "dataset_version": (
+                workflows.KITSCENES_BENCHMARK_DATASET_VERSION
+            ),
+            "has_gps": True,
+            "has_map": True,
+            "has_navigation": True,
+            "hz": 10,
+            "num_views": 0,
+            "partition_id": "nonempty-zero-view",
+            "shard_names": [tar_name],
+            "shard_sample_counts": {tar_name: 1},
+            "shards": 1,
+            "source_revision": workflows.KITSCENES_SOURCE_REVISION,
+            "source_split": "val",
+            "total_samples": 1,
+        }),
+        encoding="ascii",
+    )
+
+    with pytest.raises(ValueError, match="num_views=0, expected=6"):
+        workflows.create_kitscenes_paper_approximation_manifest.task_function(
+            val_shards=[_Shard(shard_dir)],
+            overlap_shards=[_Shard(shard_dir)],
+        )
+
+
+def test_benchmark_manifest_rejects_malformed_empty_partition(tmp_path):
+    class _Shard:
+        def __init__(self, path):
+            self.path = path
+            self.remote_source = f"s3://benchmark/{path.name}"
+
+        def download(self):
+            return str(self.path)
+
+    shard_dir = tmp_path / "malformed-empty"
+    shard_dir.mkdir()
+    (shard_dir / "manifest.json").write_text(
+        json.dumps({
+            "data_role": "benchmark",
+            "dataset": workflows.Dataset.KITSCENES.value,
+            "dataset_version": (
+                workflows.KITSCENES_BENCHMARK_DATASET_VERSION
+            ),
+            "has_gps": False,
+            "has_map": False,
+            "has_navigation": False,
+            "hz": 10,
+            "num_views": 0,
+            "partition_id": "malformed-empty",
+            "shard_names": [],
+            "shard_sample_counts": {"ghost.tar": 1},
+            "shards": 1,
+            "source_revision": workflows.KITSCENES_SOURCE_REVISION,
+            "source_split": "val",
+            "total_samples": 0,
+        }),
+        encoding="ascii",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="empty benchmark partition differs",
+    ):
+        workflows.create_kitscenes_paper_approximation_manifest.task_function(
+            val_shards=[_Shard(shard_dir)],
+            overlap_shards=[_Shard(shard_dir)],
+        )
 
 
 def test_dataset_dynamic_propagates_the_pinned_data_prep_image():
