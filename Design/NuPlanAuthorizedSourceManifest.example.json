@@ -1,0 +1,37 @@
+{
+  "archives": [
+    {
+      "archive_id": "maps-v1",
+      "component": "maps",
+      "expected_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+      "expected_size_bytes": 1,
+      "extract_to": "maps",
+      "filename": "nuplan-maps-v1.0.zip",
+      "source_uri": "https://REPLACE_WITH_AUTHORIZED_DOWNLOAD_URL"
+    },
+    {
+      "archive_id": "mini-database",
+      "component": "database",
+      "expected_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+      "expected_size_bytes": 1,
+      "extract_to": "nuplan-v1.1/splits/mini",
+      "filename": "nuplan-v1.1-mini.zip",
+      "source_uri": "https://REPLACE_WITH_AUTHORIZED_DOWNLOAD_URL"
+    },
+    {
+      "archive_id": "mini-sensor-blobs",
+      "component": "sensor_blobs",
+      "expected_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+      "expected_size_bytes": 1,
+      "extract_to": "nuplan-v1.1/sensor_blobs",
+      "filename": "nuplan-v1.1-mini-sensor-blobs.zip",
+      "source_uri": "https://REPLACE_WITH_AUTHORIZED_DOWNLOAD_URL"
+    }
+  ],
+  "authorization_reference": "REPLACE_WITH_OPERATOR_APPROVAL_REFERENCE",
+  "dataset_revision": "nuplan-v1.1",
+  "map_version": "nuplan-maps-v1.0",
+  "schema_version": "nuplan_authorized_source_v1",
+  "snapshot_id": "nuplan-v1.1-mini-20260809",
+  "terms_of_use_accepted": true
+}
