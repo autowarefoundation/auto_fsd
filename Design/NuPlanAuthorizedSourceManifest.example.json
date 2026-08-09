@@ -12,11 +12,11 @@
     {
       "archive_id": "mini-database",
       "component": "database",
-      "expected_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+      "expected_etag": "REPLACE_WITH_S3_ETAG_WITHOUT_QUOTES",
       "expected_size_bytes": 1,
       "extract_to": "nuplan-v1.1/splits/mini",
       "filename": "nuplan-v1.1-mini.zip",
-      "source_uri": "https://REPLACE_WITH_AUTHORIZED_DOWNLOAD_URL"
+      "source_uri": "s3://REPLACE_WITH_AUTHORIZED_BUCKET/nuplan-v1.1-mini.zip"
     },
     {
       "archive_id": "mini-sensor-blobs",
