@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -31,6 +32,13 @@ MANIFEST_SCHEMA_VERSION = "kitscenes_e2e_benchmark_manifest_v1"
 PROTOCOL_ID = "kitscenes_multimodal_e2e_v1"
 EVALUATOR_VERSION = "kitscenes_pose_displacement_v1"
 PAPER_PROTOCOL_SOURCE = "https://arxiv.org/html/2606.02956#A8.SS4"
+PAPER_APPROXIMATION_SELECTION_VERSION = (
+    "kitscenes_paper_approximation_sha256_v1"
+)
+PAPER_APPROXIMATION_SELECTION_SEED = (
+    "kitscenes-multimodal-e2e-paper-approximation-v1"
+)
+PAPER_WINDOW_STEPS = 90
 
 _PROTOCOL_STATUSES = {
     "development",
@@ -79,6 +87,134 @@ class KITScenesBenchmarkManifest:
             self.frequency_hz * seconds
             for seconds in self.horizons_seconds
         )
+
+
+@dataclass(frozen=True)
+class KITScenesBenchmarkCandidate:
+    sample_uid: str
+    source_split: str
+    scene_id: str
+    frame_index: int
+
+
+def select_paper_approximation_samples(
+    candidates_by_split: Mapping[
+        str, Sequence[KITScenesBenchmarkCandidate]
+    ],
+    *,
+    sample_count: int = 200,
+    window_steps: int = PAPER_WINDOW_STEPS,
+    selection_seed: str = PAPER_APPROXIMATION_SELECTION_SEED,
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """Select a metric-independent approximation of the unpublished 200 UIDs.
+
+    KITScenes specifies 200 non-overlapping nine-second windows from
+    ``val union overlap-train-val`` but does not publish the anchor UIDs or
+    sampling seed. This contract first greedily removes overlapping windows
+    inside each scene, then ranks the remaining candidates by a pinned SHA-256
+    seed. The final UID list is sorted only to make the manifest canonical.
+    """
+    expected_splits = {"val", "overlap-train-val"}
+    if set(candidates_by_split) != expected_splits:
+        raise ValueError(
+            "paper approximation candidates must contain exactly "
+            "val and overlap-train-val"
+        )
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    if window_steps <= 0:
+        raise ValueError("window_steps must be positive")
+    if not selection_seed:
+        raise ValueError("selection_seed must not be empty")
+
+    seen_uids: set[str] = set()
+    non_overlapping: list[KITScenesBenchmarkCandidate] = []
+    candidate_counts: dict[str, int] = {}
+    for split in sorted(expected_splits):
+        by_scene: dict[str, list[KITScenesBenchmarkCandidate]] = defaultdict(
+            list
+        )
+        for candidate in candidates_by_split[split]:
+            if candidate.source_split != split:
+                raise ValueError(
+                    "candidate source split differs from its collection: "
+                    f"{candidate.source_split!r} != {split!r}"
+                )
+            if not _SAFE_SAMPLE_UID.fullmatch(candidate.sample_uid):
+                raise ValueError(
+                    f"unsafe KITScenes candidate UID {candidate.sample_uid!r}"
+                )
+            if not candidate.scene_id:
+                raise ValueError("candidate scene_id must not be empty")
+            if candidate.frame_index < 0:
+                raise ValueError("candidate frame_index must be non-negative")
+            if candidate.sample_uid in seen_uids:
+                raise ValueError(
+                    f"duplicate KITScenes candidate UID {candidate.sample_uid}"
+                )
+            seen_uids.add(candidate.sample_uid)
+            by_scene[candidate.scene_id].append(candidate)
+
+        selected_for_split: list[KITScenesBenchmarkCandidate] = []
+        for scene_id in sorted(by_scene):
+            scene_candidates = sorted(
+                by_scene[scene_id],
+                key=lambda item: (item.frame_index, item.sample_uid),
+            )
+            seen_frames: set[int] = set()
+            last_frame: int | None = None
+            for candidate in scene_candidates:
+                if candidate.frame_index in seen_frames:
+                    raise ValueError(
+                        "duplicate KITScenes candidate frame in scene "
+                        f"{scene_id}: {candidate.frame_index}"
+                    )
+                seen_frames.add(candidate.frame_index)
+                if (
+                    last_frame is None
+                    or candidate.frame_index - last_frame >= window_steps
+                ):
+                    selected_for_split.append(candidate)
+                    last_frame = candidate.frame_index
+        candidate_counts[split] = len(selected_for_split)
+        non_overlapping.extend(selected_for_split)
+
+    if len(non_overlapping) < sample_count:
+        raise ValueError(
+            "KITScenes paper approximation has too few non-overlapping "
+            f"candidates: {len(non_overlapping)} < {sample_count}"
+        )
+
+    def rank(candidate: KITScenesBenchmarkCandidate) -> tuple[str, str]:
+        digest = hashlib.sha256(
+            f"{selection_seed}:{candidate.sample_uid}".encode("ascii")
+        ).hexdigest()
+        return digest, candidate.sample_uid
+
+    selected = sorted(non_overlapping, key=rank)[:sample_count]
+    selected_counts = Counter(
+        candidate.source_split for candidate in selected
+    )
+    missing_splits = expected_splits - set(selected_counts)
+    if missing_splits:
+        raise ValueError(
+            "hash-ranked KITScenes selection omitted source splits: "
+            f"{sorted(missing_splits)}"
+        )
+    sample_uids = tuple(sorted(candidate.sample_uid for candidate in selected))
+    metadata: dict[str, Any] = {
+        "candidate_count": len(non_overlapping),
+        "candidate_count_by_split": {
+            split: candidate_counts[split] for split in sorted(expected_splits)
+        },
+        "non_overlap_window_steps": window_steps,
+        "selected_count_by_split": {
+            split: selected_counts[split] for split in sorted(expected_splits)
+        },
+        "selection_seed": selection_seed,
+        "selection_version": PAPER_APPROXIMATION_SELECTION_VERSION,
+    }
+    return sample_uids, metadata
 
 
 def _required(payload: Mapping[str, Any], key: str) -> Any:
