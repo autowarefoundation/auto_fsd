@@ -73,17 +73,44 @@ only planner under test. The common BEV geometry is `450 x 300` at
 ### 3.1 nuPlan
 
 nuPlan download requires the operator to accept the dataset Terms of Use.
-The workflow MUST receive already authorized, immutable assets:
+The one-time acquisition workflow is:
+
+```text
+private authorized source manifest
+  -> wf_acquire_nuplan_raw_snapshot
+      -> one streaming import task per archive
+      -> size and SHA-256 or MD5 verification
+      -> immutable archive receipt
+      -> redacted canonical snapshot manifest in the datasets bucket
+```
+
+The source manifest MUST record explicit Terms of Use acceptance, an
+authorization reference, dataset and map revisions, and every maps, database,
+and sensor archive. It MAY contain short-lived authorized HTTPS URLs or
+operator-owned S3 URIs. It MUST declare the expected byte size and at least one
+SHA-256 or MD5 digest for every archive.
+
+Signed URLs remain only inside the private source manifest. They MUST NOT appear
+in task inputs, logs, archive receipts, or the published snapshot manifest. URL
+query refresh does not change the source contract identity; archive IDs, sizes,
+digests, extraction destinations, revision fields, and the authorization
+reference do.
+
+The acquisition workflow MUST NOT use an unauthenticated public endpoint or
+accept mutable "latest" paths. It streams each archive directly to the datasets
+bucket with multipart upload, aborts before completion on an integrity mismatch,
+and writes the canonical manifest only after all archive receipts pass. Reusing
+the same snapshot ID is allowed only when the existing bytes and receipts match.
+
+After acquisition, a packing run MUST receive the authorized snapshot assets:
 
 - nuPlan DB files;
 - map root and exact map version;
 - sensor blob root containing the eight required cameras;
 - dataset source revision.
 
-The workflow MUST NOT download nuPlan from an unauthenticated public endpoint
-or accept mutable "latest" paths. Packing MUST reject missing cameras,
-incomplete trajectory horizons, incomplete BEV supervision, or a rejection
-fraction above the declared threshold.
+Packing MUST reject missing cameras, incomplete trajectory horizons, incomplete
+BEV supervision, or a rejection fraction above the declared threshold.
 
 ### 3.2 L2D
 
