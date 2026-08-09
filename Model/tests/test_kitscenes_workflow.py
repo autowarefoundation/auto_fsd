@@ -106,6 +106,10 @@ def test_ingest_map_binds_scalars_and_maps_only_group_ids():
 
 
 def test_kitscenes_data_roles_keep_benchmark_splits_out_of_training():
+    assert (
+        workflows.KITSCENES_BENCHMARK_DATASET_VERSION
+        == "v3.3-benchmark-v2"
+    )
     workflows._validate_kitscenes_data_role(
         data_role="training",
         source_split="train",
