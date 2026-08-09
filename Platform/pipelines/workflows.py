@@ -8738,6 +8738,7 @@ def create_kitscenes_paper_approximation_manifest(
         str, list[KITScenesBenchmarkCandidate]
     ] = {}
     packed_sources: dict[str, list[dict[str, object]]] = {}
+    empty_partition_ids: dict[str, list[str]] = {}
     seen_partition_ids: set[str] = set()
     for protocol_split, (shards, source_split) in split_inputs.items():
         if not shards:
@@ -8766,7 +8767,6 @@ def create_kitscenes_paper_approximation_manifest(
                 "data_role": "benchmark",
                 "dataset_version": KITSCENES_BENCHMARK_DATASET_VERSION,
                 "hz": 10,
-                "num_views": 6,
             }
             for field, expected in expected_fields.items():
                 actual = packed_manifest.get(field)
@@ -8775,11 +8775,6 @@ def create_kitscenes_paper_approximation_manifest(
                         "KITScenes benchmark packed manifest differs from "
                         f"the evaluation contract: {field}={actual!r}, "
                         f"expected={expected!r}"
-                    )
-            for field in ("has_map", "has_gps", "has_navigation"):
-                if not bool(packed_manifest.get(field, False)):
-                    raise ValueError(
-                        f"KITScenes benchmark shard requires {field}=true"
                     )
             partition_id = str(
                 packed_manifest.get("partition_id", "")
@@ -8796,9 +8791,112 @@ def create_kitscenes_paper_approximation_manifest(
             seen_partition_ids.add(partition_id)
 
             shard_names = list(packed_manifest.get("shard_names", []))
-            if not shard_names:
+            shard_count = packed_manifest.get("shards")
+            total_samples = packed_manifest.get("total_samples")
+            shard_sample_counts = packed_manifest.get(
+                "shard_sample_counts"
+            )
+            num_views = packed_manifest.get("num_views")
+            if (
+                isinstance(shard_count, bool)
+                or not isinstance(shard_count, int)
+                or shard_count < 0
+            ):
                 raise ValueError(
-                    f"KITScenes benchmark partition {partition_id} is empty"
+                    "KITScenes benchmark shard count must be a "
+                    f"non-negative integer: {shard_count!r}"
+                )
+            if (
+                isinstance(total_samples, bool)
+                or not isinstance(total_samples, int)
+                or total_samples < 0
+            ):
+                raise ValueError(
+                    "KITScenes benchmark total_samples must be a "
+                    f"non-negative integer: {total_samples!r}"
+                )
+            if not isinstance(shard_sample_counts, dict):
+                raise ValueError(
+                    "KITScenes benchmark shard_sample_counts must be a map"
+                )
+            counted_samples = 0
+            for shard_name, count in shard_sample_counts.items():
+                if (
+                    not isinstance(shard_name, str)
+                    or not shard_name
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count <= 0
+                ):
+                    raise ValueError(
+                        "KITScenes benchmark shard_sample_counts contains "
+                        f"an invalid entry: {shard_name!r}={count!r}"
+                    )
+                counted_samples += count
+
+            is_empty = total_samples == 0
+            if is_empty:
+                empty_contract = {
+                    "num_views": 0,
+                    "shards": 0,
+                    "shard_names": [],
+                    "shard_sample_counts": {},
+                }
+                actual_empty_contract = {
+                    "num_views": num_views,
+                    "shards": shard_count,
+                    "shard_names": shard_names,
+                    "shard_sample_counts": shard_sample_counts,
+                }
+                if actual_empty_contract != empty_contract:
+                    raise ValueError(
+                        "KITScenes empty benchmark partition differs from "
+                        f"the empty contract: {actual_empty_contract!r}"
+                    )
+                for field in ("has_map", "has_gps", "has_navigation"):
+                    if bool(packed_manifest.get(field, False)):
+                        raise ValueError(
+                            "KITScenes empty benchmark partition requires "
+                            f"{field}=false"
+                        )
+                empty_partition_ids.setdefault(protocol_split, []).append(
+                    partition_id
+                )
+                split_sources.append({
+                    "empty": True,
+                    "manifest_sha256": hashlib.sha256(
+                        packed_manifest_bytes
+                    ).hexdigest(),
+                    "partition_id": partition_id,
+                    "sample_count": 0,
+                    "uri": shard_uri,
+                })
+                continue
+
+            if num_views != 6:
+                raise ValueError(
+                    "KITScenes benchmark packed manifest differs from "
+                    "the evaluation contract: "
+                    f"num_views={num_views!r}, expected=6"
+                )
+            for field in ("has_map", "has_gps", "has_navigation"):
+                if not bool(packed_manifest.get(field, False)):
+                    raise ValueError(
+                        f"KITScenes benchmark shard requires {field}=true"
+                    )
+            if (
+                not shard_names
+                or shard_count != len(shard_names)
+                or set(shard_names) != set(shard_sample_counts)
+                or counted_samples != total_samples
+            ):
+                raise ValueError(
+                    "KITScenes benchmark non-empty partition has "
+                    "inconsistent shard metadata: "
+                    f"partition_id={partition_id!r}, shards={shard_count}, "
+                    f"shard_names={len(shard_names)}, "
+                    f"counted_samples={counted_samples}, "
+                    f"total_samples={total_samples}"
                 )
             metadata_count = 0
             for shard_name in shard_names:
@@ -8848,15 +8946,13 @@ def create_kitscenes_paper_approximation_manifest(
                             )
                         )
                         metadata_count += 1
-            expected_count = int(
-                packed_manifest.get("total_samples", -1)
-            )
-            if metadata_count != expected_count:
+            if metadata_count != total_samples:
                 raise ValueError(
                     "KITScenes benchmark metadata count differs from "
-                    f"manifest: {metadata_count} != {expected_count}"
+                    f"manifest: {metadata_count} != {total_samples}"
                 )
             split_sources.append({
+                "empty": False,
                 "manifest_sha256": hashlib.sha256(
                     packed_manifest_bytes
                 ).hexdigest(),
@@ -8869,10 +8965,16 @@ def create_kitscenes_paper_approximation_manifest(
             split_sources,
             key=lambda item: str(item["partition_id"]),
         )
+        empty_partition_ids.setdefault(protocol_split, [])
+        empty_partition_ids[protocol_split].sort()
 
     sample_uids, selection = select_paper_approximation_samples(
         candidates_by_split,
     )
+    empty_partition_count_by_split = {
+        split: len(empty_partition_ids[split])
+        for split in sorted(empty_partition_ids)
+    }
     payload = {
         "authority": "auto-e2e",
         "benchmark_id": "autoe2e-kitscenes-paper-approx-v1",
@@ -8897,6 +8999,16 @@ def create_kitscenes_paper_approximation_manifest(
             "anchor_policy": (
                 "first_packed_anchor_then_greedy_90_frame_stride"
             ),
+            "empty_partition_count": sum(
+                empty_partition_count_by_split.values()
+            ),
+            "empty_partition_count_by_split": (
+                empty_partition_count_by_split
+            ),
+            "empty_partition_ids_by_split": {
+                split: empty_partition_ids[split]
+                for split in sorted(empty_partition_ids)
+            },
             "metric_or_target_values_read": False,
             "packed_history_steps": 64,
             "paper_future_steps": 50,
