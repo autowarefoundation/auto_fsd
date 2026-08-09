@@ -180,6 +180,42 @@ def test_l2d_mini_launcher_uses_explicit_range_and_remote_osm():
     assert re.search(r"\b[0-9]{12}\b", buildspec) is None
 
 
+def test_nuplan_acquisition_launcher_uses_private_manifest_and_retries_admin():
+    buildspec = (
+        Path(distributed_training.__file__).parents[1]
+        / "buildspec-launch-nuplan-acquisition.yml"
+    ).read_text()
+
+    assert '"source_manifest": FlyteFile(' in buildspec
+    assert 'os.environ["SOURCE_MANIFEST_URI"]' in buildspec
+    assert '"datasets_bucket": os.environ["DATASETS_BUCKET"]' in buildspec
+    assert "remote.fetch_execution(" in buildspec
+    assert "remote.sync_execution(" in buildspec
+    assert "FlyteEntityAlreadyExistsException" in buildspec
+    assert "FlyteEntityNotExistException" in buildspec
+    assert "grpc.StatusCode.UNAVAILABLE" in buildspec
+    assert "remote.wait(" not in buildspec
+    assert re.search(r"\b[0-9]{12}\b", buildspec) is None
+    workflow_source = Path(workflows.__file__).read_text()
+    assert "authorized HTTPS source returned" in workflow_source
+    assert "authorized HTTPS source connection failed" in workflow_source
+
+
+def test_nuplan_acquisition_workflow_binds_one_dynamic_import_program():
+    node, = workflows.wf_acquire_nuplan_raw_snapshot.nodes
+
+    assert node.flyte_entity.name.endswith(
+        "_acquire_nuplan_raw_snapshot"
+    )
+    bindings = {
+        binding.var: binding.binding
+        for binding in node.bindings
+    }
+    assert bindings["source_manifest"].promise.var == "source_manifest"
+    assert bindings["datasets_bucket"].promise.var == "datasets_bucket"
+    assert bindings["concurrency"].promise.var == "concurrency"
+
+
 def test_l2d_reactive_pack_workflow_binds_osm_and_target_contract():
     node, = workflows.wf_pack_l2d_reactive_dataset.nodes
     assert node.flyte_entity.name.endswith("wf_create_dataset_sharded")
