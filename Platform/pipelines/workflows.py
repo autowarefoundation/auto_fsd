@@ -6528,7 +6528,7 @@ def acquire_nuplan_archive(
     datasets_bucket: str,
     aws_region: str = "us-west-2",
 ) -> FlyteFile:
-    """Stream one authorized nuPlan archive into an immutable S3 snapshot."""
+    """Import one authorized nuPlan archive into an immutable S3 snapshot."""
     import json
     import tempfile
     from contextlib import closing
@@ -6547,10 +6547,11 @@ def acquire_nuplan_archive(
         archive_object_key,
         archive_receipt_key,
         canonical_json_bytes,
+        copy_s3_object_multipart,
         digest_stream,
         load_source_manifest_bytes,
         official_nuplan_open_data_region,
-        upload_stream_multipart,
+        upload_https_stream_multipart,
         validate_archive_digest,
         validate_public_https_uri,
         validate_s3_source_head,
@@ -6573,6 +6574,7 @@ def acquire_nuplan_archive(
             f"{len(manifest['archives'])} source archives"
         )
     archive = manifest["archives"][archive_index]
+    parsed_source = urlsplit(archive["source_uri"])
     object_key = archive_object_key(manifest, archive)
     receipt_key = archive_receipt_key(manifest, archive)
     s3 = boto3.client("s3", region_name=aws_region)
@@ -6610,16 +6612,39 @@ def acquire_nuplan_archive(
             raise ValueError(
                 f"existing nuPlan receipt conflicts with {archive['archive_id']!r}"
             )
-        head = s3.head_object(Bucket=datasets_bucket, Key=object_key)
+        head_arguments = {
+            "Bucket": datasets_bucket,
+            "Key": object_key,
+        }
+        if receipt.get("transfer_mode") == "s3_server_side_multipart_copy":
+            head_arguments["ChecksumMode"] = "ENABLED"
+        head = s3.head_object(**head_arguments)
         if int(head["ContentLength"]) != int(receipt["size_bytes"]):
             raise ValueError(
                 f"existing nuPlan object size differs from receipt: {object_key}"
+            )
+        if (
+            receipt.get("checksum_crc64nvme")
+            and head.get("ChecksumCRC64NVME")
+            != receipt["checksum_crc64nvme"]
+        ):
+            raise ValueError(
+                "existing nuPlan object checksum differs from receipt: "
+                f"{object_key}"
             )
         return receipt_output(receipt_bytes)
 
     upload = None
     try:
-        head = s3.head_object(Bucket=datasets_bucket, Key=object_key)
+        head = s3.head_object(
+            Bucket=datasets_bucket,
+            Key=object_key,
+            **(
+                {"ChecksumMode": "ENABLED"}
+                if parsed_source.scheme == "s3"
+                else {}
+            ),
+        )
     except ClientError as error:
         if error.response.get("Error", {}).get("Code") not in {
             "404",
@@ -6650,29 +6675,51 @@ def acquire_nuplan_archive(
                 "existing nuPlan object metadata differs from its source "
                 f"contract: {object_key}"
             )
-        existing_object = s3.get_object(
-            Bucket=datasets_bucket,
-            Key=object_key,
-        )
-        with closing(existing_object["Body"]) as existing_stream:
-            upload = digest_stream(existing_stream)
-        validate_archive_digest(
-            upload,
-            expected_size_bytes=archive["expected_size_bytes"],
-            expected_sha256=archive["expected_sha256"],
-            expected_md5=archive["expected_md5"],
-            label=object_key,
-        )
+        if parsed_source.scheme == "s3":
+            checksum = head.get("ChecksumCRC64NVME")
+            if not isinstance(checksum, str) or not checksum:
+                raise ValueError(
+                    "existing server-side copied nuPlan object lacks "
+                    f"CRC64NVME: {object_key}"
+                )
+            upload = {
+                "checksum_crc64nvme": checksum,
+                "destination_etag": str(head["ETag"]).strip('"').lower(),
+                "md5": "",
+                "sha256": "",
+                "size_bytes": int(head["ContentLength"]),
+                "source_etag": archive["expected_etag"],
+                "transfer_mode": "s3_server_side_multipart_copy",
+            }
+        else:
+            existing_object = s3.get_object(
+                Bucket=datasets_bucket,
+                Key=object_key,
+            )
+            with closing(existing_object["Body"]) as existing_stream:
+                upload = digest_stream(existing_stream)
+            validate_archive_digest(
+                upload,
+                expected_size_bytes=archive["expected_size_bytes"],
+                expected_sha256=archive["expected_sha256"],
+                expected_md5=archive["expected_md5"],
+                label=object_key,
+            )
+            upload.update({
+                "checksum_crc64nvme": "",
+                "destination_etag": str(head["ETag"]).strip('"').lower(),
+                "source_etag": "",
+                "transfer_mode": "https_stream_hash",
+            })
         print(
             "Recovered nuPlan archive receipt from existing verified object "
             f"id={archive['archive_id']}"
         )
 
     if upload is None:
-        parsed = urlsplit(archive["source_uri"])
-        if parsed.scheme == "s3":
-            source_bucket = parsed.netloc
-            source_key = parsed.path.lstrip("/")
+        if parsed_source.scheme == "s3":
+            source_bucket = parsed_source.netloc
+            source_key = parsed_source.path.lstrip("/")
             open_data_region = official_nuplan_open_data_region(
                 source_bucket,
                 source_key,
@@ -6689,14 +6736,22 @@ def acquire_nuplan_archive(
                 Bucket=source_bucket,
                 Key=source_key,
             )
-            if_match = validate_s3_source_head(source_head, archive)
-            source_response = source_s3.get_object(
-                Bucket=source_bucket,
-                Key=source_key,
-                IfMatch=if_match,
+            validate_s3_source_head(source_head, archive)
+            upload = copy_s3_object_multipart(
+                s3_client=s3,
+                source_bucket=source_bucket,
+                source_key=source_key,
+                source_etag=archive["expected_etag"],
+                destination_bucket=datasets_bucket,
+                destination_key=object_key,
+                metadata={
+                    "archive-id": archive["archive_id"],
+                    "snapshot-id": manifest["snapshot_id"],
+                    "source-contract-sha256": source_contract_sha256,
+                    "source-etag": archive["expected_etag"],
+                },
+                expected_size_bytes=archive["expected_size_bytes"],
             )
-            validate_s3_source_head(source_response, archive)
-            source_context = closing(source_response["Body"])
         else:
             validate_public_https_uri(archive["source_uri"])
 
@@ -6745,43 +6800,57 @@ def acquire_nuplan_archive(
                     f"archive_id={archive['archive_id']} "
                     f"reason_type={type(error.reason).__name__}"
                 ) from None
-            source_context = closing(source_response)
+            with closing(source_response) as source_stream:
+                upload = upload_https_stream_multipart(
+                    s3_client=s3,
+                    stream=source_stream,
+                    bucket=datasets_bucket,
+                    key=object_key,
+                    metadata={
+                        "archive-id": archive["archive_id"],
+                        "snapshot-id": manifest["snapshot_id"],
+                        "source-contract-sha256": source_contract_sha256,
+                    },
+                    expected_size_bytes=archive["expected_size_bytes"],
+                    expected_sha256=archive["expected_sha256"],
+                    expected_md5=archive["expected_md5"],
+                )
+            upload.update({
+                "checksum_crc64nvme": "",
+                "source_etag": "",
+                "transfer_mode": "https_stream_hash",
+            })
 
-        with source_context as source_stream:
-            upload = upload_stream_multipart(
-                s3_client=s3,
-                stream=source_stream,
-                bucket=datasets_bucket,
-                key=object_key,
-                metadata={
-                    "archive-id": archive["archive_id"],
-                    "snapshot-id": manifest["snapshot_id"],
-                    "source-contract-sha256": source_contract_sha256,
-                    **(
-                        {"source-etag": archive["expected_etag"]}
-                        if archive["expected_etag"]
-                        else {}
-                    ),
-                },
-                expected_size_bytes=archive["expected_size_bytes"],
-                expected_sha256=archive["expected_sha256"],
-                expected_md5=archive["expected_md5"],
-            )
-
-    head = s3.head_object(Bucket=datasets_bucket, Key=object_key)
+    head = s3.head_object(
+        Bucket=datasets_bucket,
+        Key=object_key,
+        **(
+            {"ChecksumMode": "ENABLED"}
+            if upload["transfer_mode"] == "s3_server_side_multipart_copy"
+            else {}
+        ),
+    )
     if int(head["ContentLength"]) != int(upload["size_bytes"]):
         raise ValueError(
             f"uploaded nuPlan archive size differs after completion: {object_key}"
         )
+    upload.setdefault(
+        "destination_etag",
+        str(head["ETag"]).strip('"').lower(),
+    )
     receipt = {
         "archive_id": archive["archive_id"],
+        "checksum_crc64nvme": upload.get("checksum_crc64nvme", ""),
         "component": archive["component"],
+        "destination_etag": upload["destination_etag"],
         "md5": upload["md5"],
         "object_uri": f"s3://{datasets_bucket}/{object_key}",
         "schema_version": ARCHIVE_RECEIPT_SCHEMA_VERSION,
         "sha256": upload["sha256"],
         "size_bytes": upload["size_bytes"],
         "source_contract_sha256": source_contract_sha256,
+        "source_etag": upload.get("source_etag", ""),
+        "transfer_mode": upload["transfer_mode"],
     }
     receipt_bytes = canonical_json_bytes(receipt)
     try:
@@ -6809,7 +6878,9 @@ def acquire_nuplan_archive(
     print(
         "Imported nuPlan archive "
         f"id={archive['archive_id']} component={archive['component']} "
-        f"size_bytes={upload['size_bytes']} sha256={upload['sha256']}"
+        f"size_bytes={upload['size_bytes']} "
+        f"transfer_mode={upload['transfer_mode']} "
+        f"integrity={upload.get('checksum_crc64nvme') or upload['sha256']}"
     )
     return receipt_output(receipt_bytes)
 
