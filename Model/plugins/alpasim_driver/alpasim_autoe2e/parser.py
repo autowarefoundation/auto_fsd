@@ -87,8 +87,33 @@ class AlpasimStreamParser:
 
         map_context = torch.zeros(1, 3, 256, 256, dtype=torch.float32)
         route_mask = torch.zeros(1, 2, 256, 256, dtype=torch.float32)
+        route_valid_flag = False
+
+        cmd_raw = observation.get("command", 3)
+        cmd = int(cmd_raw) if cmd_raw is not None else 3
+        if cmd in (0, 1, 2):  # LEFT=0, STRAIGHT=1, RIGHT=2
+            route_valid_flag = True
+            y, x = torch.meshgrid(torch.arange(256), torch.arange(256), indexing="ij")
+            
+            # Ego is anchored at row 170.0, col 127.5 in the BEV map (facing UP / negative y)
+            dy = 170.0 - y
+            dx = x - 127.5
+            
+            # Only illuminate the route in front of the vehicle
+            front_mask = dy > 0
+            
+            if cmd == 0:  # LEFT
+                mask = front_mask & (dx < -0.0025 * (dy ** 2) + 15)
+            elif cmd == 1:  # STRAIGHT
+                mask = front_mask & (dx >= -0.001 * (dy ** 2) - 15) & (dx <= 0.001 * (dy ** 2) + 15)
+            elif cmd == 2:  # RIGHT
+                mask = front_mask & (dx > 0.0025 * (dy ** 2) - 15)
+            
+            # RouteChannel.SELECTED_CORRIDOR is index 0
+            route_mask[0, 0, mask] = 1.0
+
         map_valid = torch.tensor([False], dtype=torch.bool)
-        route_valid = torch.tensor([False], dtype=torch.bool)
+        route_valid = torch.tensor([route_valid_flag], dtype=torch.bool)
 
         matrices = [_KIT_SCENES_PROJECTION_MATRICES[name] for name in self.camera_names]
         camera_params = torch.tensor(matrices, dtype=torch.float32).unsqueeze(0)

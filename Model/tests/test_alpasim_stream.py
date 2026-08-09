@@ -210,6 +210,47 @@ class TestAlpasimStreamParserFixturesAndBasicShape:
         assert t2.shape == (1, 7, 3, 256, 256)
         assert t3.shape == (1, 7, 3, 256, 256)
 
+    def test_route_mask_parabolic_logic(self) -> None:
+        """Verify the route mask logic correctly generates parabolic masks for LEFT, STRAIGHT, RIGHT."""
+        parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+
+        # Test command = 0 (LEFT)
+        tensors_left = parser.parse_observation(
+            {"cameras": {}, "speed": 0.0, "acceleration": 0.0, "command": 0}
+        )
+        mask_left = tensors_left["route_mask"][0, 0]
+        
+        # Ego anchored at row 170.0, col 127.5
+        # For a point at y=100 (dy = 70): dx < -0.0025 * (70**2) + 15 = -12.25 + 15 = 2.75
+        # Therefore x < 127.5 + 2.75 = 130.25
+        assert mask_left[100, 120] == 1.0
+        assert mask_left[100, 140] == 0.0
+        # Points behind ego (y >= 170, e.g., y=200) should be 0.0 due to front_mask
+        assert mask_left[200, 120] == 0.0
+
+        # Test command = 1 (STRAIGHT)
+        tensors_straight = parser.parse_observation(
+            {"cameras": {}, "speed": 0.0, "acceleration": 0.0, "command": 1}
+        )
+        mask_straight = tensors_straight["route_mask"][0, 0]
+        # For y=100 (dy = 70): dx >= -0.001 * (70**2) - 15 = -4.9 - 15 = -19.9
+        #                      dx <= 0.001 * (70**2) + 15 = 4.9 + 15 = 19.9
+        # Therefore 107.6 <= x <= 147.4
+        assert mask_straight[100, 120] == 1.0
+        assert mask_straight[100, 140] == 1.0
+        assert mask_straight[100, 100] == 0.0
+        assert mask_straight[100, 150] == 0.0
+
+        # Test command = 2 (RIGHT)
+        tensors_right = parser.parse_observation(
+            {"cameras": {}, "speed": 0.0, "acceleration": 0.0, "command": 2}
+        )
+        mask_right = tensors_right["route_mask"][0, 0]
+        # For y=100 (dy = 70): dx > 0.0025 * (70**2) - 15 = 12.25 - 15 = -2.75
+        # Therefore x > 124.75
+        assert mask_right[100, 140] == 1.0
+        assert mask_right[100, 120] == 0.0
+
 
 class TestOfflineKitScenesParity:
     """Parity assertions between AlpasimStreamParser and offline KitScenes datasets."""

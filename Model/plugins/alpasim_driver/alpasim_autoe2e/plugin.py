@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, List, cast
+from typing import Any, Dict, List, cast
 import os
 import sys
 import torch
@@ -47,9 +47,9 @@ except ImportError:
         command: Any = _MockDriveCommand.STRAIGHT
         speed: float = 0.0
         acceleration: float = 0.0
-        ego_pose_history: Optional[List[Any]] = None
+        ego_pose_history: List[Any] | None = None
         inference_seed: int = 0
-        cameras: Optional[Dict[str, Any]] = None
+        cameras: Dict[str, Any] | None = None
 
         def __post_init__(self) -> None:
             if self.cameras is not None and not self.camera_images:
@@ -61,8 +61,8 @@ except ImportError:
     class _MockModelPrediction:
         trajectory_xy: np.ndarray
         headings: np.ndarray
-        reasoning_text: Optional[str] = None
-        trajectory_points: Optional[np.ndarray] = None
+        reasoning_text: str | None = None
+        trajectory_points: np.ndarray | None = None
 
         def __post_init__(self) -> None:
             if self.trajectory_points is not None and self.trajectory_xy is None:
@@ -94,7 +94,7 @@ class AutoE2EDriver(BaseTrajectoryModel):
         model_checkpoint: str = "dummy_random.ckpt",
         allow_mock: bool = False,
         allow_untrained_model: bool = False,
-        camera_ids: Optional[List[str]] = None,
+        camera_ids: List[str] | None = None,
         **kwargs: Any
     ) -> None:
         super().__init__()
@@ -155,7 +155,7 @@ class AutoE2EDriver(BaseTrajectoryModel):
         model_cfg: Any,
         device: torch.device,
         camera_ids: List[str],
-        context_length: Optional[int],
+        context_length: int | None,
         output_frequency_hz: int,
         allow_mock: bool = False,
         allow_untrained_model: bool = False,
@@ -267,7 +267,6 @@ class AutoE2EDriver(BaseTrajectoryModel):
         })
         
         parsed = self.parser.parse_observation(input_dict)
-        from typing import Any
         tensors: dict[str, Any] = {k: v.to(self.device) for k, v in parsed.items()}
         
         if "camera_params" in tensors:
