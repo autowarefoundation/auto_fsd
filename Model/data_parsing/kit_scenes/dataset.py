@@ -37,9 +37,7 @@ from .camera import (
     load_camera_frame,
 )
 from .egomotion import (
-    MIN_ROWS,
     _FUTURE_TIMESTEPS,
-    _HISTORY_TIMESTEPS,
     load_egomotion,
     pose_yaws,
     poses_to_arrays,
@@ -47,6 +45,12 @@ from .egomotion import (
 from .map import _cached_scene_map, generate_bev_map_tile
 from .navigation import KitScenesSceneNavigation, build_scene_navigation
 from .source import KITSCENES_DATA_REVISION
+from .temporal_contract import (
+    KITSCENES_BENCHMARK_FUTURE_STEPS,
+    KITSCENES_BENCHMARK_HISTORY_STEPS,
+    KITSCENES_TRAINING_FUTURE_STEPS,
+    KITSCENES_TRAINING_HISTORY_STEPS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +142,7 @@ class KitScenesDataset(Dataset):
         reasoning_clip_only: bool = False,
         include_navigation: bool = False,
         source_revision: str = KITSCENES_DATA_REVISION,
+        benchmark_protocol: bool = False,
     ) -> None:
         if image_size <= 0:
             raise ValueError(f"image_size must be positive, got {image_size}")
@@ -158,6 +163,17 @@ class KitScenesDataset(Dataset):
         self._front_cam = self.camera_names[0]
         self._include_navigation = include_navigation
         self._source_revision = source_revision
+        self._benchmark_protocol = benchmark_protocol
+        self._sampling_history_steps = (
+            KITSCENES_BENCHMARK_HISTORY_STEPS
+            if benchmark_protocol
+            else KITSCENES_TRAINING_HISTORY_STEPS
+        )
+        self._sampling_future_steps = (
+            KITSCENES_BENCHMARK_FUTURE_STEPS
+            if benchmark_protocol
+            else KITSCENES_TRAINING_FUTURE_STEPS
+        )
 
         self._sdk = _KITScenesSDK(root=data_root, split=split)
         available = set(self._sdk.scene_ids)
@@ -207,12 +223,17 @@ class KitScenesDataset(Dataset):
             return []
 
         poses = tuple(load_ego_poses(loader.scene_path))
-        if len(poses) < MIN_ROWS:
+        minimum_rows = (
+            self._sampling_history_steps
+            + self._sampling_future_steps
+            + 1
+        )
+        if len(poses) < minimum_rows:
             logger.warning(
                 "Scene %s has only %d ego poses (need %d). Skipping.",
                 scene_id,
                 len(poses),
-                MIN_ROWS,
+                minimum_rows,
             )
             return []
 
@@ -225,8 +246,8 @@ class KitScenesDataset(Dataset):
             len(loader.get_reference_timestamps()),
             *camera_lengths,
         )
-        min_idx = _HISTORY_TIMESTEPS
-        max_idx = usable - _FUTURE_TIMESTEPS - 1
+        min_idx = self._sampling_history_steps
+        max_idx = usable - self._sampling_future_steps - 1
         if max_idx < min_idx:
             logger.warning(
                 "Scene %s: usable span %d too short for a sample. Skipping.",
@@ -395,13 +416,24 @@ class KitScenesDataset(Dataset):
     ]:
         scene_id, frame_idx = self._samples[idx]
         ego_history, trajectory = load_egomotion(
-            self._scene_egomotion[scene_id], frame_idx=frame_idx
+            self._scene_egomotion[scene_id],
+            frame_idx=frame_idx,
+            history_steps=self._sampling_history_steps,
+            future_steps=self._sampling_future_steps,
         )
         latlon = self._scene_latlon[scene_id]
-        gps_future = np.asarray(
-            latlon[frame_idx:frame_idx + _FUTURE_TIMESTEPS + 1],
+        observed_gps = np.asarray(
+            latlon[
+                frame_idx:frame_idx + self._sampling_future_steps + 1
+            ],
             dtype=np.float64,
         )
+        gps_future = np.empty(
+            (_FUTURE_TIMESTEPS + 1, 2),
+            dtype=np.float64,
+        )
+        gps_future[: len(observed_gps)] = observed_gps
+        gps_future[len(observed_gps):] = observed_gps[-1]
         expected = (_FUTURE_TIMESTEPS + 1, 2)
         if gps_future.shape != expected:
             raise IndexError(
