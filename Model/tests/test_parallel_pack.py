@@ -404,11 +404,13 @@ def test_init_row_worker_preserves_kitscenes_source_contract(monkeypatch):
         IMAGE_SIZE,
         "overlap_train_val",
         "revision-held-out",
+        True,
     )
 
     assert captured["split"] == "overlap_train_val"
     assert captured["source_revision"] == "revision-held-out"
     assert captured["scene_ids"] == ["scene-held-out"]
+    assert captured["benchmark_protocol"] is True
 
 
 def test_init_row_worker_preserves_l2d_source_revision(monkeypatch):
