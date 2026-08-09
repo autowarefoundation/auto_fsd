@@ -202,6 +202,8 @@ def test_nuplan_acquisition_launcher_uses_private_manifest_and_retries_admin():
     workflow_source = Path(workflows.__file__).read_text()
     assert "authorized HTTPS source returned" in workflow_source
     assert "authorized HTTPS source connection failed" in workflow_source
+    assert "copy_s3_object_multipart(" in workflow_source
+    assert "source_s3.get_object(" not in workflow_source
 
 
 def test_nuplan_acquisition_workflow_binds_one_dynamic_import_program():
