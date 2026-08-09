@@ -78,7 +78,8 @@ The one-time acquisition workflow is:
 ```text
 private authorized source manifest
   -> wf_acquire_nuplan_raw_snapshot
-      -> one streaming import task per archive
+      -> one import-control task per archive
+      -> S3 UploadPartCopy or authorized HTTPS streaming
       -> size plus digest or exact S3 ETag verification
       -> immutable archive receipt
       -> redacted canonical snapshot manifest in the datasets bucket
@@ -90,13 +91,20 @@ and sensor archive. It MAY contain short-lived authorized HTTPS URLs,
 operator-owned S3 URIs, or an official Registry of Open Data on AWS S3 URI. It
 MUST declare the expected byte size and at least one SHA-256 or MD5 digest for
 every HTTPS archive. An S3 source MAY instead declare the exact S3 ETag. In
-that case the import task MUST validate the source with `HEAD`, bind the read
-with `If-Match`, and compute SHA-256 and MD5 while streaming into the private
-snapshot.
+that case the import task MUST validate the source with `HEAD` and use
+`CreateMultipartUpload`, `UploadPartCopy`, and `CompleteMultipartUpload`.
+Every copy part MUST bind the source with `CopySourceIfMatch`. S3 archive bytes
+MUST NOT pass through the task Pod. The destination object MUST publish a
+full-object CRC64NVME checksum, and the archive receipt MUST record that
+checksum, the source ETag, the destination ETag, and the transfer mode.
 The official `s3://motional-nuplan/public/nuplan-v1.1/` prefix MUST be read
 anonymously in `ap-northeast-1`, because its AWS Open Data bucket policy does
 not accept the Platform Pod's IAM-signed request. All other S3 sources retain
 the default IAM-signed access path.
+
+Authorized HTTPS sources are the only sources that use Pod-mediated streaming.
+For those sources, the task MUST compute SHA-256 and MD5 while uploading and
+abort before completion on an integrity mismatch.
 
 Signed URLs remain only inside the private source manifest. They MUST NOT appear
 in task inputs, logs, archive receipts, or the published snapshot manifest. URL
@@ -106,11 +114,16 @@ reference do.
 
 The acquisition workflow MUST NOT use an unverified public endpoint or accept
 mutable "latest" paths. An official AWS Open Data object is accepted only when
-its bucket, key, byte size, and ETag are pinned. The workflow streams each
-archive directly to the datasets bucket with multipart upload, aborts before
-completion on an integrity mismatch, and writes the canonical manifest only
-after all archive receipts pass. Reusing the same snapshot ID is allowed only
-when the existing bytes and receipts match.
+its bucket, key, byte size, and ETag are pinned. The workflow copies S3
+archives inside S3 without consuming Pod network bandwidth and writes the
+canonical manifest only after all archive receipts pass. Reusing the same
+snapshot ID is allowed only when the existing objects, metadata, checksums,
+and receipts match.
+
+The raw snapshot preserves every official v1.1 distribution artifact,
+including mini and full split archives that may contain overlapping logs.
+Training manifests, rather than acquisition, are responsible for removing
+duplicate samples.
 
 After acquisition, a packing run MUST receive the authorized snapshot assets:
 
