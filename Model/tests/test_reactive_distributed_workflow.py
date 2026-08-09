@@ -194,6 +194,9 @@ def test_nuplan_acquisition_launcher_uses_private_manifest_and_retries_admin():
     assert "FlyteEntityAlreadyExistsException" in buildspec
     assert "FlyteEntityNotExistException" in buildspec
     assert "grpc.StatusCode.UNAVAILABLE" in buildspec
+    assert 'WAIT_FOR_COMPLETION: "true"' in buildspec
+    assert 'os.environ["WAIT_FOR_COMPLETION"] == "true"' in buildspec
+    assert "FLYTE_EXECUTION_DETACHED=true" in buildspec
     assert "remote.wait(" not in buildspec
     assert re.search(r"\b[0-9]{12}\b", buildspec) is None
     workflow_source = Path(workflows.__file__).read_text()
