@@ -79,16 +79,20 @@ The one-time acquisition workflow is:
 private authorized source manifest
   -> wf_acquire_nuplan_raw_snapshot
       -> one streaming import task per archive
-      -> size and SHA-256 or MD5 verification
+      -> size plus digest or exact S3 ETag verification
       -> immutable archive receipt
       -> redacted canonical snapshot manifest in the datasets bucket
 ```
 
 The source manifest MUST record explicit Terms of Use acceptance, an
 authorization reference, dataset and map revisions, and every maps, database,
-and sensor archive. It MAY contain short-lived authorized HTTPS URLs or
-operator-owned S3 URIs. It MUST declare the expected byte size and at least one
-SHA-256 or MD5 digest for every archive.
+and sensor archive. It MAY contain short-lived authorized HTTPS URLs,
+operator-owned S3 URIs, or an official Registry of Open Data on AWS S3 URI. It
+MUST declare the expected byte size and at least one SHA-256 or MD5 digest for
+every HTTPS archive. An S3 source MAY instead declare the exact S3 ETag. In
+that case the import task MUST validate the source with `HEAD`, bind the read
+with `If-Match`, and compute SHA-256 and MD5 while streaming into the private
+snapshot.
 
 Signed URLs remain only inside the private source manifest. They MUST NOT appear
 in task inputs, logs, archive receipts, or the published snapshot manifest. URL
@@ -96,17 +100,20 @@ query refresh does not change the source contract identity; archive IDs, sizes,
 digests, extraction destinations, revision fields, and the authorization
 reference do.
 
-The acquisition workflow MUST NOT use an unauthenticated public endpoint or
-accept mutable "latest" paths. It streams each archive directly to the datasets
-bucket with multipart upload, aborts before completion on an integrity mismatch,
-and writes the canonical manifest only after all archive receipts pass. Reusing
-the same snapshot ID is allowed only when the existing bytes and receipts match.
+The acquisition workflow MUST NOT use an unverified public endpoint or accept
+mutable "latest" paths. An official AWS Open Data object is accepted only when
+its bucket, key, byte size, and ETag are pinned. The workflow streams each
+archive directly to the datasets bucket with multipart upload, aborts before
+completion on an integrity mismatch, and writes the canonical manifest only
+after all archive receipts pass. Reusing the same snapshot ID is allowed only
+when the existing bytes and receipts match.
 
 After acquisition, a packing run MUST receive the authorized snapshot assets:
 
 - nuPlan DB files;
 - map root and exact map version;
 - sensor blob root containing the eight required cameras;
+- LiDAR blobs used to construct the BEV supervision observability mask;
 - dataset source revision.
 
 Packing MUST reject missing cameras, incomplete trajectory horizons, incomplete
