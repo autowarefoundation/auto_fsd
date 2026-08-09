@@ -21,8 +21,13 @@ import torch
 from kitscenes.schema import EgoPose
 from scipy.spatial.transform import Rotation
 
-_HISTORY_TIMESTEPS = 64         # 6.4 s of past context at 10 Hz
-_FUTURE_TIMESTEPS = 64          # 6.4 s of future prediction at 10 Hz
+from .temporal_contract import (
+    KITSCENES_ABI_FUTURE_STEPS,
+    KITSCENES_ABI_HISTORY_STEPS,
+)
+
+_HISTORY_TIMESTEPS = KITSCENES_ABI_HISTORY_STEPS
+_FUTURE_TIMESTEPS = KITSCENES_ABI_FUTURE_STEPS
 _NUM_HISTORY_SIGNALS = 4        # speed, acceleration, yaw_rate, curvature
 _NUM_TARGET_SIGNALS = 2         # acceleration, curvature
 
@@ -99,35 +104,64 @@ def poses_to_arrays(
 def load_egomotion(
     egomotion_arr: np.ndarray,
     frame_idx: int,
+    *,
+    history_steps: int = _HISTORY_TIMESTEPS,
+    future_steps: int = _FUTURE_TIMESTEPS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Slice egomotion history and trajectory target around a sample point.
+    """Slice egomotion around a sample point and pad to the fixed model ABI.
 
-    Takes the 64 timesteps before ``frame_idx`` as the history and the 64
-    timesteps after it as the target. Ensure ``frame_idx`` is in the valid range:
+    Training uses the default 64 past and 64 future rows. The KITScenes paper
+    approximation uses 40 past and 50 future rows while retaining the same
+    tensor shapes: history is left-zero-padded and targets are right-zero-padded.
 
-        _HISTORY_TIMESTEPS <= frame_idx <= len(egomotion_arr) - _FUTURE_TIMESTEPS - 1
+    ``frame_idx`` must satisfy the requested sampling margins.
 
     Args:
         egomotion_arr: Derived (T, 4) array from ``poses_to_arrays``.
         frame_idx: Reference-timeline index treated as the current moment.
+        history_steps: Real history rows to retain, at most 64.
+        future_steps: Real future target rows to retain, at most 64.
 
     Returns:
         egomotion_history: Float tensor of shape ``(256,)``.
         trajectory_target: Float tensor of shape ``(128,)``.
     """
-    min_idx = _HISTORY_TIMESTEPS
-    max_idx = len(egomotion_arr) - _FUTURE_TIMESTEPS - 1
+    if not 1 <= history_steps <= _HISTORY_TIMESTEPS:
+        raise ValueError(
+            "history_steps must be in "
+            f"[1,{_HISTORY_TIMESTEPS}], got {history_steps}"
+        )
+    if not 1 <= future_steps <= _FUTURE_TIMESTEPS:
+        raise ValueError(
+            "future_steps must be in "
+            f"[1,{_FUTURE_TIMESTEPS}], got {future_steps}"
+        )
+
+    min_idx = history_steps
+    max_idx = len(egomotion_arr) - future_steps - 1
     if not (min_idx <= frame_idx <= max_idx):
         raise ValueError(
             f"frame_idx {frame_idx} out of valid range [{min_idx}, {max_idx}] "
             f"for a {len(egomotion_arr)}-pose scene."
         )
 
-    history = egomotion_arr[frame_idx - _HISTORY_TIMESTEPS:frame_idx]          # (64, 4)
-    future = egomotion_arr[frame_idx + 1:frame_idx + 1 + _FUTURE_TIMESTEPS]    # (64, 4)
-    target = future[:, _TARGET_IDX]                                         # (64, 2)
+    history = np.zeros(
+        (_HISTORY_TIMESTEPS, _NUM_HISTORY_SIGNALS),
+        dtype=np.float32,
+    )
+    history[-history_steps:] = egomotion_arr[
+        frame_idx - history_steps:frame_idx
+    ]
+    future = egomotion_arr[
+        frame_idx + 1:frame_idx + 1 + future_steps
+    ]
+    target = np.zeros(
+        (_FUTURE_TIMESTEPS, _NUM_TARGET_SIGNALS),
+        dtype=np.float32,
+    )
+    target[:future_steps] = future[:, _TARGET_IDX]
 
     return (
-        torch.from_numpy(history.flatten()),   # (256,)
-        torch.from_numpy(target.flatten()),    # (128,)
+        torch.from_numpy(history.flatten()),
+        torch.from_numpy(target.flatten()),
     )
