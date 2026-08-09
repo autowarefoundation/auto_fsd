@@ -19,6 +19,9 @@ from flytekit.configuration import ImageConfig, SerializationSettings
 
 from Platform.pipelines import workflows
 from data_parsing.kit_scenes.source import InventoryResolution, SceneArchive
+from data_parsing.kit_scenes.temporal_contract import (
+    kitscenes_temporal_contract,
+)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -108,7 +111,7 @@ def test_ingest_map_binds_scalars_and_maps_only_group_ids():
 def test_kitscenes_data_roles_keep_benchmark_splits_out_of_training():
     assert (
         workflows.KITSCENES_BENCHMARK_DATASET_VERSION
-        == "v3.3-benchmark-v2"
+        == "v3.3-benchmark-v3"
     )
     workflows._validate_kitscenes_data_role(
         data_role="training",
@@ -258,6 +261,9 @@ def test_benchmark_manifest_task_scans_only_packed_metadata(tmp_path):
             "shards": shard_count,
             "source_revision": workflows.KITSCENES_SOURCE_REVISION,
             "source_split": source_split,
+            "temporal_sampling": kitscenes_temporal_contract(
+                benchmark_protocol=True,
+            ),
             "total_samples": 0 if empty else 100,
         }
         (shard_dir / "manifest.json").write_text(
@@ -297,6 +303,10 @@ def test_benchmark_manifest_task_scans_only_packed_metadata(tmp_path):
     assert payload["sample_count"] == 200
     assert payload["selection"]["candidate_count"] == 200
     assert payload["selection"]["metric_or_target_values_read"] is False
+    assert payload["selection"]["packed_future_steps"] == 64
+    assert payload["selection"]["packed_history_steps"] == 64
+    assert payload["selection"]["sampling_future_steps"] == 50
+    assert payload["selection"]["sampling_history_steps"] == 40
     assert payload["selection"]["empty_partition_count"] == 1
     assert payload["selection"]["empty_partition_count_by_split"] == {
         "overlap-train-val": 0,
@@ -366,6 +376,9 @@ def test_benchmark_manifest_rejects_nonempty_zero_view_partition(tmp_path):
             "shards": 1,
             "source_revision": workflows.KITSCENES_SOURCE_REVISION,
             "source_split": "val",
+            "temporal_sampling": kitscenes_temporal_contract(
+                benchmark_protocol=True,
+            ),
             "total_samples": 1,
         }),
         encoding="ascii",
@@ -407,6 +420,9 @@ def test_benchmark_manifest_rejects_malformed_empty_partition(tmp_path):
             "shards": 1,
             "source_revision": workflows.KITSCENES_SOURCE_REVISION,
             "source_split": "val",
+            "temporal_sampling": kitscenes_temporal_contract(
+                benchmark_protocol=True,
+            ),
             "total_samples": 0,
         }),
         encoding="ascii",
