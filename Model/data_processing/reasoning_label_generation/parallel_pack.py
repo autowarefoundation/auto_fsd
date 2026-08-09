@@ -106,6 +106,8 @@ def init_row_worker(
     episodes: Optional[List[int | str]],
     raw_path: str,
     image_size: int,
+    source_split: str,
+    source_revision: str,
 ) -> None:
     """Build this process's PLAIN-mode dataset for row-level decode (#121 decode-dedup).
 
@@ -135,11 +137,12 @@ def init_row_worker(
         scene_ids = [str(scene_id) for scene_id in episodes] if episodes else None
         _DS = KitScenesDataset(
             data_root=raw_path,
-            split="train",
+            split=source_split,
             scene_ids=scene_ids,
             image_size=image_size,
             include_world_model_windows=False,
             include_navigation=False,
+            source_revision=source_revision,
         )
     else:
         from data_parsing.l2d import L2DDataset
@@ -148,8 +151,13 @@ def init_row_worker(
             if episodes is not None
             else None
         )
-        _DS = L2DDataset(repo_id=dataset_value, episodes=l2d_episodes,
-                         include_world_model_windows=False, root=raw_path)
+        _DS = L2DDataset(
+            repo_id=dataset_value,
+            revision=source_revision,
+            episodes=l2d_episodes,
+            include_world_model_windows=False,
+            root=raw_path,
+        )
 
 
 def decode_row(
