@@ -16,6 +16,7 @@ from Platform.pipelines.nuplan_acquisition import (
     load_source_manifest_bytes,
     snapshot_manifest_key,
     upload_stream_multipart,
+    validate_s3_source_head,
     validate_public_https_uri,
     validate_source_manifest,
 )
@@ -136,6 +137,57 @@ def test_source_manifest_rejects_unsafe_archive_fields(field, value, message):
         validate_source_manifest(manifest)
 
 
+def test_source_manifest_accepts_multipart_etag_for_s3_source():
+    manifest = _source_manifest()
+    archive = manifest["archives"][1]
+    archive.pop("expected_md5")
+    archive["expected_etag"] = '"08ABC074DB9227E758CC41C6B1EE223C-1020"'
+
+    normalized = validate_source_manifest(manifest)
+
+    assert (
+        normalized["archives"][1]["expected_etag"]
+        == "08abc074db9227e758cc41c6b1ee223c-1020"
+    )
+
+
+def test_source_manifest_rejects_etag_for_https_source():
+    manifest = _source_manifest()
+    archive = manifest["archives"][0]
+    archive.pop("expected_sha256")
+    archive["expected_etag"] = "0efaac6b7c603ae6f341021b35059bcc-116"
+
+    with pytest.raises(ValueError, match="only valid for s3"):
+        validate_source_manifest(manifest)
+
+
+def test_s3_source_head_validates_size_and_exact_etag():
+    archive = {
+        "archive_id": "mini-db",
+        "expected_etag": "08abc074db9227e758cc41c6b1ee223c-1020",
+        "expected_size_bytes": 8_550_100_030,
+    }
+
+    if_match = validate_s3_source_head(
+        {
+            "ContentLength": 8_550_100_030,
+            "ETag": '"08abc074db9227e758cc41c6b1ee223c-1020"',
+        },
+        archive,
+    )
+
+    assert if_match == '"08abc074db9227e758cc41c6b1ee223c-1020"'
+
+    with pytest.raises(ValueError, match="ETag differs"):
+        validate_s3_source_head(
+            {
+                "ContentLength": 8_550_100_030,
+                "ETag": '"f8abc074db9227e758cc41c6b1ee223c-1020"',
+            },
+            archive,
+        )
+
+
 def test_snapshot_manifest_redacts_authorized_source_urls():
     raw = canonical_json_bytes(_source_manifest())
     manifest, source_contract_sha = load_source_manifest_bytes(raw)
@@ -153,6 +205,7 @@ def test_snapshot_manifest_redacts_authorized_source_urls():
         "maps": 1,
         "sensor_blobs": 1,
     }
+    assert all("source_etag" not in item for item in snapshot["archives"])
     assert snapshot["total_size_bytes"] == 60
     assert archive_object_key(
         manifest,
@@ -162,6 +215,28 @@ def test_snapshot_manifest_redacts_authorized_source_urls():
         "nuplan-v1.1-mini-20260809/archives/maps/"
     )
     assert snapshot_manifest_key(manifest).endswith("/manifest.json")
+
+
+def test_snapshot_manifest_publishes_pinned_s3_source_etag():
+    source = _source_manifest()
+    source["archives"][1].pop("expected_md5")
+    source["archives"][1]["expected_etag"] = (
+        "08abc074db9227e758cc41c6b1ee223c-1020"
+    )
+    manifest, source_contract_sha = load_source_manifest_bytes(
+        canonical_json_bytes(source)
+    )
+
+    snapshot = build_snapshot_manifest(
+        source_manifest=manifest,
+        source_contract_sha256=source_contract_sha,
+        receipts=_receipts(manifest, source_contract_sha),
+    )
+
+    by_id = {item["archive_id"]: item for item in snapshot["archives"]}
+    assert by_id["mini-db"]["source_etag"] == (
+        "08abc074db9227e758cc41c6b1ee223c-1020"
+    )
 
 
 def test_signed_url_refresh_does_not_change_source_contract_identity():
