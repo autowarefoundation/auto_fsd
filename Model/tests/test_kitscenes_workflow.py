@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import ast
 import functools
+import hashlib
+import io
+import json
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -96,7 +100,178 @@ def test_ingest_map_binds_scalars_and_maps_only_group_ids():
         "source_revision",
         "episodes",
         "group_ids",
+        "source_split",
+        "data_role",
     }
+
+
+def test_kitscenes_data_roles_keep_benchmark_splits_out_of_training():
+    workflows._validate_kitscenes_data_role(
+        data_role="training",
+        source_split="train",
+    )
+    workflows._validate_kitscenes_data_role(
+        data_role="benchmark",
+        source_split="val",
+    )
+    workflows._validate_kitscenes_data_role(
+        data_role="benchmark",
+        source_split="overlap_train_val",
+    )
+
+    with pytest.raises(ValueError, match="training accepts only"):
+        workflows._validate_kitscenes_data_role(
+            data_role="training",
+            source_split="val",
+        )
+    with pytest.raises(ValueError, match="benchmark preparation accepts"):
+        workflows._validate_kitscenes_data_role(
+            data_role="benchmark",
+            source_split="train",
+        )
+
+
+def test_benchmark_inventory_accepts_only_official_eval_splits(monkeypatch):
+    inventory = InventoryResolution(
+        split="val",
+        expected_scene_ids=("scene-a",),
+        selected_scene_ids=("scene-a",),
+        missing_scene_ids=(),
+        total_size_bytes=10,
+        source_revision=workflows.KITSCENES_SOURCE_REVISION,
+    )
+    archives = {
+        "scene-a": SceneArchive(
+            scene_id="scene-a",
+            split="val",
+            filename="data/val/scene-a.tar",
+            sha256="a" * 64,
+            size_bytes=10,
+        )
+    }
+    monkeypatch.setattr(
+        "data_parsing.kit_scenes.source.fetch_archive_manifest",
+        lambda *args, **kwargs: archives,
+    )
+    monkeypatch.setattr(
+        "data_parsing.kit_scenes.source.resolve_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+
+    partitions = workflows.plan_fanout_partitions.task_function(
+        dataset=workflows.Dataset.KITSCENES,
+        source_revision=workflows.KITSCENES_SOURCE_REVISION,
+        episodes=0,
+        start_ep=-1,
+        end_ep=-1,
+        partition_size=1,
+        max_partitions=200,
+        max_missing_scenes=0,
+        split="val",
+        data_role="benchmark",
+    )
+
+    assert partitions == [["scene-a"]]
+    with pytest.raises(ValueError, match="training accepts only"):
+        workflows.plan_fanout_partitions.task_function(
+            dataset=workflows.Dataset.KITSCENES,
+            source_revision=workflows.KITSCENES_SOURCE_REVISION,
+            episodes=0,
+            start_ep=-1,
+            end_ep=-1,
+            partition_size=1,
+            max_partitions=200,
+            max_missing_scenes=0,
+            split="val",
+            data_role="training",
+        )
+
+
+def test_benchmark_manifest_task_scans_only_packed_metadata(tmp_path):
+    class _Shard:
+        def __init__(self, path):
+            self.path = path
+            self.remote_source = f"s3://benchmark/{path.name}"
+
+        def download(self):
+            return str(self.path)
+
+        def __str__(self):
+            return self.remote_source
+
+    def build_shard(name, source_split, scene_id):
+        shard_dir = tmp_path / name
+        shard_dir.mkdir()
+        tar_name = "shard-000000.tar"
+        with tarfile.open(shard_dir / tar_name, "w") as archive:
+            for index in range(100):
+                frame_index = 64 + index * 90
+                sample_uid = (
+                    f"kitscenes-v1-{scene_id}-f{frame_index:06d}"
+                )
+                payload = json.dumps({
+                    "frame_idx": frame_index,
+                    "sample_uid": sample_uid,
+                    "split_group_uid": f"kitscenes-{scene_id}",
+                }).encode("ascii")
+                info = tarfile.TarInfo(f"{sample_uid}.meta.json")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+        manifest = {
+            "data_role": "benchmark",
+            "dataset": workflows.Dataset.KITSCENES.value,
+            "dataset_version": (
+                workflows.KITSCENES_BENCHMARK_DATASET_VERSION
+            ),
+            "has_gps": True,
+            "has_map": True,
+            "has_navigation": True,
+            "hz": 10,
+            "num_views": 6,
+            "partition_id": name,
+            "shard_names": [tar_name],
+            "source_revision": workflows.KITSCENES_SOURCE_REVISION,
+            "source_split": source_split,
+            "total_samples": 100,
+        }
+        (shard_dir / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="ascii",
+        )
+        return _Shard(shard_dir)
+
+    val = build_shard(
+        "val-scene",
+        "val",
+        "01234567-89ab-cdef-0123-456789abcdef",
+    )
+    overlap = build_shard(
+        "overlap-scene",
+        "overlap_train_val",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+    )
+
+    result = (
+        workflows.create_kitscenes_paper_approximation_manifest.task_function(
+            val_shards=[val],
+            overlap_shards=[overlap],
+            release_id="test-paper-approx-v1",
+        )
+    )
+    manifest_path = Path(result.manifest.path)
+    payload = json.loads(manifest_path.read_text(encoding="ascii"))
+
+    assert payload["protocol_status"] == "paper_protocol_approximation"
+    assert payload["sample_count"] == 200
+    assert payload["selection"]["candidate_count"] == 200
+    assert payload["selection"]["metric_or_target_values_read"] is False
+    assert payload["selection"]["selected_count_by_split"] == {
+        "overlap-train-val": 100,
+        "val": 100,
+    }
+    assert result.manifest_sha256 == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
 
 
 def test_dataset_dynamic_propagates_the_pinned_data_prep_image():
@@ -212,6 +387,8 @@ def test_data_prep_tasks_serialize_karpenter_disruption_protection():
     expected = {"karpenter.sh/do-not-disrupt": "true"}
 
     for task in (
+        workflows.audit_kitscenes_benchmark_inventory,
+        workflows.create_kitscenes_paper_approximation_manifest,
         workflows.data_ingest,
         workflows.generate_reasoning_labels,
         workflows.data_processing,
@@ -229,6 +406,25 @@ def test_data_prep_tasks_serialize_karpenter_disruption_protection():
         concurrency=60,
     )
     assert mapped.get_k8s_pod(settings).metadata.annotations == expected
+
+
+def test_kitscenes_benchmark_launcher_is_evaluation_only():
+    buildspec = (
+        _REPO_ROOT
+        / "Platform"
+        / "buildspec-launch-kitscenes-benchmark.yml"
+    ).read_text()
+
+    assert "flytekit==1.16.24" in buildspec
+    assert "wf_audit_kitscenes_benchmark_inventory" in buildspec
+    assert "wf_prepare_kitscenes_paper_approximation" in buildspec
+    assert "VAL_SCENE_LIMIT" in buildspec
+    assert "OVERLAP_SCENE_LIMIT" in buildspec
+    assert "INGEST_CONCURRENCY" in buildspec
+    assert "PACK_CONCURRENCY" in buildspec
+    assert 'printf \'%s\' "${MODE}"' in buildspec
+    assert "wf_train" not in buildspec
+    assert "checkpoint" not in buildspec.lower()
 
 
 def test_large_shm_tasks_serialize_karpenter_disruption_protection():
