@@ -101,6 +101,15 @@ resource "aws_iam_role_policy" "flyte_user_s3" {
             "arn:aws:s3:::${var.datasets_bucket}",
           ]
         },
+        # S3 multipart copy authorizes the source through the Flyte task role.
+        # Keep this read-only grant scoped to the official nuPlan v1.1 prefix.
+        {
+          Effect = "Allow"
+          Action = ["s3:GetObject"]
+          Resource = [
+            "arn:aws:s3:::motional-nuplan/public/nuplan-v1.1/*",
+          ]
+        },
         {
           Effect = "Allow"
           Action = ["dynamodb:GetItem", "dynamodb:PutItem"]
