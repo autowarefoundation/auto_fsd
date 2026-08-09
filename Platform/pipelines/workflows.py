@@ -26,6 +26,9 @@ from data_processing.contract_versions import (
     UID_SCHEMA_VERSION as _UID_V,
 )
 from data_processing.source_revisions import L2D_DATA_REVISION
+from data_parsing.kit_scenes.temporal_contract import (
+    kitscenes_temporal_contract,
+)
 from Platform.pipelines.dataset_publication import DatasetPublication
 from Platform.pipelines.overlay_tasks import (
     register_selected_overlay_checkpoint,
@@ -59,7 +62,7 @@ MLFLOW_URI = "http://mlflow.mlflow.svc.cluster.local:5000"
 DATASET_PACK_VERSION = "v2.2"
 L2D_REACTIVE_DATASET_VERSION = "v3.0-reactive-v1"
 KITSCENES_NAVIGATION_DATASET_VERSION = "v3.3"
-KITSCENES_BENCHMARK_DATASET_VERSION = "v3.3-benchmark-v2"
+KITSCENES_BENCHMARK_DATASET_VERSION = "v3.3-benchmark-v3"
 BASELINE_TRAINING_OBJECTIVE_VERSION = "trajectory_imitation_v1"
 KITSCENES_NAVIGATION_OBJECTIVE_VERSION = (
     "kitscenes_navigation_objective_v1"
@@ -2236,6 +2239,9 @@ def data_processing(
             "non-KITScenes processing supports only "
             "data_role='training', source_split='train'"
         )
+    benchmark_protocol = (
+        dataset == Dataset.KITSCENES and data_role == "benchmark"
+    )
 
     raw_path = raw_data.download()
     print(f"Processing raw data from: {raw_path} (dataset={dataset.value})")
@@ -2316,6 +2322,7 @@ def data_processing(
                 image_size=image_size,
                 include_world_model_windows=world_model,
                 include_navigation=False,
+                benchmark_protocol=benchmark_protocol,
             )
         else:
             from data_parsing.l2d import L2DDataset
@@ -2528,14 +2535,16 @@ def data_processing(
             image_size,
             source_split,
             source_revision,
+            benchmark_protocol,
         )
 
         # Pass A: unique rows. ds is still alive here (not yet deleted).
         all_rows: set = set()
         # Collect the current-frame row (offset 0 = cam_*.jpg) FIRST so it's
         # tracked even if window_rows raises. Do NOT catch IndexError from
-        # window_rows: enumeration excludes edge frames (margins 64/64 dominate
-        # WM 30/40), so a raise here means the invariant has broken and we MUST
+        # window_rows: enumeration excludes edge frames. Training uses 64/64
+        # margins and the benchmark uses 40/50; both cover the WM 30/40 window.
+        # A raise here means the invariant has broken and we MUST
         # fail loudly rather than silently drop the sample's cam_*.jpg (which
         # would poison the shard: loader hits torch.stack([]) at train time).
         sample_cur_rows: dict = {}  # si -> (episode/scene, frame) current row
@@ -2593,6 +2602,7 @@ def data_processing(
                 include_world_model_windows=False,
                 include_navigation=True,
                 source_revision=source_revision,
+                benchmark_protocol=benchmark_protocol,
             )
         else:
             from data_parsing.l2d import L2DDataset
@@ -2878,6 +2888,13 @@ def data_processing(
                 "data_role": data_role,
                 "dataset_version": dataset_version,
                 "episodes": _packed_episode_count(episodes, group_ids),
+                "temporal_sampling": (
+                    kitscenes_temporal_contract(
+                        benchmark_protocol=benchmark_protocol,
+                    )
+                    if dataset == Dataset.KITSCENES
+                    else None
+                ),
                 "reactive_targets_requested": reactive_targets,
                 "contracts": contract_versions(),
                 # num_views = real cameras only; the map view is stored under a
@@ -8767,6 +8784,9 @@ def create_kitscenes_paper_approximation_manifest(
                 "data_role": "benchmark",
                 "dataset_version": KITSCENES_BENCHMARK_DATASET_VERSION,
                 "hz": 10,
+                "temporal_sampling": kitscenes_temporal_contract(
+                    benchmark_protocol=True,
+                ),
             }
             for field, expected in expected_fields.items():
                 actual = packed_manifest.get(field)
@@ -8975,6 +8995,9 @@ def create_kitscenes_paper_approximation_manifest(
         split: len(empty_partition_ids[split])
         for split in sorted(empty_partition_ids)
     }
+    temporal_sampling = kitscenes_temporal_contract(
+        benchmark_protocol=True,
+    )
     payload = {
         "authority": "auto-e2e",
         "benchmark_id": "autoe2e-kitscenes-paper-approx-v1",
@@ -9010,9 +9033,16 @@ def create_kitscenes_paper_approximation_manifest(
                 for split in sorted(empty_partition_ids)
             },
             "metric_or_target_values_read": False,
-            "packed_history_steps": 64,
+            "packed_future_steps": temporal_sampling["abi_future_steps"],
+            "packed_history_steps": temporal_sampling["abi_history_steps"],
             "paper_future_steps": 50,
             "paper_observation_steps": 40,
+            "sampling_future_steps": temporal_sampling[
+                "sampling_future_steps"
+            ],
+            "sampling_history_steps": temporal_sampling[
+                "sampling_history_steps"
+            ],
             "selection_seed": PAPER_APPROXIMATION_SELECTION_SEED,
             "selection_version": PAPER_APPROXIMATION_SELECTION_VERSION,
             "window_steps": PAPER_WINDOW_STEPS,
