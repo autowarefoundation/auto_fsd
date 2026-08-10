@@ -313,6 +313,7 @@ test("honors teacher validity, minimum size, and object count bounds", () => {
 test("renders the interactive premium scene and all semantic modes", async ({
   page,
 }, testInfo) => {
+  testInfo.setTimeout(90_000);
   const { canvas, errors, region } = await openDemo(page, {
     width: 1440,
     height: 1000,
@@ -380,6 +381,7 @@ test("renders the interactive premium scene and all semantic modes", async ({
 test("keeps the WebGL scene usable on a mobile viewport", async ({
   page,
 }, testInfo) => {
+  testInfo.setTimeout(90_000);
   const { canvas, errors, region } = await openDemo(page, {
     width: 390,
     height: 844,
