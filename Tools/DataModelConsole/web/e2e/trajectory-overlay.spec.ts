@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator } from "@playwright/test";
 
 import {
   bevHeatmapForRow,
@@ -42,6 +42,74 @@ const NEXT_PIXEL = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAkAQMAAAADwq7RAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAGUExURdwmJv///wv9ac8AAAABYktHRAH/Ai3eAAAAB3RJTUUH6gcPDxE6D8HjnQAAAA1JREFUGNNjYBgFlAIAAUQAAS6fR94AAAAldEVYdGRhdGU6YXRlADIwMjYtMDctMTVUMTU6MTc6NTgrMDA6MDAR0XezAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA3LTE1VDE1OjE3OjU4KzAwOjAwYIzPDwAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wNy0xNVQxNToxNzo1OCswMDowMDeZ7tAAAAAASUVORK5CYII=",
   "base64",
 );
+
+async function webGLPaintState(canvas: Locator) {
+  return canvas.evaluate((element) => {
+    const target = element as HTMLCanvasElement;
+    const gl =
+      target.getContext("webgl2") ??
+      target.getContext("webgl");
+    if (!gl) {
+      return {
+        width: 0,
+        height: 0,
+        paintedSamples: 0,
+        colorfulSamples: 0,
+        variance: 0,
+        hash: 0,
+      };
+    }
+    gl.finish();
+    const width = gl.drawingBufferWidth;
+    const height = gl.drawingBufferHeight;
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(
+      0,
+      0,
+      width,
+      height,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      pixels,
+    );
+    const background = [pixels[0], pixels[1], pixels[2]];
+    let paintedSamples = 0;
+    let colorfulSamples = 0;
+    let luminanceSum = 0;
+    let luminanceSquaredSum = 0;
+    let samples = 0;
+    let hash = 2166136261;
+    for (let offset = 0; offset < pixels.length; offset += 16) {
+      const red = pixels[offset];
+      const green = pixels[offset + 1];
+      const blue = pixels[offset + 2];
+      const difference =
+        Math.abs(red - background[0]) +
+        Math.abs(green - background[1]) +
+        Math.abs(blue - background[2]);
+      if (difference > 18) paintedSamples++;
+      if (Math.max(red, green, blue) - Math.min(red, green, blue) > 12) {
+        colorfulSamples++;
+      }
+      const luminance = (red + green + blue) / 3;
+      luminanceSum += luminance;
+      luminanceSquaredSum += luminance * luminance;
+      hash = Math.imul(hash ^ red, 16777619);
+      hash = Math.imul(hash ^ green, 16777619);
+      hash = Math.imul(hash ^ blue, 16777619);
+      samples++;
+    }
+    const mean = luminanceSum / samples;
+    return {
+      width,
+      height,
+      paintedSamples,
+      colorfulSamples,
+      variance: luminanceSquaredSum / samples - mean * mean,
+      hash: hash >>> 0,
+    };
+  });
+}
 
 function uidHash(uid: string): bigint {
   return createHash("sha256").update(uid).digest().readBigUInt64LE(0);
@@ -201,11 +269,32 @@ function semanticOccupancyBody(): Buffer {
       body[probabilityOffset + lane] = 240;
       body[teacherOffset + lane] = 255;
     }
-    for (let rasterRow = 260; rasterRow < 285; rasterRow++) {
-      for (let rasterCol = 138; rasterCol < 162; rasterCol++) {
+    for (let rasterRow = 252; rasterRow < 268; rasterRow++) {
+      for (let rasterCol = 143; rasterCol < 151; rasterCol++) {
         const vehicle = indexOf(row, 5, rasterRow, rasterCol);
         body[probabilityOffset + vehicle] = 235;
-        if (rasterRow < 280) body[teacherOffset + vehicle] = 255;
+        if (rasterRow < 264) body[teacherOffset + vehicle] = 255;
+      }
+    }
+    for (let rasterRow = 218; rasterRow < 224; rasterRow++) {
+      for (let rasterCol = 188; rasterCol < 205; rasterCol++) {
+        const vehicle = indexOf(row, 5, rasterRow, rasterCol);
+        body[probabilityOffset + vehicle] = 220;
+        if (rasterCol < 199) body[teacherOffset + vehicle] = 255;
+      }
+    }
+    for (let rasterRow = 242; rasterRow < 246; rasterRow++) {
+      for (let rasterCol = 122; rasterCol < 125; rasterCol++) {
+        const pedestrian = indexOf(row, 6, rasterRow, rasterCol);
+        body[probabilityOffset + pedestrian] = 228;
+        if (rasterRow > 242) body[teacherOffset + pedestrian] = 255;
+      }
+    }
+    for (let rasterRow = 178; rasterRow < 187; rasterRow++) {
+      for (let rasterCol = 92; rasterCol < 102; rasterCol++) {
+        const obstacle = indexOf(row, 7, rasterRow, rasterCol);
+        body[probabilityOffset + obstacle] = 215;
+        if (rasterCol > 94) body[teacherOffset + obstacle] = 255;
       }
     }
   }
@@ -282,6 +371,7 @@ function egoFuture(): number[] {
 test("trajectory overlays and geographic views honor production contracts", async ({
   page,
 }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
   let blobRequests = 0;
   let directImageRequests = 0;
   let frameOneImageAttempts = 0;
@@ -587,50 +677,93 @@ test("trajectory overlays and geographic views honor production contracts", asyn
   );
   expect(new Set(heatmapSnapshots).size).toBe(6);
   const semanticOccupancy = page.getByRole("region", {
-    name: "2D BEV semantic occupancy",
+    name: "3D semantic occupancy",
   });
   await expect(semanticOccupancy).toContainText("180 m × 120 m");
-  const semanticCanvas = semanticOccupancy.locator("canvas");
+  await expect(semanticOccupancy).toContainText("4/56 objects");
+  const semanticCanvas = semanticOccupancy.locator(
+    'canvas[aria-label="Interactive 3D semantic occupancy scene"]',
+  );
   await expect(semanticCanvas).toBeVisible();
-  const semanticTopDown = await semanticCanvas.evaluate((canvas) => {
-    const context = (canvas as HTMLCanvasElement).getContext("2d");
-    if (!context) return { nonBackground: 0, snapshot: "" };
-    const data = context.getImageData(
-      0,
-      0,
-      (canvas as HTMLCanvasElement).width,
-      (canvas as HTMLCanvasElement).height,
-    ).data;
-    let nonBackground = 0;
-    for (let offset = 0; offset < data.length; offset += 4) {
-      if (
-        data[offset] !== 8 ||
-        data[offset + 1] !== 11 ||
-        data[offset + 2] !== 16
-      ) {
-        nonBackground++;
-      }
-    }
-    return {
-      nonBackground,
-      snapshot: (canvas as HTMLCanvasElement).toDataURL(),
-    };
-  });
-  expect(semanticTopDown.nonBackground).toBeGreaterThan(100);
-  await semanticOccupancy
-    .getByRole("button", { name: "Isometric 2D semantic occupancy" })
-    .click();
   await expect
-    .poll(() =>
-      semanticCanvas.evaluate((canvas) =>
-        (canvas as HTMLCanvasElement).toDataURL(),
-      ),
-    )
-    .not.toBe(semanticTopDown.snapshot);
+    .poll(async () => (await webGLPaintState(semanticCanvas)).paintedSamples, {
+      timeout: 15_000,
+    })
+    .toBeGreaterThan(1_000);
+  const orbitPaint = await webGLPaintState(semanticCanvas);
+  expect(orbitPaint.width).toBeGreaterThan(500);
+  expect(orbitPaint.height).toBeGreaterThan(400);
+  expect(orbitPaint.colorfulSamples).toBeGreaterThan(500);
+  expect(orbitPaint.variance).toBeGreaterThan(20);
+
+  await semanticOccupancy.getByRole("button", { name: "Top view" }).click();
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).hash)
+    .not.toBe(orbitPaint.hash);
+  const topPaint = await webGLPaintState(semanticCanvas);
+  await semanticOccupancy.getByRole("button", { name: "Ego view" }).click();
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).hash)
+    .not.toBe(topPaint.hash);
+  const egoPaint = await webGLPaintState(semanticCanvas);
+  expect(egoPaint.paintedSamples).toBeGreaterThan(500);
+
+  await semanticOccupancy.getByRole("button", { name: "Top view" }).click();
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).hash)
+    .not.toBe(egoPaint.hash);
+  const predictionPaint = await webGLPaintState(semanticCanvas);
   await semanticOccupancy.getByRole("tab", { name: "Teacher" }).click();
   await expect(
     semanticOccupancy.getByRole("tab", { name: "Teacher" }),
   ).toHaveAttribute("aria-selected", "true");
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).hash)
+    .not.toBe(predictionPaint.hash);
+  const teacherPaint = await webGLPaintState(semanticCanvas);
+  expect(teacherPaint.paintedSamples).toBeGreaterThan(1_000);
+  await semanticOccupancy.getByRole("tab", { name: "Prediction" }).click();
+  await expect(
+    semanticOccupancy.getByRole("tab", { name: "Prediction" }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).hash)
+    .not.toBe(teacherPaint.hash);
+  await semanticOccupancy
+    .getByRole("button", { name: "Orbit view" })
+    .click();
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).hash)
+    .not.toBe(predictionPaint.hash);
+
+  const desktopLayout = await semanticOccupancy.evaluate((region) => {
+    const scene = region.querySelector("canvas")?.parentElement;
+    const controls = region.querySelector('[role="tablist"]')?.parentElement;
+    const camera = region.querySelector(
+      '[role="group"][aria-label="Semantic occupancy camera"]',
+    );
+    if (!scene || !controls || !camera) return null;
+    const sceneRect = scene.getBoundingClientRect();
+    const controlsRect = controls.getBoundingClientRect();
+    const cameraRect = camera.getBoundingClientRect();
+    return {
+      sideBySide: sceneRect.right <= controlsRect.left + 1,
+      cameraInside:
+        cameraRect.left >= sceneRect.left &&
+        cameraRect.right <= sceneRect.right &&
+        cameraRect.top >= sceneRect.top &&
+        cameraRect.bottom <= sceneRect.bottom,
+    };
+  });
+  expect(desktopLayout).toEqual({
+    sideBySide: true,
+    cameraInside: true,
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(1);
   expect(rigRequestPath).toBe(
     "/api/v1/datasets/kitscenes/shards/train-000000.tar/rig-projection",
   );
@@ -745,6 +878,32 @@ test("trajectory overlays and geographic views honor production contracts", asyn
   await expect(page.getByText("Scene map")).toBeVisible();
   await expect(navigationMap.getByRole("img")).toBeVisible();
   await expect(heatmapCanvases.first()).toBeVisible();
+  await expect
+    .poll(async () => (await webGLPaintState(semanticCanvas)).paintedSamples)
+    .toBeGreaterThan(500);
+  const mobileLayout = await semanticOccupancy.evaluate((region) => {
+    const scene = region.querySelector("canvas")?.parentElement;
+    const controls = region.querySelector('[role="tablist"]')?.parentElement;
+    const camera = region.querySelector(
+      '[role="group"][aria-label="Semantic occupancy camera"]',
+    );
+    if (!scene || !controls || !camera) return null;
+    const sceneRect = scene.getBoundingClientRect();
+    const controlsRect = controls.getBoundingClientRect();
+    const cameraRect = camera.getBoundingClientRect();
+    return {
+      stacked: sceneRect.bottom <= controlsRect.top + 1,
+      cameraInside:
+        cameraRect.left >= sceneRect.left &&
+        cameraRect.right <= sceneRect.right &&
+        cameraRect.top >= sceneRect.top &&
+        cameraRect.bottom <= sceneRect.bottom,
+    };
+  });
+  expect(mobileLayout).toEqual({
+    stacked: true,
+    cameraInside: true,
+  });
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - window.innerWidth,
   );
