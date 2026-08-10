@@ -107,6 +107,7 @@ export default function SemanticOccupancyDemoPage() {
       </div>
       <SemanticOccupancyView
         artifact={artifact}
+        demoEnvironment
         row={0}
         status="ready"
       />
