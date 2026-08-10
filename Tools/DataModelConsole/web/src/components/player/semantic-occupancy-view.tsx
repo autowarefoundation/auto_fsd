@@ -619,6 +619,11 @@ export function SemanticOccupancyView({
                 }}
                 shadows
                 onCreated={({ gl }) => {
+                  gl.domElement.setAttribute("role", "img");
+                  gl.domElement.setAttribute(
+                    "aria-label",
+                    "Interactive 3D semantic occupancy scene",
+                  );
                   gl.outputColorSpace = THREE.SRGBColorSpace;
                   gl.toneMapping = THREE.ACESFilmicToneMapping;
                   gl.toneMappingExposure = 1.08;
