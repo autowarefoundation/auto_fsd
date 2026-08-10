@@ -17,6 +17,10 @@ import {
   MeshStandardMaterial,
 } from "three";
 
+export {
+  PremiumEgoVehicle as EgoVehicle,
+} from "@/components/player/premium-ego-vehicle";
+
 type ScenePosition = [number, number, number];
 
 interface SemanticModelProps {
@@ -49,11 +53,6 @@ const ASSET_ROOT =
   "/assets/semantic-occupancy/kenney-car-kit";
 
 const VEHICLE_ASSETS = {
-  ego: {
-    path: `${ASSET_ROOT}/race-future.glb`,
-    nativeSize: [1.2, 0.833, 2.66],
-    height: 1.14,
-  },
   sedan: {
     path: `${ASSET_ROOT}/sedan-sports.glb`,
     nativeSize: [1.3, 1.1, 2.55],
@@ -234,56 +233,6 @@ function VehicleFallback({
     </RoundedBox>
   );
 }
-
-export const EgoVehicle = memo(function EgoVehicle() {
-  const asset = VEHICLE_ASSETS.ego;
-  const width = 2.08;
-  const length = 4.72;
-  return (
-    <group name="auto-e2e-ego-vehicle" position={[0, 0.025, 0]}>
-      <GroundHalo
-        color="#5de9ff"
-        confidence={1}
-        opacity={0.96}
-        scale={[1.52, 2.7, 1]}
-      />
-      <Suspense
-        fallback={
-          <VehicleFallback
-            color="#d7e3e9"
-            length={length}
-            opacity={1}
-            width={width}
-          />
-        }
-      >
-        <SemanticAsset
-          color="#5de9ff"
-          confidence={1}
-          opacity={1}
-          path={asset.path}
-          scale={[
-            width / asset.nativeSize[0],
-            asset.height / asset.nativeSize[1],
-            length / asset.nativeSize[2],
-          ]}
-          tintStrength={0.08}
-        />
-      </Suspense>
-      <mesh position={[0, 0.09, 0]} scale={[0.78, 0.025, 1.9]}>
-        <boxGeometry />
-        <meshBasicMaterial
-          blending={AdditiveBlending}
-          color="#42e7ff"
-          depthWrite={false}
-          opacity={0.2}
-          toneMapped={false}
-          transparent
-        />
-      </mesh>
-    </group>
-  );
-});
 
 function vehicleAssetFor(
   length: number,
