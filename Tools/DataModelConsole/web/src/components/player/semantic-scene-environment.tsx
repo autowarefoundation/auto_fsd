@@ -26,11 +26,14 @@ import type { SemanticOccupancyArtifact } from "@/lib/semantic-occupancy";
 
 const HDRI_PATH =
   "/assets/semantic-occupancy/poly-haven/studio_small_09_1k.hdr";
+const ASPHALT_NORMAL_SCALE = new THREE.Vector2(0.24, 0.24);
 const SEMANTIC_GLOW = new THREE.Color(1.45, 1.45, 1.45);
 
 interface GroundTextures {
   asphalt: THREE.DataTexture;
+  normal: THREE.DataTexture;
   roughness: THREE.DataTexture;
+  wetness: THREE.DataTexture;
 }
 
 interface SemanticTextures {
@@ -52,7 +55,9 @@ function configureGroundTexture(texture: THREE.DataTexture) {
 function createGroundTextures(): GroundTextures {
   const size = 192;
   const asphaltPixels = new Uint8Array(size * size * 4);
+  const normalPixels = new Uint8Array(size * size * 4);
   const roughnessPixels = new Uint8Array(size * size * 4);
+  const wetnessPixels = new Uint8Array(size * size * 4);
 
   for (let row = 0; row < size; row++) {
     for (let col = 0; col < size; col++) {
@@ -69,11 +74,29 @@ function createGroundTextures(): GroundTextures {
       asphaltPixels[offset + 2] = Math.min(101, base + 3);
       asphaltPixels[offset + 3] = 255;
 
+      const normalX = ((hash >>> 5) & 31) - 15;
+      const normalY = ((hash >>> 13) & 31) - 15;
+      normalPixels[offset] = 128 + normalX;
+      normalPixels[offset + 1] = 128 + normalY;
+      normalPixels[offset + 2] = 244;
+      normalPixels[offset + 3] = 255;
+
       const roughness = Math.max(166, 245 - grain * 2 - aggregate);
       roughnessPixels[offset] = roughness;
       roughnessPixels[offset + 1] = roughness;
       roughnessPixels[offset + 2] = roughness;
       roughnessPixels[offset + 3] = 255;
+
+      const broadPatch =
+        Math.sin(row * 0.105) +
+        Math.cos(col * 0.083) +
+        Math.sin((row + col) * 0.047);
+      const wetness =
+        broadPatch > 1.18 && Math.abs(hash % 17) > 2 ? 210 : 0;
+      wetnessPixels[offset] = wetness;
+      wetnessPixels[offset + 1] = wetness;
+      wetnessPixels[offset + 2] = wetness;
+      wetnessPixels[offset + 3] = 255;
     }
   }
 
@@ -91,10 +114,28 @@ function createGroundTextures(): GroundTextures {
     THREE.RGBAFormat,
     THREE.UnsignedByteType,
   );
+  const normal = new THREE.DataTexture(
+    normalPixels,
+    size,
+    size,
+    THREE.RGBAFormat,
+    THREE.UnsignedByteType,
+  );
+  const wetness = new THREE.DataTexture(
+    wetnessPixels,
+    size,
+    size,
+    THREE.RGBAFormat,
+    THREE.UnsignedByteType,
+  );
   configureGroundTexture(asphalt);
+  configureGroundTexture(normal);
   configureGroundTexture(roughness);
+  configureGroundTexture(wetness);
+  normal.colorSpace = THREE.NoColorSpace;
   roughness.colorSpace = THREE.NoColorSpace;
-  return { asphalt, roughness };
+  wetness.colorSpace = THREE.NoColorSpace;
+  return { asphalt, normal, roughness, wetness };
 }
 
 function configureSemanticTexture(
@@ -176,9 +217,15 @@ function createSemanticTextures(
       edgePixels[pixelOffset] = pixels[pixelOffset];
       edgePixels[pixelOffset + 1] = pixels[pixelOffset + 1];
       edgePixels[pixelOffset + 2] = pixels[pixelOffset + 2];
-      edgePixels[pixelOffset + 3] = Math.min(
-        255,
-        96 + pixels[pixelOffset + 3],
+      const red = pixels[pixelOffset];
+      const green = pixels[pixelOffset + 1];
+      const blue = pixels[pixelOffset + 2];
+      const importantClass =
+        (green > red * 1.45 && green > blue * 1.18) ||
+        (red > 180 && blue > 120) ||
+        (red > 180 && green < 170);
+      edgePixels[pixelOffset + 3] = Math.round(
+        pixels[pixelOffset + 3] * (importantClass ? 0.92 : 0.42),
       );
     }
   }
@@ -229,7 +276,9 @@ export function SemanticGround({
   useEffect(
     () => () => {
       groundTextures.asphalt.dispose();
+      groundTextures.normal.dispose();
       groundTextures.roughness.dispose();
+      groundTextures.wetness.dispose();
     },
     [groundTextures],
   );
@@ -266,6 +315,8 @@ export function SemanticGround({
           envMapIntensity={0.65}
           map={groundTextures.asphalt}
           metalness={0.14}
+          normalMap={groundTextures.normal}
+          normalScale={ASPHALT_NORMAL_SCALE}
           roughness={0.9}
           roughnessMap={groundTextures.roughness}
         />
@@ -277,7 +328,8 @@ export function SemanticGround({
       >
         <planeGeometry args={[groundWidth, groundLength]} />
         <MeshReflectorMaterial
-          blur={compact ? [72, 20] : [144, 36]}
+          alphaMap={groundTextures.wetness}
+          blur={compact ? [64, 18] : [180, 42]}
           color="#203038"
           depthScale={0.28}
           depthWrite={false}
@@ -288,7 +340,7 @@ export function SemanticGround({
           mixBlur={0.82}
           mixStrength={1.45}
           opacity={0.14}
-          resolution={compact ? 128 : 256}
+          resolution={compact ? 128 : 512}
           roughness={0.48}
           transparent
         />
@@ -327,14 +379,14 @@ export function SemanticGround({
           clearcoatRoughness={0.28}
           depthWrite={false}
           displacementMap={semanticTextures.confidence}
-          displacementScale={0.16}
+          displacementScale={0.12}
           emissive="#ffffff"
-          emissiveIntensity={0.035}
+          emissiveIntensity={0.008}
           emissiveMap={semanticTextures.raster}
           envMapIntensity={0.42}
           map={semanticTextures.raster}
           metalness={0.18}
-          opacity={0.34}
+          opacity={0.28}
           roughness={0.58}
           side={THREE.DoubleSide}
           transparent
@@ -365,18 +417,30 @@ export function SceneEnvironment({
   groundCenterZ,
   groundLength,
   groundWidth,
+  viewMode = "orbit",
 }: {
   groundCenterZ: number;
   groundLength: number;
   groundWidth: number;
+  viewMode?: "ego" | "orbit" | "top";
 }) {
-  const { size } = useThree();
+  const { gl, invalidate, size } = useThree();
   const compact = size.width < 700;
+  const fogNear =
+    viewMode === "ego" ? 106 : viewMode === "top" ? 132 : 92;
+  const fogFar =
+    viewMode === "ego" ? 250 : viewMode === "top" ? 290 : 236;
+
+  useEffect(() => {
+    gl.toneMappingExposure =
+      viewMode === "ego" ? 1.13 : viewMode === "top" ? 1.02 : 1.08;
+    invalidate();
+  }, [gl, invalidate, viewMode]);
 
   return (
     <>
       <color attach="background" args={["#050d13"]} />
-      <fog attach="fog" args={["#07131a", 92, 236]} />
+      <fog attach="fog" args={["#07131a", fogNear, fogFar]} />
       <mesh
         frustumCulled={false}
         position={[0, 28, 45]}
@@ -390,9 +454,15 @@ export function SceneEnvironment({
           toneMapped={false}
         >
           <GradientTexture
-            colors={["#02050b", "#061522", "#173344", "#744b5d"]}
+            colors={[
+              "#02050a",
+              "#07131c",
+              "#6b4d61",
+              "#071522",
+              "#02050b",
+            ]}
             size={1024}
-            stops={[0, 0.38, 0.7, 1]}
+            stops={[0, 0.36, 0.5, 0.64, 1]}
           />
         </meshBasicMaterial>
       </mesh>
@@ -418,8 +488,8 @@ export function SceneEnvironment({
         shadow-camera-near={1}
         shadow-camera-right={90}
         shadow-camera-top={145}
-        shadow-mapSize-height={compact ? 512 : 1024}
-        shadow-mapSize-width={compact ? 512 : 1024}
+        shadow-mapSize-height={compact ? 384 : 1536}
+        shadow-mapSize-width={compact ? 384 : 1536}
       />
       <directionalLight
         color="#62e9ff"
@@ -439,7 +509,7 @@ export function SceneEnvironment({
         height={groundLength}
         opacity={0.48}
         position={[0, 0.045, groundCenterZ]}
-        resolution={compact ? 256 : 512}
+        resolution={compact ? 192 : 768}
         smooth
         width={groundWidth}
       />
@@ -447,7 +517,11 @@ export function SceneEnvironment({
   );
 }
 
-export function ScenePostProcessing() {
+export function ScenePostProcessing({
+  viewMode = "orbit",
+}: {
+  viewMode?: "ego" | "orbit" | "top";
+}) {
   const { camera, scene, size } = useThree();
   const compact = size.width < 700;
   const passes = useMemo(() => {
@@ -458,9 +532,15 @@ export function ScenePostProcessing() {
 
     const bloom = new UnrealBloomPass(
       new THREE.Vector2(size.width, size.height),
-      compact ? 0.17 : 0.24,
-      0.52,
-      0.88,
+      compact
+        ? 0.14
+        : viewMode === "ego"
+          ? 0.28
+          : viewMode === "top"
+            ? 0.16
+            : 0.22,
+      viewMode === "ego" ? 0.58 : 0.48,
+      viewMode === "top" ? 0.96 : 0.9,
     );
 
     const contrast = new ShaderPass(BrightnessContrastShader);
@@ -475,7 +555,8 @@ export function ScenePostProcessing() {
     vignette.uniforms.darkness.value = 0.78;
 
     const toneMapping = new ShaderPass(ACESFilmicToneMappingShader);
-    toneMapping.uniforms.exposure.value = 0.66;
+    toneMapping.uniforms.exposure.value =
+      viewMode === "ego" ? 0.7 : viewMode === "top" ? 0.62 : 0.66;
     const gamma = new ShaderPass(GammaCorrectionShader);
 
     return {
@@ -487,7 +568,7 @@ export function ScenePostProcessing() {
       toneMapping,
       vignette,
     };
-  }, [camera, compact, scene, size.height, size.width]);
+  }, [camera, compact, scene, size.height, size.width, viewMode]);
 
   useEffect(
     () => () => {
