@@ -41,13 +41,13 @@ interface SemanticVehicleProps extends SemanticModelProps {
 }
 
 interface SemanticPedestrianProps extends SemanticModelProps {
-  length?: number;
-  width?: number;
-  yaw?: number;
+  length: number;
+  width: number;
+  yaw: number;
 }
 
 interface SemanticObstacleProps extends SemanticModelProps {
-  height?: number;
+  decorativeVariants?: boolean;
   length: number;
   width: number;
   yaw: number;
@@ -97,6 +97,9 @@ type ObstacleKind =
   | "bollard"
   | "cone"
   | "crate"
+  | "drum"
+  | "fence"
+  | "guardrail"
   | "sign";
 
 function SemanticMaterial({
@@ -410,11 +413,11 @@ export const SemanticPedestrian = memo(function SemanticPedestrian({
   color,
   confidence,
   errorKind,
-  length = 0.82,
+  length,
   opacity,
   position,
-  width = 0.82,
-  yaw = 0,
+  width,
+  yaw,
 }: SemanticPedestrianProps) {
   return (
     <group position={position} rotation={[0, yaw, 0]}>
@@ -802,30 +805,236 @@ function BicycleModel({
   );
 }
 
+function GuardrailModel({
+  length,
+  opacity,
+  width,
+}: {
+  length: number;
+  opacity: number;
+  width: number;
+}) {
+  const postCount = Math.max(2, Math.min(9, Math.ceil(length / 1.6)));
+  return (
+    <group>
+      <RoundedBox
+        args={[Math.min(width, 0.18), 0.2, length]}
+        castShadow
+        position={[0, 0.68, 0]}
+        radius={0.04}
+        smoothness={2}
+      >
+        <meshPhysicalMaterial
+          color="#a7b1b5"
+          envMapIntensity={2}
+          metalness={0.9}
+          opacity={opacity}
+          roughness={0.2}
+          transparent={opacity < 1}
+        />
+      </RoundedBox>
+      {Array.from({ length: postCount }, (_, index) => (
+        <RoundedBox
+          key={`guardrail-post-${index}`}
+          args={[Math.min(width, 0.14), 0.72, 0.14]}
+          castShadow
+          position={[
+            0,
+            0.36,
+            -length / 2 + ((index + 0.5) * length) / postCount,
+          ]}
+          radius={0.025}
+          smoothness={2}
+        >
+          <meshPhysicalMaterial
+            color="#77848a"
+            metalness={0.84}
+            opacity={opacity}
+            roughness={0.26}
+            transparent={opacity < 1}
+          />
+        </RoundedBox>
+      ))}
+    </group>
+  );
+}
+
+function TrafficDrumModel({
+  confidence,
+  length,
+  opacity,
+  width,
+}: {
+  confidence: number;
+  length: number;
+  opacity: number;
+  width: number;
+}) {
+  return (
+    <group scale={[width / 0.72, 1, length / 0.72]}>
+      <mesh castShadow position={[0, 0.46, 0]}>
+        <cylinderGeometry args={[0.24, 0.34, 0.82, 16]} />
+        <SemanticMaterial
+          color="#ef6e2f"
+          confidence={confidence}
+          opacity={opacity}
+        />
+      </mesh>
+      {[0.29, 0.55].map((y) => (
+        <mesh key={`drum-stripe-${y}`} position={[0, y, 0]}>
+          <cylinderGeometry args={[0.275, 0.29, 0.12, 16]} />
+          <meshBasicMaterial color="#f2f4e9" toneMapped={false} />
+        </mesh>
+      ))}
+      <RoundedBox
+        args={[0.7, 0.1, 0.7]}
+        castShadow
+        position={[0, 0.05, 0]}
+        radius={0.05}
+        smoothness={2}
+      >
+        <meshPhysicalMaterial
+          color="#11191d"
+          metalness={0.4}
+          roughness={0.46}
+        />
+      </RoundedBox>
+    </group>
+  );
+}
+
+function ConstructionFenceModel({
+  length,
+  opacity,
+  width,
+}: {
+  length: number;
+  opacity: number;
+  width: number;
+}) {
+  const panelCount = Math.max(2, Math.min(10, Math.ceil(length / 1.2)));
+  return (
+    <group>
+      {[-0.68, 0.68].map((y) => (
+        <RoundedBox
+          key={`fence-rail-${y}`}
+          args={[Math.min(width, 0.08), 0.07, length]}
+          position={[0, 0.86 + y * 0.62, 0]}
+          radius={0.02}
+          smoothness={2}
+        >
+          <meshPhysicalMaterial
+            color="#b7c2c6"
+            metalness={0.88}
+            opacity={opacity}
+            roughness={0.22}
+            transparent={opacity < 1}
+          />
+        </RoundedBox>
+      ))}
+      {Array.from({ length: panelCount + 1 }, (_, index) => (
+        <RoundedBox
+          key={`fence-post-${index}`}
+          args={[Math.min(width, 0.08), 1.45, 0.08]}
+          castShadow
+          position={[
+            0,
+            0.78,
+            -length / 2 + (index * length) / panelCount,
+          ]}
+          radius={0.02}
+          smoothness={2}
+        >
+          <meshPhysicalMaterial
+            color="#8d9ba0"
+            metalness={0.82}
+            opacity={opacity}
+            roughness={0.28}
+            transparent={opacity < 1}
+          />
+        </RoundedBox>
+      ))}
+      {Array.from({ length: panelCount }, (_, index) => (
+        <mesh
+          key={`fence-panel-${index}`}
+          position={[
+            0,
+            0.79,
+            -length / 2 + ((index + 0.5) * length) / panelCount,
+          ]}
+        >
+          <boxGeometry
+            args={[
+              Math.min(width, 0.035),
+              1.1,
+              Math.max(0.08, length / panelCount - 0.08),
+            ]}
+          />
+          <meshBasicMaterial
+            color="#d8e1e3"
+            opacity={opacity * 0.12}
+            transparent
+            wireframe
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
 function obstacleKindFor({
+  decorativeVariants,
   length,
   position,
   width,
 }: Pick<
   SemanticObstacleProps,
-  "length" | "position" | "width"
+  "decorativeVariants" | "length" | "position" | "width"
 >): ObstacleKind {
+  if (!decorativeVariants) return "crate";
   const major = Math.max(width, length);
   const minor = Math.min(width, length);
   const seed = Math.abs(
     Math.round(position[0] * 7 + position[2] * 11),
   );
+  if (major >= 5) return seed % 2 === 0 ? "guardrail" : "fence";
   if (major >= 3.8) return "barrier";
   if (major >= 2 && minor <= 1.8) {
-    return seed % 2 === 0 ? "bicycle" : "sign";
+    return ["bicycle", "sign", "fence"][seed % 3] as ObstacleKind;
   }
-  if (major <= 1.45) return seed % 2 === 0 ? "cone" : "bollard";
+  if (major <= 1.45) {
+    return ["cone", "bollard", "drum"][seed % 3] as ObstacleKind;
+  }
   return "crate";
+}
+
+function obstacleDisplayHeight(kind: ObstacleKind): number {
+  switch (kind) {
+    case "sign":
+      return 2.25;
+    case "fence":
+      return 1.5;
+    case "bicycle":
+      return 1.28;
+    case "barrier":
+      return 1.2;
+    case "bollard":
+      return 1.1;
+    case "crate":
+      return 1.05;
+    case "drum":
+      return 0.9;
+    case "guardrail":
+      return 0.8;
+    case "cone":
+      return 0.75;
+  }
 }
 
 export const SemanticObstacle = memo(function SemanticObstacle({
   color,
   confidence,
+  decorativeVariants = false,
   errorKind,
   length,
   opacity,
@@ -833,21 +1042,15 @@ export const SemanticObstacle = memo(function SemanticObstacle({
   width,
   yaw,
 }: SemanticObstacleProps) {
-  const kind = obstacleKindFor({ length, position, width });
+  const kind = obstacleKindFor({
+    decorativeVariants,
+    length,
+    position,
+    width,
+  });
   const asset =
     kind === "cone" ? OBSTACLE_ASSETS.cone : OBSTACLE_ASSETS.box;
-  const targetHeight =
-    kind === "sign"
-      ? 2.25
-      : kind === "bicycle"
-        ? 1.28
-        : kind === "barrier"
-          ? 1.2
-          : kind === "bollard"
-            ? 1.1
-            : kind === "cone"
-              ? 0.75
-              : 1.05;
+  const targetHeight = obstacleDisplayHeight(kind);
 
   return (
     <group position={position} rotation={[0, yaw, 0]}>
@@ -871,6 +1074,25 @@ export const SemanticObstacle = memo(function SemanticObstacle({
         />
       ) : kind === "bollard" ? (
         <BollardModel confidence={confidence} opacity={opacity} />
+      ) : kind === "drum" ? (
+        <TrafficDrumModel
+          confidence={confidence}
+          length={length}
+          opacity={opacity}
+          width={width}
+        />
+      ) : kind === "fence" ? (
+        <ConstructionFenceModel
+          length={length}
+          opacity={opacity}
+          width={width}
+        />
+      ) : kind === "guardrail" ? (
+        <GuardrailModel
+          length={length}
+          opacity={opacity}
+          width={width}
+        />
       ) : kind === "sign" ? (
         <RoadSignModel confidence={confidence} opacity={opacity} />
       ) : kind === "bicycle" ? (
