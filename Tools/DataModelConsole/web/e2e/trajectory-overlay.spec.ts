@@ -377,11 +377,30 @@ test("trajectory overlays and geographic views honor production contracts", asyn
   let frameOneImageAttempts = 0;
   let frameOneImagesAvailable = false;
   let rigRequestPath = "";
+  const semanticAssetStatuses = new Map<string, number>();
+  const forbiddenRuntimeAssets: string[] = [];
   const consoleErrors: string[] = [];
   page.on("console", (message) => {
     if (message.type() === "error") consoleErrors.push(message.text());
   });
   page.on("pageerror", (error) => consoleErrors.push(error.message));
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      /(^|\.)kenney\.nl$/.test(url.hostname) ||
+      url.hostname === "www.gstatic.com" ||
+      url.hostname === "cdn.jsdelivr.net" ||
+      url.hostname === "unpkg.com"
+    ) {
+      forbiddenRuntimeAssets.push(request.url());
+    }
+  });
+  page.on("response", (response) => {
+    const url = new URL(response.url());
+    if (url.pathname.startsWith("/assets/semantic-occupancy/")) {
+      semanticAssetStatuses.set(url.pathname, response.status());
+    }
+  });
 
   await page.route("https://tile.openstreetmap.org/**", (route) =>
     route.fulfill({ status: 200, contentType: "image/png", body: PIXEL }),
@@ -690,6 +709,19 @@ test("trajectory overlays and geographic views honor production contracts", asyn
       timeout: 15_000,
     })
     .toBeGreaterThan(1_000);
+  const expectedSemanticAssets = [
+    "/assets/semantic-occupancy/kenney-car-kit/race-future.glb",
+    "/assets/semantic-occupancy/kenney-car-kit/suv-luxury.glb",
+    "/assets/semantic-occupancy/kenney-car-kit/box.glb",
+    "/assets/semantic-occupancy/kenney-car-kit/Textures/colormap.png",
+  ];
+  for (const path of expectedSemanticAssets) {
+    await expect
+      .poll(() => semanticAssetStatuses.get(path), {
+        message: `${path} should load from the local app`,
+      })
+      .toBe(200);
+  }
   const orbitPaint = await webGLPaintState(semanticCanvas);
   expect(orbitPaint.width).toBeGreaterThan(500);
   expect(orbitPaint.height).toBeGreaterThan(400);
@@ -923,4 +955,8 @@ test("trajectory overlays and geographic views honor production contracts", asyn
   });
 
   expect(consoleErrors, consoleErrors.join("\n")).toHaveLength(0);
+  expect(
+    forbiddenRuntimeAssets,
+    `Unexpected remote 3D asset requests:\n${forbiddenRuntimeAssets.join("\n")}`,
+  ).toHaveLength(0);
 });
