@@ -288,13 +288,18 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
         <meshPhysicalMaterial
           clearcoat={1}
           clearcoatRoughness={0.035}
-          color="#f2f5f6"
-          envMapIntensity={2.35}
-          iridescence={0.1}
+          color="#f6f8f8"
+          emissive="#cbd7dc"
+          emissiveIntensity={0.09}
+          envMapIntensity={1.8}
+          iridescence={0.05}
           iridescenceIOR={1.36}
           iridescenceThicknessRange={[120, 420]}
-          metalness={0.34}
-          roughness={0.13}
+          metalness={0.16}
+          roughness={0.15}
+          sheen={0.18}
+          sheenColor="#def6ff"
+          sheenRoughness={0.32}
         />
       </mesh>
       <mesh
@@ -305,7 +310,7 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
           blending={AdditiveBlending}
           color={BODY_SHELL_COLOR}
           depthWrite={false}
-          opacity={0.045}
+          opacity={0.022}
           side={DoubleSide}
           toneMapped={false}
           transparent
