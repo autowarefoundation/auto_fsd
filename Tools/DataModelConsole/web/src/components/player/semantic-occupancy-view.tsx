@@ -98,16 +98,12 @@ const CAMERA_PRESETS: Record<CameraPreset, CameraPresetDefinition> = {
     fov: 43,
   },
   ego: {
-    position: [0, 2.8, -6.8],
-    target: [0, 1, 26],
+    position: [0, 3.8, -9.2],
+    target: [0, 0.9, 18],
     up: [0, 1, 0],
-    fov: 56,
+    fov: 50,
   },
 };
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
-}
 
 function sourcePixels(
   artifact: SemanticOccupancyArtifact,
@@ -189,9 +185,7 @@ function sourcePixels(
       pixels[offset] = color[0];
       pixels[offset + 1] = color[1];
       pixels[offset + 2] = color[2];
-      pixels[offset + 3] = Math.round(
-        255 * opacity * Math.max(0.24, selectedValue),
-      );
+      pixels[offset + 3] = Math.round(255 * opacity * selectedValue);
     }
   }
   return pixels;
@@ -326,15 +320,12 @@ function SceneObject({
   component: SemanticOccupancyComponent;
   opacity: number;
 }) {
-  const rowSpan = (component.maxRow - component.minRow + 1) * METERS_PER_CELL;
-  const colSpan = (component.maxCol - component.minCol + 1) * METERS_PER_CELL;
-  const majorSpan = Math.max(rowSpan, colSpan);
-  const minorSpan = Math.min(rowSpan, colSpan);
+  const majorSpan = component.majorSpanCells * METERS_PER_CELL;
+  const minorSpan = component.minorSpanCells * METERS_PER_CELL;
   const position = componentPosition(artifact, component);
   const color = component.errorKind
     ? ERROR_COLORS[component.errorKind]
     : OBJECT_COLORS[component.classIndex - OBJECT_CLASS_INDICES[0]];
-  const objectOpacity = clamp(opacity, 0.2, 1);
 
   if (component.classIndex === 5) {
     return (
@@ -342,10 +333,10 @@ function SceneObject({
         color={color}
         confidence={component.meanConfidence}
         errorKind={component.errorKind}
-        length={clamp(majorSpan, 3.4, 8)}
-        opacity={objectOpacity}
+        length={majorSpan}
+        opacity={opacity}
         position={position}
-        width={clamp(minorSpan, 1.6, 3)}
+        width={minorSpan}
         yaw={component.principalAxisRadians}
       />
     );
@@ -356,8 +347,11 @@ function SceneObject({
         color={color}
         confidence={component.meanConfidence}
         errorKind={component.errorKind}
-        opacity={objectOpacity}
+        length={majorSpan}
+        opacity={opacity}
         position={position}
+        width={minorSpan}
+        yaw={component.principalAxisRadians}
       />
     );
   }
@@ -366,11 +360,10 @@ function SceneObject({
       color={color}
       confidence={component.meanConfidence}
       errorKind={component.errorKind}
-      height={clamp(Math.sqrt(component.cellCount) * 0.22, 0.8, 3.4)}
-      length={clamp(majorSpan, 0.8, 8)}
-      opacity={objectOpacity}
+      length={majorSpan}
+      opacity={opacity}
       position={position}
-      width={clamp(minorSpan, 0.8, 6)}
+      width={minorSpan}
       yaw={component.principalAxisRadians}
     />
   );
