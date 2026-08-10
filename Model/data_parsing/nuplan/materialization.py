@@ -26,6 +26,7 @@ class MaterializedNuPlanDataset:
 
     data_root: Path
     map_root: Path
+    map_version: str
     sensor_root: Path
     db_files: tuple[Path, ...]
     sensor_log_names: tuple[str, ...]
@@ -303,11 +304,27 @@ def extract_nuplan_archive(
     file_count = 0
     uncompressed_bytes = 0
     with zipfile.ZipFile(archive_path) as source:
-        for info in source.infolist():
+        members = source.infolist()
+        archive_map_version = map_version
+        if archive["component"] == "maps":
+            map_versions = {
+                parts[0]
+                for info in members
+                if len(parts := _safe_member_parts(info)) == 2
+                and parts[0].startswith("nuplan-maps-v")
+                and parts[1] == f"{parts[0]}.json"
+            }
+            if len(map_versions) != 1:
+                raise ValueError(
+                    "nuPlan map archive must contain exactly one "
+                    "version metadata file"
+                )
+            archive_map_version = map_versions.pop()
+        for info in members:
             relative = _member_destination(
                 info,
                 archive,
-                map_version=map_version,
+                map_version=archive_map_version,
             )
             if relative is None:
                 continue
@@ -364,6 +381,12 @@ def discover_materialized_nuplan(
     """Discover DBs whose complete camera and LiDAR blobs are available."""
     data_root = dataset_root.resolve()
     map_root = data_root / "maps"
+    map_metadata = tuple(sorted(map_root.glob("nuplan-maps-v*.json")))
+    if len(map_metadata) != 1:
+        raise ValueError(
+            "nuPlan map root must contain exactly one version metadata file"
+        )
+    map_version = map_metadata[0].stem
     sensor_root = data_root / "nuplan-v1.1" / "sensor_blobs"
     sensor_logs = complete_sensor_log_names(sensor_root)
     available = set(sensor_logs)
@@ -386,6 +409,7 @@ def discover_materialized_nuplan(
     return MaterializedNuPlanDataset(
         data_root=data_root,
         map_root=map_root,
+        map_version=map_version,
         sensor_root=sensor_root,
         db_files=db_files,
         sensor_log_names=sensor_logs,
