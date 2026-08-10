@@ -191,8 +191,49 @@ test("extracts connected components and estimates their principal axes", () => {
     Math.PI / 2,
     6,
   );
+  expect(components[0].majorSpanCells).toBeCloseTo(6, 6);
+  expect(components[0].minorSpanCells).toBeCloseTo(1, 6);
   expect(components[0].meanConfidence).toBeCloseTo(230 / 255, 6);
   expect(components[1].principalAxisRadians).toBeCloseTo(0, 6);
+  expect(components[1].majorSpanCells).toBeCloseTo(5, 6);
+  expect(components[1].minorSpanCells).toBeCloseTo(1, 6);
+});
+
+test("keeps component footprints faithful for single and diagonal cells", () => {
+  const semantic = artifact();
+  paint(semantic.probability, 5, [[1, 1]], 255);
+  paint(
+    semantic.probability,
+    6,
+    [
+      [4, 4],
+      [5, 5],
+      [6, 6],
+      [7, 7],
+    ],
+    255,
+  );
+
+  const components = extractSemanticOccupancyComponents({
+    artifact: semantic,
+    row: 0,
+    classIndices: [5, 6],
+    mode: "prediction",
+    threshold: 0.5,
+  });
+  const diagonal = components.find(
+    (component) => component.className === "vulnerable_road_user",
+  );
+  const single = components.find(
+    (component) => component.className === "vehicle",
+  );
+
+  expect(single?.majorSpanCells).toBeCloseTo(1, 6);
+  expect(single?.minorSpanCells).toBeCloseTo(1, 6);
+  expect(diagonal?.principalAxisRadians).toBeCloseTo(Math.PI / 4, 6);
+  expect(diagonal?.majorSpanCells).toBeCloseTo(4 * Math.SQRT2, 6);
+  expect(diagonal?.minorSpanCells).toBeCloseTo(Math.SQRT2, 6);
+  expect(diagonal?.minorSpanCells).toBeLessThan(4);
 });
 
 test("keeps false positives and false negatives as separate error objects", () => {
