@@ -633,7 +633,7 @@ export function SemanticOccupancyView({
                   near: 0.1,
                   far: 420,
                 }}
-                dpr={compactViewport ? [1, 1.15] : [1, 1.75]}
+                dpr={compactViewport ? [1, 1.15] : [1, 1.5]}
                 frameloop="demand"
                 gl={{
                   alpha: false,
