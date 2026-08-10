@@ -153,6 +153,12 @@ The official ZIP layout is normalized to the nuPlan devkit hierarchy:
 - camera and LiDAR wrapper directories are merged under
   `nuplan-v1.1/sensor_blobs/<log>/`.
 
+The map archive filename and raw snapshot declaration do not necessarily match
+the devkit map version embedded in the ZIP. The materializer MUST derive the
+effective version from the archive's unique `nuplan-maps-v*.json` metadata
+file, pass that version to `NuPlanScenarioBuilder`, and record both the raw
+declared version and effective materialized version in the packed manifest.
+
 ZIP traversal entries and symbolic links MUST be rejected. The materializer
 MUST match DB filenames to sensor-log directories and reject snapshots with no
 complete camera-plus-LiDAR log.
