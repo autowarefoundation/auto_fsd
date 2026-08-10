@@ -340,7 +340,7 @@ export function SemanticGround({
           mixBlur={0.82}
           mixStrength={1.45}
           opacity={0.14}
-          resolution={compact ? 128 : 512}
+          resolution={compact ? 128 : 256}
           roughness={0.48}
           transparent
         />
@@ -521,8 +521,8 @@ function DemoStreetscape({
   const railPosts = useMemo(
     () =>
       Array.from(
-        { length: Math.floor(groundLength / 8) },
-        (_, index) => groundCenterZ - groundLength / 2 + index * 8 + 4,
+        { length: Math.floor(groundLength / 12) },
+        (_, index) => groundCenterZ - groundLength / 2 + index * 12 + 6,
       ),
     [groundCenterZ, groundLength],
   );
@@ -570,7 +570,6 @@ function DemoStreetscape({
           {railPosts.map((z) => (
             <mesh
               key={`guardrail-${side}-${z}`}
-              castShadow
               position={[side * 42.25, 0.4, z]}
             >
               <boxGeometry args={[0.14, 0.8, 0.14]} />
@@ -668,8 +667,8 @@ export function SceneEnvironment({
         shadow-camera-near={1}
         shadow-camera-right={90}
         shadow-camera-top={145}
-        shadow-mapSize-height={compact ? 384 : 1536}
-        shadow-mapSize-width={compact ? 384 : 1536}
+        shadow-mapSize-height={compact ? 384 : 1024}
+        shadow-mapSize-width={compact ? 384 : 1024}
       />
       <directionalLight
         color="#62e9ff"
@@ -695,7 +694,7 @@ export function SceneEnvironment({
         height={groundLength}
         opacity={0.48}
         position={[0, 0.045, groundCenterZ]}
-        resolution={compact ? 192 : 768}
+        resolution={compact ? 192 : 512}
         smooth
         width={groundWidth}
       />
