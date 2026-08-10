@@ -10,10 +10,11 @@ import {
 } from "react";
 import {
   AdditiveBlending,
+  BackSide,
   Color,
-  DoubleSide,
   Material,
   Mesh,
+  MeshBasicMaterial,
   MeshStandardMaterial,
   Quaternion,
   Vector3,
@@ -39,8 +40,14 @@ interface SemanticVehicleProps extends SemanticModelProps {
   yaw: number;
 }
 
+interface SemanticPedestrianProps extends SemanticModelProps {
+  length?: number;
+  width?: number;
+  yaw?: number;
+}
+
 interface SemanticObstacleProps extends SemanticModelProps {
-  height: number;
+  height?: number;
   length: number;
   width: number;
   yaw: number;
@@ -183,90 +190,119 @@ function SemanticAsset({
   return <primitive object={clone} scale={scale} />;
 }
 
-function GroundHalo({
+function SemanticAssetShell({
   color,
   confidence,
-  opacity,
+  errorKind,
+  path,
   scale,
 }: {
   color: string;
   confidence: number;
-  opacity: number;
+  errorKind?: "fp" | "fn" | null;
+  path: string;
   scale: ScenePosition;
 }) {
+  const { scene } = useGLTF(path, false, false);
+  const clone = useMemo(() => {
+    const next = scene.clone(true);
+    next.traverse((child) => {
+      if (!(child instanceof Mesh)) return;
+      child.castShadow = false;
+      child.receiveShadow = false;
+      child.material = new MeshBasicMaterial({
+        blending: AdditiveBlending,
+        color,
+        depthWrite: false,
+        opacity: errorKind
+          ? 0.14 + confidence * 0.12
+          : 0.035 + confidence * 0.045,
+        side: BackSide,
+        toneMapped: false,
+        transparent: true,
+      });
+    });
+    return next;
+  }, [color, confidence, errorKind, scene]);
+
+  useEffect(
+    () => () => {
+      clone.traverse((child) => {
+        if (!(child instanceof Mesh)) return;
+        const materials = Array.isArray(child.material)
+          ? child.material
+          : [child.material];
+        materials.forEach((material: Material) => material.dispose());
+      });
+    },
+    [clone],
+  );
+
   return (
-    <mesh
-      position={[0, 0.035, 0]}
-      rotation={[-Math.PI / 2, 0, 0]}
-      scale={scale}
-    >
-      <ringGeometry args={[0.72, 1, 48]} />
+    <primitive
+      object={clone}
+      scale={scale.map((value) => value * 1.025) as ScenePosition}
+    />
+  );
+}
+
+function GroundFootprint({
+  color,
+  confidence,
+  length,
+  opacity,
+  width,
+}: {
+  color: string;
+  confidence: number;
+  length: number;
+  opacity: number;
+  width: number;
+}) {
+  return (
+    <mesh position={[0, 0.03, 0]}>
+      <boxGeometry args={[width, 0.018, length]} />
       <meshBasicMaterial
-        blending={AdditiveBlending}
         color={color}
         depthWrite={false}
-        opacity={opacity * (0.16 + confidence * 0.28)}
-        side={DoubleSide}
+        opacity={opacity * (0.025 + confidence * 0.055)}
         toneMapped={false}
         transparent
+      />
+      <Edges
+        color={color}
+        threshold={1}
+        toneMapped={false}
+        transparent
+        opacity={opacity * (0.26 + confidence * 0.42)}
       />
     </mesh>
   );
 }
 
-function HologramShell({
+function ConfidencePillar({
   color,
   confidence,
   errorKind,
-  size,
 }: {
   color: string;
   confidence: number;
   errorKind?: "fp" | "fn" | null;
-  size: ScenePosition;
 }) {
-  const glowColor = useMemo(
-    () =>
-      new Color(color).multiplyScalar(
-        errorKind ? 2.2 : 1.18 + confidence * 0.22,
-      ),
-    [color, confidence, errorKind],
-  );
-  const heightScale =
-    0.88 + confidence * 0.18 + (errorKind ? 0.24 : 0);
-  const shellOpacity = errorKind
-    ? 0.08 + confidence * 0.08
-    : 0.025 + confidence * 0.035;
+  const height = 0.12 + confidence * 0.72;
 
   return (
-    <RoundedBox
-      args={[size[0] * 1.08, size[1] * heightScale, size[2] * 1.08]}
-      position={[0, (size[1] * heightScale) / 2, 0]}
-      radius={Math.min(0.22, size[0] * 0.12, size[2] * 0.08)}
-      smoothness={3}
-    >
+    <mesh position={[0, height / 2 + 0.04, 0]}>
+      <cylinderGeometry args={[0.035, 0.065, height, 12]} />
       <meshBasicMaterial
         blending={AdditiveBlending}
-        color={glowColor}
+        color={color}
         depthWrite={false}
-        opacity={shellOpacity}
-        side={DoubleSide}
+        opacity={errorKind ? 0.7 : 0.18 + confidence * 0.32}
         toneMapped={false}
         transparent
       />
-      <Edges
-        color={glowColor}
-        scale={1.002}
-        threshold={24}
-        toneMapped={false}
-        transparent
-        opacity={
-          errorKind
-            ? 0.28 + confidence * 0.28
-            : 0.08 + confidence * 0.13
-        }
-      />
-    </RoundedBox>
+    </mesh>
   );
 }
 
@@ -321,19 +357,24 @@ export const SemanticVehicle = memo(function SemanticVehicle({
   yaw,
 }: SemanticVehicleProps) {
   const asset = vehicleAssetFor(length, position);
+  const assetScale: ScenePosition = [
+    width / asset.nativeSize[0],
+    asset.height / asset.nativeSize[1],
+    length / asset.nativeSize[2],
+  ];
   return (
     <group position={position} rotation={[0, yaw, 0]}>
-      <GroundHalo
+      <GroundFootprint
         color={color}
         confidence={confidence}
+        length={length}
         opacity={opacity}
-        scale={[width * 0.72, length * 0.62, 1]}
+        width={width}
       />
-      <HologramShell
+      <ConfidencePillar
         color={color}
         confidence={confidence}
         errorKind={errorKind}
-        size={[width, asset.height, length]}
       />
       <Suspense
         fallback={
@@ -350,12 +391,15 @@ export const SemanticVehicle = memo(function SemanticVehicle({
           confidence={confidence}
           opacity={opacity}
           path={asset.path}
-          scale={[
-            width / asset.nativeSize[0],
-            asset.height / asset.nativeSize[1],
-            length / asset.nativeSize[2],
-          ]}
+          scale={assetScale}
           tintStrength={0.2}
+        />
+        <SemanticAssetShell
+          color={color}
+          confidence={confidence}
+          errorKind={errorKind}
+          path={asset.path}
+          scale={assetScale}
         />
       </Suspense>
     </group>
@@ -366,84 +410,89 @@ export const SemanticPedestrian = memo(function SemanticPedestrian({
   color,
   confidence,
   errorKind,
+  length = 0.82,
   opacity,
   position,
-}: SemanticModelProps) {
+  width = 0.82,
+  yaw = 0,
+}: SemanticPedestrianProps) {
   return (
-    <group position={position}>
-      <GroundHalo
+    <group position={position} rotation={[0, yaw, 0]}>
+      <GroundFootprint
         color={color}
         confidence={confidence}
+        length={length}
         opacity={opacity}
-        scale={[0.55, 0.55, 1]}
+        width={width}
       />
-      <HologramShell
+      <ConfidencePillar
         color={color}
         confidence={confidence}
         errorKind={errorKind}
-        size={[0.82, 2.12, 0.82]}
       />
-      <mesh castShadow position={[0, 1.72, 0]}>
-        <icosahedronGeometry args={[0.22, 2]} />
-        <meshPhysicalMaterial
-          clearcoat={0.35}
-          color="#d9b8a4"
-          envMapIntensity={1.2}
-          opacity={opacity}
-          roughness={0.48}
-          transparent={opacity < 1}
-        />
-      </mesh>
-      <RoundedBox
-        args={[0.52, 0.72, 0.34]}
-        castShadow
-        position={[0, 1.13, 0]}
-        radius={0.15}
-        smoothness={3}
-      >
-        <SemanticMaterial
-          color={color}
-          confidence={confidence}
-          metalness={0.25}
-          opacity={opacity}
-          roughness={0.34}
-        />
-      </RoundedBox>
-      {[-0.31, 0.31].map((x) => (
-        <mesh
-          key={`arm-${x}`}
-          castShadow
-          position={[x, 1.08, 0]}
-          rotation={[0, 0, x < 0 ? -0.16 : 0.16]}
-        >
-          <capsuleGeometry args={[0.075, 0.52, 3, 7]} />
-          <SemanticMaterial
-            color={color}
-            confidence={confidence}
-            metalness={0.18}
-            opacity={opacity}
-            roughness={0.42}
-          />
-        </mesh>
-      ))}
-      {[-0.14, 0.14].map((x) => (
-        <mesh
-          key={`leg-${x}`}
-          castShadow
-          position={[x, 0.46, 0]}
-          rotation={[0, 0, x < 0 ? -0.07 : 0.07]}
-        >
-          <capsuleGeometry args={[0.09, 0.55, 3, 7]} />
+      <group scale={[width / 0.82, 1, length / 0.82]}>
+        <mesh castShadow position={[0, 1.72, 0]}>
+          <icosahedronGeometry args={[0.22, 2]} />
           <meshPhysicalMaterial
-            color="#18252b"
+            clearcoat={0.35}
+            color="#d9b8a4"
             envMapIntensity={1.2}
-            metalness={0.3}
             opacity={opacity}
-            roughness={0.5}
+            roughness={0.48}
             transparent={opacity < 1}
           />
         </mesh>
-      ))}
+        <RoundedBox
+          args={[0.52, 0.72, 0.34]}
+          castShadow
+          position={[0, 1.13, 0]}
+          radius={0.15}
+          smoothness={3}
+        >
+          <SemanticMaterial
+            color={color}
+            confidence={confidence}
+            metalness={0.25}
+            opacity={opacity}
+            roughness={0.34}
+          />
+        </RoundedBox>
+        {[-0.31, 0.31].map((x) => (
+          <mesh
+            key={`arm-${x}`}
+            castShadow
+            position={[x, 1.08, 0]}
+            rotation={[0, 0, x < 0 ? -0.16 : 0.16]}
+          >
+            <capsuleGeometry args={[0.075, 0.52, 3, 7]} />
+            <SemanticMaterial
+              color={color}
+              confidence={confidence}
+              metalness={0.18}
+              opacity={opacity}
+              roughness={0.42}
+            />
+          </mesh>
+        ))}
+        {[-0.14, 0.14].map((x) => (
+          <mesh
+            key={`leg-${x}`}
+            castShadow
+            position={[x, 0.46, 0]}
+            rotation={[0, 0, x < 0 ? -0.07 : 0.07]}
+          >
+            <capsuleGeometry args={[0.09, 0.55, 3, 7]} />
+            <meshPhysicalMaterial
+              color="#18252b"
+              envMapIntensity={1.2}
+              metalness={0.3}
+              opacity={opacity}
+              roughness={0.5}
+              transparent={opacity < 1}
+            />
+          </mesh>
+        ))}
+      </group>
     </group>
   );
 });
@@ -754,13 +803,12 @@ function BicycleModel({
 }
 
 function obstacleKindFor({
-  height,
   length,
   position,
   width,
 }: Pick<
   SemanticObstacleProps,
-  "height" | "length" | "position" | "width"
+  "length" | "position" | "width"
 >): ObstacleKind {
   const major = Math.max(width, length);
   const minor = Math.min(width, length);
@@ -771,7 +819,6 @@ function obstacleKindFor({
   if (major >= 2 && minor <= 1.8) {
     return seed % 2 === 0 ? "bicycle" : "sign";
   }
-  if (height >= 1.55) return "sign";
   if (major <= 1.45) return seed % 2 === 0 ? "cone" : "bollard";
   return "crate";
 }
@@ -780,31 +827,41 @@ export const SemanticObstacle = memo(function SemanticObstacle({
   color,
   confidence,
   errorKind,
-  height,
   length,
   opacity,
   position,
   width,
   yaw,
 }: SemanticObstacleProps) {
-  const kind = obstacleKindFor({ height, length, position, width });
+  const kind = obstacleKindFor({ length, position, width });
   const asset =
     kind === "cone" ? OBSTACLE_ASSETS.cone : OBSTACLE_ASSETS.box;
-  const targetHeight = kind === "cone" ? Math.max(0.7, height) : height;
+  const targetHeight =
+    kind === "sign"
+      ? 2.25
+      : kind === "bicycle"
+        ? 1.28
+        : kind === "barrier"
+          ? 1.2
+          : kind === "bollard"
+            ? 1.1
+            : kind === "cone"
+              ? 0.75
+              : 1.05;
 
   return (
     <group position={position} rotation={[0, yaw, 0]}>
-      <GroundHalo
+      <GroundFootprint
         color={color}
         confidence={confidence}
+        length={length}
         opacity={opacity}
-        scale={[width * 0.68, length * 0.66, 1]}
+        width={width}
       />
-      <HologramShell
+      <ConfidencePillar
         color={color}
         confidence={confidence}
         errorKind={errorKind}
-        size={[width, targetHeight, length]}
       />
       {kind === "barrier" ? (
         <BarrierModel
