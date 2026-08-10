@@ -54,7 +54,7 @@ function createMockArtifact(): SemanticOccupancyArtifact {
   paint(5, 236, 244, 180, 197, 255, "teacher");
   paint(5, 178, 198, 103, 111, 218, "prediction");
   paint(5, 178, 196, 105, 113, 255, "teacher");
-  paint(5, 330, 345, 78, 85, 210, "prediction");
+  paint(5, 220, 235, 225, 232, 210, "prediction");
   paint(5, 142, 158, 160, 166, 255, "teacher");
 
   paint(6, 270, 274, 121, 124, 232, "prediction");
