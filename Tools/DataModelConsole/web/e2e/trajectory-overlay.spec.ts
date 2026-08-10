@@ -710,7 +710,7 @@ test("trajectory overlays and geographic views honor production contracts", asyn
     })
     .toBeGreaterThan(1_000);
   const expectedSemanticAssets = [
-    "/assets/semantic-occupancy/kenney-car-kit/race-future.glb",
+    "/assets/semantic-occupancy/poly-haven/studio_small_09_1k.hdr",
     "/assets/semantic-occupancy/kenney-car-kit/suv-luxury.glb",
     "/assets/semantic-occupancy/kenney-car-kit/box.glb",
     "/assets/semantic-occupancy/kenney-car-kit/Textures/colormap.png",
