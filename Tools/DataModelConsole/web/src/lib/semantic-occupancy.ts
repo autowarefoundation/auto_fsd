@@ -39,6 +39,8 @@ export interface SemanticOccupancyComponent {
   meanConfidence: number;
   peakConfidence: number;
   principalAxisRadians: number;
+  majorSpanCells: number;
+  minorSpanCells: number;
 }
 
 export interface SemanticOccupancyArtifact {
@@ -414,6 +416,48 @@ export function extractSemanticOccupancyComponents({
         sumColSquared / count - centroidCol * centroidCol;
       const covariance =
         sumRowCol / count - centroidRow * centroidCol;
+      const principalAxisRadians =
+        count > 1
+          ? 0.5 *
+            Math.atan2(
+              2 * covariance,
+              rowVariance - colVariance,
+            )
+          : 0;
+      const axisRow = Math.cos(principalAxisRadians);
+      const axisCol = Math.sin(principalAxisRadians);
+      const cellProjectionSpan = Math.abs(axisRow) + Math.abs(axisCol);
+      let minMajorProjection = Number.POSITIVE_INFINITY;
+      let maxMajorProjection = Number.NEGATIVE_INFINITY;
+      let minMinorProjection = Number.POSITIVE_INFINITY;
+      let maxMinorProjection = Number.NEGATIVE_INFINITY;
+      for (let index = 0; index < queueEnd; index++) {
+        const rasterIndex = queue[index];
+        const rasterRow = Math.floor(rasterIndex / width);
+        const rasterCol = rasterIndex - rasterRow * width;
+        const rowOffset = rasterRow - centroidRow;
+        const colOffset = rasterCol - centroidCol;
+        const majorProjection =
+          rowOffset * axisRow + colOffset * axisCol;
+        const minorProjection =
+          -rowOffset * axisCol + colOffset * axisRow;
+        minMajorProjection = Math.min(
+          minMajorProjection,
+          majorProjection,
+        );
+        maxMajorProjection = Math.max(
+          maxMajorProjection,
+          majorProjection,
+        );
+        minMinorProjection = Math.min(
+          minMinorProjection,
+          minorProjection,
+        );
+        maxMinorProjection = Math.max(
+          maxMinorProjection,
+          minorProjection,
+        );
+      }
       components.push({
         classIndex,
         className: SEMANTIC_OCCUPANCY_CLASS_NAMES[classIndex],
@@ -432,14 +476,15 @@ export function extractSemanticOccupancyComponents({
         maxCol,
         meanConfidence: confidenceSum / count,
         peakConfidence,
-        principalAxisRadians:
-          count > 1
-            ? 0.5 *
-              Math.atan2(
-                2 * covariance,
-                rowVariance - colVariance,
-              )
-            : 0,
+        principalAxisRadians,
+        majorSpanCells:
+          maxMajorProjection -
+          minMajorProjection +
+          cellProjectionSpan,
+        minorSpanCells:
+          maxMinorProjection -
+          minMinorProjection +
+          cellProjectionSpan,
       });
     }
   }
