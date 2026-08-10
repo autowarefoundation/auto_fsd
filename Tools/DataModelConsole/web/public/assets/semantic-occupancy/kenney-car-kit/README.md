@@ -16,7 +16,6 @@ bundled. No runtime request is made to Kenney or another asset host.
 
 | File | SHA-256 |
 |---|---|
-| `race-future.glb` | `869e2a58d2c12de474e824aff137334491b8f234b97127cf23f1ea04e42deec6` |
 | `sedan-sports.glb` | `2889c428ca1dd9c975c3ff760eb8757883490410555ab60b818f712f583826d6` |
 | `suv-luxury.glb` | `9e2a79dc050189d4555a88d2e9da0f30ff946ba74f1d43b5b3bda3c193d1f7d7` |
 | `van.glb` | `ed4ed56e8e5ed98db050af09ed2062b3b6bb7b93eab1e563cb6774b387b233a1` |
