@@ -120,7 +120,7 @@ def _snapshot(tmp_path: Path):
     manifest = {
         "archives": archives,
         "dataset_revision": "nuplan-v1.1",
-        "map_version": "nuplan-maps-v1.0",
+        "map_version": "nuplan-maps-v1.1",
         "schema_version": "nuplan_raw_snapshot_v1",
         "snapshot_id": "nuplan-test",
         "source_contract_sha256": "a" * 64,
@@ -152,6 +152,7 @@ def test_materializes_devkit_layout_and_filters_incomplete_sensor_logs(
     )
 
     assert materialized.sensor_log_names == ("log-complete",)
+    assert materialized.map_version == "nuplan-maps-v1.0"
     assert [path.name for path in materialized.db_files] == [
         "log-complete.db"
     ]
@@ -230,6 +231,11 @@ def test_zip_member_path_and_symlink_are_rejected(tmp_path):
 def test_discovery_fails_without_complete_sensor_data(tmp_path):
     dataset_root = tmp_path / "dataset"
     (dataset_root / "maps").mkdir(parents=True)
+    (
+        dataset_root
+        / "maps"
+        / "nuplan-maps-v1.0.json"
+    ).write_text("{}")
     (dataset_root / "nuplan-v1.1" / "sensor_blobs").mkdir(parents=True)
 
     with pytest.raises(ValueError, match="complete camera and LiDAR"):
