@@ -33,6 +33,7 @@ from kubernetes.client import (
     V1PodAntiAffinity,
     V1PodSpec,
     V1ResourceRequirements,
+    V1Toleration,
     V1Volume,
     V1VolumeMount,
 )
@@ -118,13 +119,21 @@ def _head_pod_template() -> PodTemplate:
     )
 
 
-def _worker_pod_template() -> PodTemplate:
+def _worker_pod_template(*, workload_type: str) -> PodTemplate:
     return PodTemplate(
         primary_container_name="ray-worker",
         labels={"auto-e2e.training/role": "ray-gpu-worker"},
         annotations={"karpenter.sh/do-not-disrupt": "true"},
         pod_spec=V1PodSpec(
             service_account_name="default",
+            node_selector={"workload-type": workload_type},
+            tolerations=[
+                V1Toleration(
+                    key="nvidia.com/gpu",
+                    operator="Exists",
+                    effect="NoSchedule",
+                ),
+            ],
             affinity=V1Affinity(
                 pod_anti_affinity=V1PodAntiAffinity(
                     required_during_scheduling_ignored_during_execution=[
@@ -186,7 +195,11 @@ def _worker_pod_template() -> PodTemplate:
     )
 
 
-def _ray_job_config(replicas: int) -> RayJobConfig:
+def _ray_job_config(
+    replicas: int,
+    *,
+    worker_workload_type: str,
+) -> RayJobConfig:
     return RayJobConfig(
         head_node_config=HeadNodeConfig(
             ray_start_params={
@@ -205,7 +218,9 @@ def _ray_job_config(replicas: int) -> RayJobConfig:
                     "num-cpus": "4",
                     "num-gpus": "1",
                 },
-                pod_template=_worker_pod_template(),
+                pod_template=_worker_pod_template(
+                    workload_type=worker_workload_type,
+                ),
             ),
         ],
         enable_autoscaling=False,
@@ -215,9 +230,18 @@ def _ray_job_config(replicas: int) -> RayJobConfig:
     )
 
 
-RAY_2 = _ray_job_config(2)
-RAY_4 = _ray_job_config(4)
-RAY_8 = _ray_job_config(8)
+RAY_2 = _ray_job_config(
+    2,
+    worker_workload_type="gpu-canary",
+)
+RAY_4 = _ray_job_config(
+    4,
+    worker_workload_type="gpu-training",
+)
+RAY_8 = _ray_job_config(
+    8,
+    worker_workload_type="gpu-training",
+)
 
 
 @task(
@@ -475,7 +499,7 @@ def verify_reactive_canary_training(
     container_image=TRAINING_IMAGE,
     retries=1,
     labels={
-        "kueue.x-k8s.io/queue-name": "training",
+        "kueue.x-k8s.io/queue-name": "gpu-canary",
         "kueue.x-k8s.io/priority-class": "research-low",
     },
     environment=RAY_TASK_ENVIRONMENT,
