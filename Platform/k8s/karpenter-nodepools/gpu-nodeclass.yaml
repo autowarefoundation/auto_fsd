@@ -32,7 +32,7 @@ spec:
   role: auto-e2e-platform-node-role
   subnetSelectorTerms:
     - tags:
-        Name: auto-e2e-platform-private-us-west-2b
+        Name: auto-e2e-platform-private-us-west-2a
   securityGroupSelectorTerms:
     - tags:
         aws:eks:cluster-name: auto-e2e-platform
