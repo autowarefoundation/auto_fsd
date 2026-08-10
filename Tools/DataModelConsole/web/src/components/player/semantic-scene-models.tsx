@@ -1,6 +1,6 @@
 "use client";
 
-import { RoundedBox, useGLTF } from "@react-three/drei";
+import { Edges, RoundedBox, useGLTF } from "@react-three/drei";
 import type { ThreeElements } from "@react-three/fiber";
 import {
   memo,
@@ -15,6 +15,8 @@ import {
   Material,
   Mesh,
   MeshStandardMaterial,
+  Quaternion,
+  Vector3,
 } from "three";
 
 export {
@@ -26,6 +28,7 @@ type ScenePosition = [number, number, number];
 interface SemanticModelProps {
   color: string;
   confidence: number;
+  errorKind?: "fp" | "fn" | null;
   opacity: number;
   position: ScenePosition;
 }
@@ -80,6 +83,14 @@ const OBSTACLE_ASSETS = {
     nativeSize: [0.476, 0.595, 0.476] as ScenePosition,
   },
 };
+
+type ObstacleKind =
+  | "barrier"
+  | "bicycle"
+  | "bollard"
+  | "cone"
+  | "crate"
+  | "sign";
 
 function SemanticMaterial({
   color,
@@ -203,6 +214,62 @@ function GroundHalo({
   );
 }
 
+function HologramShell({
+  color,
+  confidence,
+  errorKind,
+  size,
+}: {
+  color: string;
+  confidence: number;
+  errorKind?: "fp" | "fn" | null;
+  size: ScenePosition;
+}) {
+  const glowColor = useMemo(
+    () =>
+      new Color(color).multiplyScalar(
+        errorKind ? 2.2 : 1.18 + confidence * 0.22,
+      ),
+    [color, confidence, errorKind],
+  );
+  const heightScale =
+    0.88 + confidence * 0.18 + (errorKind ? 0.24 : 0);
+  const shellOpacity = errorKind
+    ? 0.08 + confidence * 0.08
+    : 0.025 + confidence * 0.035;
+
+  return (
+    <RoundedBox
+      args={[size[0] * 1.08, size[1] * heightScale, size[2] * 1.08]}
+      position={[0, (size[1] * heightScale) / 2, 0]}
+      radius={Math.min(0.22, size[0] * 0.12, size[2] * 0.08)}
+      smoothness={3}
+    >
+      <meshBasicMaterial
+        blending={AdditiveBlending}
+        color={glowColor}
+        depthWrite={false}
+        opacity={shellOpacity}
+        side={DoubleSide}
+        toneMapped={false}
+        transparent
+      />
+      <Edges
+        color={glowColor}
+        scale={1.002}
+        threshold={24}
+        toneMapped={false}
+        transparent
+        opacity={
+          errorKind
+            ? 0.28 + confidence * 0.28
+            : 0.08 + confidence * 0.13
+        }
+      />
+    </RoundedBox>
+  );
+}
+
 function VehicleFallback({
   color,
   length,
@@ -246,6 +313,7 @@ function vehicleAssetFor(
 export const SemanticVehicle = memo(function SemanticVehicle({
   color,
   confidence,
+  errorKind,
   length,
   opacity,
   position,
@@ -260,6 +328,12 @@ export const SemanticVehicle = memo(function SemanticVehicle({
         confidence={confidence}
         opacity={opacity}
         scale={[width * 0.72, length * 0.62, 1]}
+      />
+      <HologramShell
+        color={color}
+        confidence={confidence}
+        errorKind={errorKind}
+        size={[width, asset.height, length]}
       />
       <Suspense
         fallback={
@@ -291,6 +365,7 @@ export const SemanticVehicle = memo(function SemanticVehicle({
 export const SemanticPedestrian = memo(function SemanticPedestrian({
   color,
   confidence,
+  errorKind,
   opacity,
   position,
 }: SemanticModelProps) {
@@ -301,6 +376,12 @@ export const SemanticPedestrian = memo(function SemanticPedestrian({
         confidence={confidence}
         opacity={opacity}
         scale={[0.55, 0.55, 1]}
+      />
+      <HologramShell
+        color={color}
+        confidence={confidence}
+        errorKind={errorKind}
+        size={[0.82, 2.12, 0.82]}
       />
       <mesh castShadow position={[0, 1.72, 0]}>
         <icosahedronGeometry args={[0.22, 2]} />
@@ -400,9 +481,305 @@ function ObstacleFallback({
   );
 }
 
+function Tube({
+  color,
+  from,
+  opacity,
+  radius = 0.035,
+  to,
+}: {
+  color: string;
+  from: ScenePosition;
+  opacity: number;
+  radius?: number;
+  to: ScenePosition;
+}) {
+  const transform = useMemo(() => {
+    const start = new Vector3(...from);
+    const end = new Vector3(...to);
+    const direction = end.clone().sub(start);
+    return {
+      length: direction.length(),
+      midpoint: start.add(end).multiplyScalar(0.5),
+      quaternion: new Quaternion().setFromUnitVectors(
+        new Vector3(0, 1, 0),
+        direction.normalize(),
+      ),
+    };
+  }, [from, to]);
+
+  return (
+    <mesh
+      position={transform.midpoint}
+      quaternion={transform.quaternion}
+    >
+      <cylinderGeometry args={[radius, radius, transform.length, 8]} />
+      <meshPhysicalMaterial
+        clearcoat={0.65}
+        color={color}
+        envMapIntensity={1.7}
+        metalness={0.72}
+        opacity={opacity}
+        roughness={0.24}
+        transparent={opacity < 1}
+      />
+    </mesh>
+  );
+}
+
+function BarrierModel({
+  confidence,
+  length,
+  opacity,
+}: {
+  confidence: number;
+  length: number;
+  opacity: number;
+}) {
+  const segments = Math.max(3, Math.min(8, Math.round(length / 0.8)));
+  return (
+    <group>
+      <RoundedBox
+        args={[0.26, 0.34, length]}
+        castShadow
+        position={[0, 1.02, 0]}
+        radius={0.08}
+        smoothness={3}
+      >
+        <SemanticMaterial
+          color="#f08b32"
+          confidence={confidence}
+          opacity={opacity}
+        />
+      </RoundedBox>
+      {Array.from({ length: segments }, (_, index) => (
+        <RoundedBox
+          key={`barrier-stripe-${index}`}
+          args={[0.28, 0.22, Math.max(0.18, length / segments / 2.2)]}
+          position={[
+            0,
+            1.03,
+            -length / 2 + ((index + 0.5) * length) / segments,
+          ]}
+          radius={0.025}
+          smoothness={2}
+        >
+          <meshBasicMaterial color="#f7f4dc" toneMapped={false} />
+        </RoundedBox>
+      ))}
+      {[-0.38, 0.38].map((ratio) => (
+        <group key={`barrier-foot-${ratio}`} position={[0, 0, ratio * length]}>
+          <RoundedBox
+            args={[0.18, 0.86, 0.18]}
+            castShadow
+            position={[0, 0.52, 0]}
+            radius={0.04}
+            smoothness={2}
+          >
+            <meshPhysicalMaterial
+              color="#202b31"
+              metalness={0.68}
+              opacity={opacity}
+              roughness={0.3}
+              transparent={opacity < 1}
+            />
+          </RoundedBox>
+          <RoundedBox
+            args={[0.82, 0.12, 0.36]}
+            castShadow
+            position={[0, 0.08, 0]}
+            radius={0.05}
+            smoothness={2}
+          >
+            <meshPhysicalMaterial
+              color="#11191d"
+              metalness={0.52}
+              opacity={opacity}
+              roughness={0.38}
+              transparent={opacity < 1}
+            />
+          </RoundedBox>
+        </group>
+      ))}
+    </group>
+  );
+}
+
+function BollardModel({
+  confidence,
+  opacity,
+}: {
+  confidence: number;
+  opacity: number;
+}) {
+  return (
+    <group>
+      <mesh castShadow position={[0, 0.55, 0]}>
+        <cylinderGeometry args={[0.15, 0.2, 1.1, 16]} />
+        <SemanticMaterial
+          color="#e76738"
+          confidence={confidence}
+          opacity={opacity}
+        />
+      </mesh>
+      <mesh position={[0, 0.75, 0]}>
+        <cylinderGeometry args={[0.156, 0.17, 0.18, 16]} />
+        <meshBasicMaterial color="#f2f6eb" toneMapped={false} />
+      </mesh>
+      <mesh castShadow position={[0, 0.06, 0]}>
+        <cylinderGeometry args={[0.34, 0.4, 0.12, 16]} />
+        <meshPhysicalMaterial
+          color="#172127"
+          metalness={0.74}
+          roughness={0.3}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+function RoadSignModel({
+  confidence,
+  opacity,
+}: {
+  confidence: number;
+  opacity: number;
+}) {
+  return (
+    <group>
+      <mesh castShadow position={[0, 0.92, 0]}>
+        <cylinderGeometry args={[0.045, 0.055, 1.84, 12]} />
+        <meshPhysicalMaterial
+          color="#9aa7ad"
+          envMapIntensity={1.8}
+          metalness={0.92}
+          roughness={0.22}
+        />
+      </mesh>
+      <mesh
+        castShadow
+        position={[0, 1.78, 0]}
+        rotation={[Math.PI / 2, 0, 0]}
+      >
+        <cylinderGeometry args={[0.48, 0.48, 0.075, 8]} />
+        <SemanticMaterial
+          color="#e64c58"
+          confidence={confidence}
+          opacity={opacity}
+        />
+      </mesh>
+      <mesh position={[0, 1.78, -0.042]} rotation={[Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.3, 0.39, 8]} />
+        <meshBasicMaterial color="#f8f8ec" toneMapped={false} />
+      </mesh>
+      <mesh castShadow position={[0, 0.06, 0]}>
+        <cylinderGeometry args={[0.28, 0.34, 0.12, 16]} />
+        <meshPhysicalMaterial
+          color="#182329"
+          metalness={0.68}
+          roughness={0.32}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+function BicycleModel({
+  color,
+  length,
+  opacity,
+}: {
+  color: string;
+  length: number;
+  opacity: number;
+}) {
+  const wheelOffset = Math.min(0.84, Math.max(0.62, length * 0.34));
+  const rear: ScenePosition = [0, 0.5, -wheelOffset];
+  const front: ScenePosition = [0, 0.5, wheelOffset];
+  const crank: ScenePosition = [0, 0.54, -0.06];
+  const seat: ScenePosition = [0, 1.15, -0.34];
+  const handle: ScenePosition = [0, 1.12, wheelOffset * 0.72];
+
+  return (
+    <group>
+      {[-wheelOffset, wheelOffset].map((z) => (
+        <group key={`bicycle-wheel-${z}`} position={[0, 0.5, z]}>
+          <mesh castShadow rotation={[0, Math.PI / 2, 0]}>
+            <torusGeometry args={[0.46, 0.045, 10, 28]} />
+            <meshPhysicalMaterial
+              color="#101719"
+              metalness={0.35}
+              opacity={opacity}
+              roughness={0.44}
+              transparent={opacity < 1}
+            />
+          </mesh>
+          <mesh rotation={[0, Math.PI / 2, 0]}>
+            <circleGeometry args={[0.055, 16]} />
+            <meshPhysicalMaterial
+              color="#b9c3c6"
+              metalness={0.9}
+              roughness={0.2}
+            />
+          </mesh>
+        </group>
+      ))}
+      <Tube color={color} from={rear} opacity={opacity} to={crank} />
+      <Tube color={color} from={crank} opacity={opacity} to={front} />
+      <Tube color={color} from={crank} opacity={opacity} to={seat} />
+      <Tube color={color} from={seat} opacity={opacity} to={rear} />
+      <Tube color={color} from={seat} opacity={opacity} to={handle} />
+      <Tube color="#c5d1d4" from={front} opacity={opacity} to={handle} />
+      <Tube
+        color="#c5d1d4"
+        from={[-0.28, 1.16, handle[2]]}
+        opacity={opacity}
+        radius={0.025}
+        to={[0.28, 1.16, handle[2]]}
+      />
+      <RoundedBox
+        args={[0.22, 0.07, 0.32]}
+        position={[0, 1.21, -0.39]}
+        radius={0.03}
+        smoothness={2}
+      >
+        <meshPhysicalMaterial
+          color="#151b1d"
+          metalness={0.38}
+          roughness={0.42}
+        />
+      </RoundedBox>
+    </group>
+  );
+}
+
+function obstacleKindFor({
+  height,
+  length,
+  position,
+  width,
+}: Pick<
+  SemanticObstacleProps,
+  "height" | "length" | "position" | "width"
+>): ObstacleKind {
+  const major = Math.max(width, length);
+  const minor = Math.min(width, length);
+  const seed = Math.abs(
+    Math.round(position[0] * 7 + position[2] * 11),
+  );
+  if (major >= 3.8) return "barrier";
+  if (major >= 2 && minor <= 1.8) {
+    return seed % 2 === 0 ? "bicycle" : "sign";
+  }
+  if (height >= 1.55) return "sign";
+  if (major <= 1.45) return seed % 2 === 0 ? "cone" : "bollard";
+  return "crate";
+}
+
 export const SemanticObstacle = memo(function SemanticObstacle({
   color,
   confidence,
+  errorKind,
   height,
   length,
   opacity,
@@ -410,11 +787,10 @@ export const SemanticObstacle = memo(function SemanticObstacle({
   width,
   yaw,
 }: SemanticObstacleProps) {
-  const isCone = width <= 1.5 && length <= 1.5;
-  const asset = isCone
-    ? OBSTACLE_ASSETS.cone
-    : OBSTACLE_ASSETS.box;
-  const targetHeight = isCone ? Math.max(0.7, height) : height;
+  const kind = obstacleKindFor({ height, length, position, width });
+  const asset =
+    kind === "cone" ? OBSTACLE_ASSETS.cone : OBSTACLE_ASSETS.box;
+  const targetHeight = kind === "cone" ? Math.max(0.7, height) : height;
 
   return (
     <group position={position} rotation={[0, yaw, 0]}>
@@ -424,30 +800,63 @@ export const SemanticObstacle = memo(function SemanticObstacle({
         opacity={opacity}
         scale={[width * 0.68, length * 0.66, 1]}
       />
-      <Suspense
-        fallback={
-          <ObstacleFallback
-            color={color}
-            height={targetHeight}
-            length={length}
-            opacity={opacity}
-            width={width}
-          />
-        }
-      >
-        <SemanticAsset
-          color={color}
+      <HologramShell
+        color={color}
+        confidence={confidence}
+        errorKind={errorKind}
+        size={[width, targetHeight, length]}
+      />
+      {kind === "barrier" ? (
+        <BarrierModel
           confidence={confidence}
+          length={length}
           opacity={opacity}
-          path={asset.path}
-          scale={[
-            width / asset.nativeSize[0],
-            targetHeight / asset.nativeSize[1],
-            length / asset.nativeSize[2],
-          ]}
-          tintStrength={0.16}
         />
-      </Suspense>
+      ) : kind === "bollard" ? (
+        <BollardModel confidence={confidence} opacity={opacity} />
+      ) : kind === "sign" ? (
+        <RoadSignModel confidence={confidence} opacity={opacity} />
+      ) : kind === "bicycle" ? (
+        <BicycleModel color={color} length={length} opacity={opacity} />
+      ) : (
+        <Suspense
+          fallback={
+            <ObstacleFallback
+              color={color}
+              height={targetHeight}
+              length={length}
+              opacity={opacity}
+              width={width}
+            />
+          }
+        >
+          <SemanticAsset
+            color={color}
+            confidence={confidence}
+            opacity={opacity}
+            path={asset.path}
+            scale={[
+              width / asset.nativeSize[0],
+              targetHeight / asset.nativeSize[1],
+              length / asset.nativeSize[2],
+            ]}
+            tintStrength={0.16}
+          />
+        </Suspense>
+      )}
+      {kind === "crate" && (
+        <mesh position={[0, targetHeight + 0.04, 0]}>
+          <boxGeometry args={[width * 0.72, 0.025, length * 0.72]} />
+          <meshBasicMaterial
+            blending={AdditiveBlending}
+            color={color}
+            depthWrite={false}
+            opacity={0.16 + confidence * 0.14}
+            toneMapped={false}
+            transparent
+          />
+        </mesh>
+      )}
     </group>
   );
 });
