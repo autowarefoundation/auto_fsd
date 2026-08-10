@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytest.importorskip("flytekit")
 
@@ -78,6 +79,142 @@ def test_reviewed_ray_topologies_have_fixed_worker_groups():
         assert workers.min_replicas == workers.replicas
         assert workers.max_replicas == workers.replicas
         assert config.enable_autoscaling is False
+
+
+def test_two_rank_canary_targets_dedicated_gpu_placement_pool():
+    canary_spec = (
+        distributed_training.RAY_2.worker_node_config[0]
+        .pod_template.pod_spec
+    )
+    assert canary_spec.node_selector == {
+        "workload-type": "gpu-canary"
+    }
+    assert [
+        (item.key, item.operator, item.effect)
+        for item in canary_spec.tolerations
+    ] == [("nvidia.com/gpu", "Exists", "NoSchedule")]
+
+    for config in (
+        distributed_training.RAY_4,
+        distributed_training.RAY_8,
+    ):
+        worker_spec = (
+            config.worker_node_config[0].pod_template.pod_spec
+        )
+        assert worker_spec.node_selector == {
+            "workload-type": "gpu-training"
+        }
+
+    assert (
+        distributed_training.train_reactive_stage_ray_2.metadata.labels[
+            "kueue.x-k8s.io/queue-name"
+        ]
+        == "gpu-canary"
+    )
+    assert (
+        distributed_training.train_reactive_stage_ray_8.metadata.labels[
+            "kueue.x-k8s.io/queue-name"
+        ]
+        == "training"
+    )
+
+
+def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
+    platform_root = Path(distributed_training.__file__).parents[1]
+    node_classes = {
+        document["metadata"]["name"]: document
+        for document in yaml.safe_load_all(
+            (
+                platform_root
+                / "k8s/karpenter-nodepools/gpu-nodeclass.yaml"
+            ).read_text()
+        )
+    }
+    canary_class = node_classes["auto-e2e-gpu-canary"]["spec"]
+    assert "capacityReservationSelectorTerms" not in canary_class
+    assert canary_class["placementGroupSelector"] == {
+        "name": "auto-e2e-distributed-training-pg"
+    }
+    assert canary_class["subnetSelectorTerms"] == [
+        {
+            "tags": {
+                "Name": "auto-e2e-platform-private-us-west-2b"
+            }
+        }
+    ]
+
+    node_pools = {
+        document["metadata"]["name"]: document
+        for document in yaml.safe_load_all(
+            (
+                platform_root
+                / "k8s/karpenter-nodepools/gpu-nodepool.yaml"
+            ).read_text()
+        )
+    }
+    canary_pool = node_pools["gpu-canary"]["spec"]
+    assert canary_pool["limits"] == {
+        "cpu": "16",
+        "memory": "128Gi",
+        "nodes": "2",
+        "nvidia.com/gpu": "2",
+    }
+    requirements = {
+        item["key"]: item["values"]
+        for item in canary_pool["template"]["spec"]["requirements"]
+    }
+    assert requirements["node.kubernetes.io/instance-type"] == [
+        "g6e.2xlarge"
+    ]
+    assert requirements["karpenter.sh/capacity-type"] == ["on-demand"]
+    assert requirements["topology.kubernetes.io/zone"] == [
+        "us-west-2b"
+    ]
+
+
+def test_gpu_canary_has_an_isolated_kueue_flavor_and_quota():
+    platform_root = Path(distributed_training.__file__).parents[1]
+    objects = list(
+        yaml.safe_load_all(
+            (
+                platform_root / "k8s/kueue-config/kueue-objects.yaml"
+            ).read_text()
+        )
+    )
+    by_kind_and_name = {
+        (item["kind"], item["metadata"]["name"]): item
+        for item in objects
+    }
+
+    flavor = by_kind_and_name[
+        ("ResourceFlavor", "gpu-canary-flavor")
+    ]["spec"]
+    assert flavor["nodeLabels"] == {"workload-type": "gpu-canary"}
+
+    cluster_queue = by_kind_and_name[
+        ("ClusterQueue", "gpu-canary-queue")
+    ]["spec"]
+    gpu_group = next(
+        group
+        for group in cluster_queue["resourceGroups"]
+        if group["coveredResources"] == ["nvidia.com/gpu"]
+    )
+    assert gpu_group["flavors"] == [
+        {
+            "name": "gpu-canary-flavor",
+            "resources": [
+                {"name": "nvidia.com/gpu", "nominalQuota": "2"}
+            ],
+        }
+    ]
+
+    local_queue = by_kind_and_name[
+        ("LocalQueue", "gpu-canary")
+    ]
+    assert local_queue["metadata"]["namespace"] == (
+        "auto-e2e-development"
+    )
+    assert local_queue["spec"]["clusterQueue"] == "gpu-canary-queue"
 
 
 def test_ray_tasks_serialize_the_resolved_storage_path():
