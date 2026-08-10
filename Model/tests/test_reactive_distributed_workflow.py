@@ -221,6 +221,49 @@ def test_nuplan_acquisition_workflow_binds_one_dynamic_import_program():
     assert bindings["concurrency"].promise.var == "concurrency"
 
 
+def test_nuplan_snapshot_pack_workflow_binds_materialization_contract():
+    node, = workflows.wf_pack_nuplan_snapshot_reactive_dataset.nodes
+
+    assert node.flyte_entity.name.endswith(
+        "pack_nuplan_snapshot_reactive_dataset"
+    )
+    bindings = {
+        binding.var: binding.binding
+        for binding in node.bindings
+    }
+    assert (
+        bindings["snapshot_manifest"].promise.var
+        == "snapshot_manifest"
+    )
+    assert bindings["datasets_bucket"].promise.var == "datasets_bucket"
+    assert bindings["archive_ids"].promise.var == "archive_ids"
+    assert (
+        bindings["limit_total_scenarios"].promise.var
+        == "limit_total_scenarios"
+    )
+
+
+def test_nuplan_snapshot_pack_launcher_is_detached_and_bounded():
+    buildspec = (
+        Path(distributed_training.__file__).parents[1]
+        / "buildspec-launch-nuplan-pack.yml"
+    ).read_text()
+
+    assert (
+        "wf_pack_nuplan_snapshot_reactive_dataset"
+        in buildspec
+    )
+    assert '"snapshot_manifest": FlyteFile(' in buildspec
+    assert '"archive_ids": archive_ids or None' in buildspec
+    assert 'WAIT_FOR_COMPLETION: "false"' in buildspec
+    assert "FLYTE_EXECUTION_DETACHED=true" in buildspec
+    assert "MAX_REJECTION_FRACTION" in buildspec
+    assert re.search(r"\b[0-9]{12}\b", buildspec) is None
+    workflow_source = Path(workflows.__file__).read_text()
+    assert 'ephemeral_storage="500Gi"' in workflow_source
+    assert 'cache_version="nuplan-snapshot-pack-v1"' in workflow_source
+
+
 def test_l2d_reactive_pack_workflow_binds_osm_and_target_contract():
     node, = workflows.wf_pack_l2d_reactive_dataset.nodes
     assert node.flyte_entity.name.endswith("wf_create_dataset_sharded")
