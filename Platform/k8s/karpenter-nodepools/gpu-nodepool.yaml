@@ -27,7 +27,7 @@ spec:
           values: ["on-demand"]
         - key: topology.kubernetes.io/zone
           operator: In
-          values: ["us-west-2b"]
+          values: ["us-west-2a"]
       taints:
         - key: nvidia.com/gpu
           effect: NoSchedule
