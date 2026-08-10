@@ -341,6 +341,7 @@ function SceneObject({
       <SemanticVehicle
         color={color}
         confidence={component.meanConfidence}
+        errorKind={component.errorKind}
         length={clamp(majorSpan, 3.4, 8)}
         opacity={objectOpacity}
         position={position}
@@ -354,6 +355,7 @@ function SceneObject({
       <SemanticPedestrian
         color={color}
         confidence={component.meanConfidence}
+        errorKind={component.errorKind}
         opacity={objectOpacity}
         position={position}
       />
@@ -363,6 +365,7 @@ function SceneObject({
     <SemanticObstacle
       color={color}
       confidence={component.meanConfidence}
+      errorKind={component.errorKind}
       height={clamp(Math.sqrt(component.cellCount) * 0.22, 0.8, 3.4)}
       length={clamp(majorSpan, 0.8, 8)}
       opacity={objectOpacity}
