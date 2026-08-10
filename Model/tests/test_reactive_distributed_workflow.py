@@ -138,7 +138,7 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
     assert canary_class["subnetSelectorTerms"] == [
         {
             "tags": {
-                "Name": "auto-e2e-platform-private-us-west-2b"
+                "Name": "auto-e2e-platform-private-us-west-2a"
             }
         }
     ]
@@ -168,7 +168,7 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
     ]
     assert requirements["karpenter.sh/capacity-type"] == ["on-demand"]
     assert requirements["topology.kubernetes.io/zone"] == [
-        "us-west-2b"
+        "us-west-2a"
     ]
 
 
