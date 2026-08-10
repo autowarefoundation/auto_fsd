@@ -5,6 +5,7 @@ import { memo, useEffect, useMemo } from "react";
 import {
   AdditiveBlending,
   BufferGeometry,
+  Color,
   DoubleSide,
   Float32BufferAttribute,
 } from "three";
@@ -26,6 +27,9 @@ const BODY_SECTIONS: readonly BodySection[] = [
   { z: 2.22, halfWidth: 0.84, centerY: 0.51, halfHeight: 0.34 },
   { z: 2.43, halfWidth: 0.1, centerY: 0.49, halfHeight: 0.07 },
 ];
+const HEADLIGHT_COLOR = new Color(3.8, 4.8, 5.2);
+const TAILLIGHT_COLOR = new Color(4.5, 0.08, 0.24);
+const BODY_SHELL_COLOR = new Color(0.12, 1.45, 2.2);
 
 function signedPower(value: number, exponent: number): number {
   return Math.sign(value) * Math.abs(value) ** exponent;
@@ -284,13 +288,27 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
         <meshPhysicalMaterial
           clearcoat={1}
           clearcoatRoughness={0.035}
-          color="#e9eef0"
-          envMapIntensity={3.8}
-          iridescence={0.17}
+          color="#f2f5f6"
+          envMapIntensity={2.35}
+          iridescence={0.1}
           iridescenceIOR={1.36}
           iridescenceThicknessRange={[120, 420]}
-          metalness={0.68}
-          roughness={0.11}
+          metalness={0.34}
+          roughness={0.13}
+        />
+      </mesh>
+      <mesh
+        geometry={bodyGeometry}
+        scale={[1.025, 1.045, 1.025]}
+      >
+        <meshBasicMaterial
+          blending={AdditiveBlending}
+          color={BODY_SHELL_COLOR}
+          depthWrite={false}
+          opacity={0.045}
+          side={DoubleSide}
+          toneMapped={false}
+          transparent
         />
       </mesh>
 
@@ -403,7 +421,10 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
           radius={0.03}
           smoothness={4}
         >
-          <meshBasicMaterial color="#eaffff" toneMapped={false} />
+          <meshBasicMaterial
+            color={HEADLIGHT_COLOR}
+            toneMapped={false}
+          />
         </RoundedBox>
       ))}
       <RoundedBox
@@ -412,7 +433,7 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
         radius={0.035}
         smoothness={4}
       >
-        <meshBasicMaterial color="#ff214a" toneMapped={false} />
+        <meshBasicMaterial color={TAILLIGHT_COLOR} toneMapped={false} />
       </RoundedBox>
       <RoundedBox
         args={[1.18, 0.1, 0.055]}
