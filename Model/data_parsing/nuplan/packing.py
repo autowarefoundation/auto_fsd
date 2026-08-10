@@ -629,6 +629,93 @@ def _add_tar_member(
     archive.addfile(info, io.BytesIO(payload))
 
 
+def pack_nuplan_local_dataset(
+    *,
+    data_root: str | Path,
+    map_root: str | Path,
+    sensor_root: str | Path,
+    db_files: Sequence[str | Path],
+    output_directory: str | Path,
+    source_revision: str,
+    map_version: str,
+    limit_total_scenarios: int = 0,
+    image_size: int = 256,
+    samples_per_shard: int = 1000,
+    max_rejection_fraction: float = 0.0,
+) -> dict[str, object]:
+    """Build and pack scenarios from one materialized nuPlan dataset."""
+    import os
+
+    from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import (
+        NuPlanScenarioBuilder,
+    )
+    from nuplan.planning.scenario_builder.scenario_filter import (
+        ScenarioFilter,
+    )
+    from nuplan.planning.utils.multithreading.worker_sequential import (
+        Sequential,
+    )
+
+    if not source_revision or not map_version:
+        raise ValueError("nuPlan source_revision and map_version are required")
+    if limit_total_scenarios < 0:
+        raise ValueError("limit_total_scenarios must be non-negative")
+    local_data = Path(data_root).resolve()
+    local_map = Path(map_root).resolve()
+    local_sensor = Path(sensor_root).resolve()
+    for name, path in (
+        ("data_root", local_data),
+        ("map_root", local_map),
+        ("sensor_root", local_sensor),
+    ):
+        if not path.is_dir():
+            raise FileNotFoundError(f"nuPlan {name} is not a directory: {path}")
+    resolved_db_files = [Path(path).resolve() for path in db_files]
+    if not resolved_db_files:
+        raise ValueError("nuPlan db_files must not be empty")
+    for db_path in resolved_db_files:
+        if not db_path.is_file() or db_path.suffix != ".db":
+            raise FileNotFoundError(f"nuPlan DB is missing: {db_path}")
+
+    os.environ["NUPLAN_DATA_STORE"] = "local"
+    builder = NuPlanScenarioBuilder(
+        data_root=str(local_data),
+        map_root=str(local_map),
+        sensor_root=str(local_sensor),
+        db_files=[str(path) for path in resolved_db_files],
+        map_version=map_version,
+        include_cameras=True,
+        max_workers=1,
+        verbose=False,
+    )
+    scenario_filter = ScenarioFilter(
+        scenario_types=None,
+        scenario_tokens=None,
+        log_names=None,
+        map_names=None,
+        num_scenarios_per_type=None,
+        limit_total_scenarios=limit_total_scenarios or None,
+        timestamp_threshold_s=None,
+        ego_displacement_minimum_m=None,
+        expand_scenarios=False,
+        remove_invalid_goals=True,
+        shuffle=False,
+    )
+    scenarios = builder.get_scenarios(
+        scenario_filter,
+        Sequential(),
+    )
+    return pack_nuplan_reactive_scenarios(
+        scenarios,
+        output_directory,
+        source_revision=source_revision,
+        map_version=map_version,
+        image_size=image_size,
+        samples_per_shard=samples_per_shard,
+        max_rejection_fraction=max_rejection_fraction,
+    )
+
+
 def pack_nuplan_reactive_scenarios(
     scenarios: Iterable[Any],
     output_directory: str | Path,
