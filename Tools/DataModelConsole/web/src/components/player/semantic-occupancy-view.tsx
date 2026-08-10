@@ -1,20 +1,42 @@
 "use client";
 
-import { Box, Map as MapIcon } from "lucide-react";
+import { OrbitControls } from "@react-three/drei";
 import {
-  type MouseEvent,
+  Canvas,
+  type ThreeEvent,
+  useThree,
+} from "@react-three/fiber";
+import { CarFront, Map as MapIcon, Orbit } from "lucide-react";
+import {
+  type ComponentProps,
+  type MutableRefObject,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import * as THREE from "three";
+import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 
 import {
+  EgoVehicle,
+  SemanticObstacle,
+  SemanticPedestrian,
+  SemanticVehicle,
+} from "@/components/player/semantic-scene-models";
+import {
+  extractSemanticOccupancyComponents,
   SEMANTIC_OCCUPANCY_CLASS_NAMES,
   semanticOccupancyValid,
   semanticOccupancyValue,
   type SemanticOccupancyArtifact,
+  type SemanticOccupancyComponent,
+  type SemanticOccupancyDisplayMode,
 } from "@/lib/semantic-occupancy";
+
+const METERS_PER_CELL = 0.4;
+const MAX_SCENE_OBJECTS = 56;
+const OBJECT_CLASS_INDICES = [5, 6, 7] as const;
 
 const CLASS_LABELS = [
   "Drivable",
@@ -38,8 +60,10 @@ const CLASS_COLORS = [
   [242, 139, 55],
 ] as const;
 
-type DisplayMode = "prediction" | "teacher" | "error";
-type ProjectionMode = "top-down" | "isometric";
+const OBJECT_COLORS = ["#62df7b", "#ef73cf", "#f39a42"] as const;
+const ERROR_COLORS = { fp: "#ff365f", fn: "#35dff4" } as const;
+
+type CameraPreset = "orbit" | "top" | "ego";
 
 interface PointerReading {
   rasterRow: number;
@@ -47,44 +71,47 @@ interface PointerReading {
   values: number[];
 }
 
-function rasterCoordinates(
-  event: MouseEvent<HTMLCanvasElement>,
-  artifact: SemanticOccupancyArtifact,
-  projection: ProjectionMode,
-): [number, number] | null {
-  const rect = event.currentTarget.getBoundingClientRect();
-  const canvasX =
-    ((event.clientX - rect.left) / rect.width) * event.currentTarget.width;
-  const canvasY =
-    ((event.clientY - rect.top) / rect.height) * event.currentTarget.height;
-  let row = canvasY;
-  let col = canvasX;
-  if (projection === "isometric") {
-    const vertical = (canvasY - 126) / 0.42;
-    col = (canvasX - vertical) / 2;
-    row = (canvasX + vertical) / 2;
-  }
-  row = Math.floor(row);
-  col = Math.floor(col);
-  return row >= 0 &&
-    row < artifact.height &&
-    col >= 0 &&
-    col < artifact.width
-    ? [row, col]
-    : null;
+interface CameraPresetDefinition {
+  fov: number;
+  position: [number, number, number];
+  target: [number, number, number];
+  up: [number, number, number];
 }
 
-function sourceImage(
+const CAMERA_PRESETS: Record<CameraPreset, CameraPresetDefinition> = {
+  orbit: {
+    position: [54, 52, -35],
+    target: [0, 0, 28],
+    up: [0, 1, 0],
+    fov: 46,
+  },
+  top: {
+    position: [0, 142, 30.01],
+    target: [0, 0, 30],
+    up: [0, 0, 1],
+    fov: 43,
+  },
+  ego: {
+    position: [0, 3.4, -7.8],
+    target: [0, 1.05, 24],
+    up: [0, 1, 0],
+    fov: 56,
+  },
+};
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function sourcePixels(
   artifact: SemanticOccupancyArtifact,
   row: number,
-  mode: DisplayMode,
+  mode: SemanticOccupancyDisplayMode,
   threshold: number,
   opacity: number,
   enabled: boolean[],
-): ImageData {
-  const pixels = new Uint8ClampedArray(
-    artifact.height * artifact.width * 4,
-  );
+): Uint8Array {
+  const pixels = new Uint8Array(artifact.height * artifact.width * 4);
   const teacher = artifact.teacher;
   for (let rasterRow = 0; rasterRow < artifact.height; rasterRow++) {
     for (let rasterCol = 0; rasterCol < artifact.width; rasterCol++) {
@@ -147,21 +174,318 @@ function sourceImage(
       }
       if (selectedClass < 0) continue;
       const color =
-        mode === "error"
+        mode === "error" && errorKind
           ? errorKind === "fp"
-            ? ([244, 63, 94] as const)
-            : ([34, 211, 238] as const)
+            ? ([255, 54, 95] as const)
+            : ([53, 223, 244] as const)
           : CLASS_COLORS[selectedClass];
       const offset = (rasterRow * artifact.width + rasterCol) * 4;
       pixels[offset] = color[0];
       pixels[offset + 1] = color[1];
       pixels[offset + 2] = color[2];
       pixels[offset + 3] = Math.round(
-        255 * opacity * Math.max(0.25, selectedValue),
+        255 * opacity * Math.max(0.24, selectedValue),
       );
     }
   }
-  return new ImageData(pixels, artifact.width, artifact.height);
+  return pixels;
+}
+
+function SemanticGround({
+  artifact,
+  pixels,
+}: {
+  artifact: SemanticOccupancyArtifact;
+  pixels: Uint8Array;
+}) {
+  const texture = useMemo(() => {
+    const next = new THREE.DataTexture(
+      pixels,
+      artifact.width,
+      artifact.height,
+      THREE.RGBAFormat,
+      THREE.UnsignedByteType,
+    );
+    next.colorSpace = THREE.SRGBColorSpace;
+    next.magFilter = THREE.NearestFilter;
+    next.minFilter = THREE.LinearFilter;
+    next.generateMipmaps = false;
+    next.wrapS = THREE.RepeatWrapping;
+    next.repeat.x = -1;
+    next.offset.x = 1;
+    next.needsUpdate = true;
+    return next;
+  }, [artifact.height, artifact.width, pixels]);
+
+  useEffect(() => () => texture.dispose(), [texture]);
+
+  const groundWidth = artifact.width * METERS_PER_CELL;
+  const groundLength = artifact.height * METERS_PER_CELL;
+  const groundCenterZ =
+    (artifact.height * (2 / 3) - artifact.height / 2) *
+    METERS_PER_CELL;
+
+  return (
+    <>
+      <mesh
+        receiveShadow
+        position={[0, -0.08, groundCenterZ]}
+        rotation={[-Math.PI / 2, 0, 0]}
+      >
+        <planeGeometry args={[groundWidth, groundLength]} />
+        <meshStandardMaterial
+          color="#11191c"
+          metalness={0.08}
+          roughness={0.96}
+        />
+      </mesh>
+      <gridHelper
+        args={[Math.max(groundWidth, groundLength), 36, "#315260", "#1c3038"]}
+        position={[0, -0.045, groundCenterZ]}
+        material-transparent
+        material-opacity={0.42}
+      />
+      <mesh
+        position={[0, 0, groundCenterZ]}
+        rotation={[-Math.PI / 2, 0, 0]}
+      >
+        <planeGeometry args={[groundWidth, groundLength]} />
+        <meshBasicMaterial
+          map={texture}
+          transparent
+          alphaTest={0.01}
+          depthWrite={false}
+          toneMapped={false}
+        />
+      </mesh>
+    </>
+  );
+}
+
+function CameraRig({ preset }: { preset: CameraPreset }) {
+  const controlsRef =
+    useRef<OrbitControlsImpl>(null) as MutableRefObject<OrbitControlsImpl | null>;
+  const { camera, invalidate } = useThree();
+
+  useEffect(() => {
+    const definition = CAMERA_PRESETS[preset];
+    camera.position.set(...definition.position);
+    camera.up.set(...definition.up);
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.fov = definition.fov;
+      camera.updateProjectionMatrix();
+    }
+    controlsRef.current?.target.set(...definition.target);
+    controlsRef.current?.update();
+    camera.lookAt(...definition.target);
+    invalidate();
+  }, [camera, invalidate, preset]);
+
+  return (
+    <OrbitControls
+      ref={controlsRef}
+      makeDefault
+      enableDamping
+      dampingFactor={0.08}
+      enablePan
+      enableRotate
+      enableZoom
+      minDistance={2.5}
+      maxDistance={190}
+      maxPolarAngle={Math.PI * 0.495}
+      screenSpacePanning
+      onChange={() => invalidate()}
+    />
+  );
+}
+
+function componentPosition(
+  artifact: SemanticOccupancyArtifact,
+  component: SemanticOccupancyComponent,
+): [number, number, number] {
+  return [
+    (artifact.width / 2 - (component.centroidCol + 0.5)) *
+      METERS_PER_CELL,
+    0,
+    (artifact.height * (2 / 3) - (component.centroidRow + 0.5)) *
+      METERS_PER_CELL,
+  ];
+}
+
+function SceneObject({
+  artifact,
+  component,
+  opacity,
+}: {
+  artifact: SemanticOccupancyArtifact;
+  component: SemanticOccupancyComponent;
+  opacity: number;
+}) {
+  const rowSpan = (component.maxRow - component.minRow + 1) * METERS_PER_CELL;
+  const colSpan = (component.maxCol - component.minCol + 1) * METERS_PER_CELL;
+  const majorSpan = Math.max(rowSpan, colSpan);
+  const minorSpan = Math.min(rowSpan, colSpan);
+  const position = componentPosition(artifact, component);
+  const color = component.errorKind
+    ? ERROR_COLORS[component.errorKind]
+    : OBJECT_COLORS[component.classIndex - OBJECT_CLASS_INDICES[0]];
+  const objectOpacity = clamp(opacity, 0.2, 1);
+
+  if (component.classIndex === 5) {
+    return (
+      <SemanticVehicle
+        color={color}
+        confidence={component.meanConfidence}
+        length={clamp(majorSpan, 3.4, 8)}
+        opacity={objectOpacity}
+        position={position}
+        width={clamp(minorSpan, 1.6, 3)}
+        yaw={component.principalAxisRadians}
+      />
+    );
+  }
+  if (component.classIndex === 6) {
+    return (
+      <SemanticPedestrian
+        color={color}
+        confidence={component.meanConfidence}
+        opacity={objectOpacity}
+        position={position}
+      />
+    );
+  }
+  return (
+    <SemanticObstacle
+      color={color}
+      confidence={component.meanConfidence}
+      height={clamp(Math.sqrt(component.cellCount) * 0.22, 0.8, 3.4)}
+      length={clamp(majorSpan, 0.8, 8)}
+      opacity={objectOpacity}
+      position={position}
+      width={clamp(minorSpan, 0.8, 6)}
+      yaw={component.principalAxisRadians}
+    />
+  );
+}
+
+function GroundInteraction({
+  artifact,
+  onRead,
+}: {
+  artifact: SemanticOccupancyArtifact;
+  onRead: (rasterRow: number, rasterCol: number) => void;
+}) {
+  const groundWidth = artifact.width * METERS_PER_CELL;
+  const groundLength = artifact.height * METERS_PER_CELL;
+  const groundCenterZ =
+    (artifact.height * (2 / 3) - artifact.height / 2) *
+    METERS_PER_CELL;
+  const handlePointer = (event: ThreeEvent<PointerEvent>) => {
+    event.stopPropagation();
+    const rasterRow = Math.floor(
+      artifact.height * (2 / 3) - event.point.z / METERS_PER_CELL,
+    );
+    const rasterCol = Math.floor(
+      artifact.width / 2 - event.point.x / METERS_PER_CELL,
+    );
+    if (
+      rasterRow >= 0 &&
+      rasterRow < artifact.height &&
+      rasterCol >= 0 &&
+      rasterCol < artifact.width
+    ) {
+      onRead(rasterRow, rasterCol);
+    }
+  };
+
+  return (
+    <mesh
+      position={[0, 0.08, groundCenterZ]}
+      rotation={[-Math.PI / 2, 0, 0]}
+      onPointerMove={handlePointer}
+    >
+      <planeGeometry args={[groundWidth, groundLength]} />
+      <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+    </mesh>
+  );
+}
+
+function OccupancyScene({
+  artifact,
+  cameraPreset,
+  components,
+  objectOpacity,
+  onPointerRead,
+  pixels,
+}: {
+  artifact: SemanticOccupancyArtifact;
+  cameraPreset: CameraPreset;
+  components: SemanticOccupancyComponent[];
+  objectOpacity: number;
+  onPointerRead: (rasterRow: number, rasterCol: number) => void;
+  pixels: Uint8Array;
+}) {
+  return (
+    <>
+      <color attach="background" args={["#05090d"]} />
+      <fog attach="fog" args={["#05090d", 92, 225]} />
+      <ambientLight intensity={0.52} />
+      <hemisphereLight args={["#d6f8ff", "#071013", 1.35]} />
+      <directionalLight
+        castShadow
+        intensity={2.6}
+        position={[-28, 48, -18]}
+        shadow-mapSize-width={1024}
+        shadow-mapSize-height={1024}
+      />
+      <SemanticGround artifact={artifact} pixels={pixels} />
+      {components.map((component, index) => (
+        <SceneObject
+          key={`${component.classIndex}:${component.errorKind}:${component.centroidRow}:${component.centroidCol}:${index}`}
+          artifact={artifact}
+          component={component}
+          opacity={objectOpacity}
+        />
+      ))}
+      <EgoVehicle />
+      <GroundInteraction artifact={artifact} onRead={onPointerRead} />
+      <CameraRig preset={cameraPreset} />
+    </>
+  );
+}
+
+function CameraButton({
+  active,
+  children,
+  label,
+  ...props
+}: {
+  active: boolean;
+  children: React.ReactNode;
+  label: string;
+} & ComponentProps<"button">) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-pressed={active}
+      title={label}
+      className={`group relative flex size-8 items-center justify-center rounded border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
+        active
+          ? "border-cyan-400/60 bg-cyan-400/15 text-cyan-100"
+          : "border-slate-700 bg-slate-950/80 text-slate-400 hover:border-slate-500 hover:text-white"
+      }`}
+      {...props}
+    >
+      {children}
+      <span
+        role="tooltip"
+        className="pointer-events-none absolute top-9 right-0 z-20 whitespace-nowrap rounded border border-slate-700 bg-slate-950 px-2 py-1 text-[9px] font-normal text-slate-200 opacity-0 shadow-xl transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+      >
+        {label}
+      </span>
+    </button>
+  );
 }
 
 export function SemanticOccupancyView({
@@ -173,10 +497,9 @@ export function SemanticOccupancyView({
   row: number | undefined;
   status: "idle" | "loading" | "ready" | "unavailable" | "error";
 }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [mode, setMode] = useState<DisplayMode>("prediction");
-  const [projection, setProjection] =
-    useState<ProjectionMode>("top-down");
+  const [mode, setMode] =
+    useState<SemanticOccupancyDisplayMode>("prediction");
+  const [cameraPreset, setCameraPreset] = useState<CameraPreset>("orbit");
   const [threshold, setThreshold] = useState(0.5);
   const [opacity, setOpacity] = useState(0.8);
   const [enabled, setEnabled] = useState(
@@ -189,10 +512,10 @@ export function SemanticOccupancyView({
     if (!hasTeacher && mode !== "prediction") setMode("prediction");
   }, [hasTeacher, mode]);
 
-  const image = useMemo(
+  const pixels = useMemo(
     () =>
       artifact && row !== undefined
-        ? sourceImage(
+        ? sourcePixels(
             artifact,
             row,
             mode,
@@ -203,41 +526,25 @@ export function SemanticOccupancyView({
         : null,
     [artifact, enabled, mode, opacity, row, threshold],
   );
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.fillStyle = "#080b10";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    if (!image || !artifact) return;
-    const source = document.createElement("canvas");
-    source.width = artifact.width;
-    source.height = artifact.height;
-    const sourceContext = source.getContext("2d");
-    if (!sourceContext) return;
-    sourceContext.putImageData(image, 0, 0);
-    sourceContext.strokeStyle = "rgba(255,255,255,0.92)";
-    sourceContext.lineWidth = 2;
-    sourceContext.beginPath();
-    sourceContext.moveTo(149.5, 292);
-    sourceContext.lineTo(143.5, 306);
-    sourceContext.lineTo(155.5, 306);
-    sourceContext.closePath();
-    sourceContext.stroke();
-
-    context.imageSmoothingEnabled = false;
-    if (projection === "top-down") {
-      context.drawImage(source, 0, 0);
-      return;
-    }
-    context.save();
-    context.setTransform(1, -0.42, 1, 0.42, 0, 126);
-    context.drawImage(source, 0, 0);
-    context.restore();
-  }, [artifact, image, projection]);
+  const objectClassIndices = useMemo(
+    () => OBJECT_CLASS_INDICES.filter((classIndex) => enabled[classIndex]),
+    [enabled],
+  );
+  const components = useMemo(
+    () =>
+      artifact && row !== undefined
+        ? extractSemanticOccupancyComponents({
+            artifact,
+            row,
+            classIndices: objectClassIndices,
+            mode,
+            threshold,
+            minCells: 1,
+            maxComponents: MAX_SCENE_OBJECTS,
+          })
+        : [],
+    [artifact, mode, objectClassIndices, row, threshold],
+  );
 
   const pointerRows = pointer
     ? SEMANTIC_OCCUPANCY_CLASS_NAMES.map((name, index) => ({
@@ -246,92 +553,168 @@ export function SemanticOccupancyView({
         color: CLASS_COLORS[index],
         value: pointer.values[index],
       }))
-        .filter((entry, index) => enabled[index])
-        .sort((a, b) => b.value - a.value)
+        .filter((_, index) => enabled[index])
+        .sort((left, right) => right.value - left.value)
     : [];
 
+  const updatePointer = (rasterRow: number, rasterCol: number) => {
+    if (!artifact || row === undefined) return;
+    setPointer({
+      rasterRow,
+      rasterCol,
+      values: SEMANTIC_OCCUPANCY_CLASS_NAMES.map((_, classIndex) =>
+        semanticOccupancyValue(
+          artifact.probability,
+          artifact,
+          row,
+          classIndex,
+          rasterRow,
+          rasterCol,
+        ),
+      ),
+    });
+  };
+
   return (
-    <section className="space-y-3" aria-label="2D BEV semantic occupancy">
+    <section className="min-w-0 space-y-3" aria-label="3D semantic occupancy">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-sm font-medium text-slate-200">
-            2D BEV semantic occupancy
+            3D semantic occupancy
           </h3>
           <p className="font-mono text-[10px] text-slate-500">
-            180 m × 120 m · 0.4 m/px
+            {artifact
+              ? `${(artifact.height * METERS_PER_CELL).toFixed(0)} m × ${(artifact.width * METERS_PER_CELL).toFixed(0)} m`
+              : "180 m × 120 m"}{" "}
+            · {METERS_PER_CELL.toFixed(1)} m/cell
           </p>
         </div>
-        <div className="flex items-center gap-1 rounded-md border border-slate-800 p-1">
-          <button
-            type="button"
-            className={`rounded px-2 py-1 text-[10px] ${
-              projection === "top-down"
-                ? "bg-slate-700 text-white"
-                : "text-slate-400"
-            }`}
-            onClick={() => setProjection("top-down")}
-            title="Top-down view"
-            aria-label="Top-down semantic occupancy"
-          >
-            <MapIcon className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={`rounded px-2 py-1 text-[10px] ${
-              projection === "isometric"
-                ? "bg-slate-700 text-white"
-                : "text-slate-400"
-            }`}
-            onClick={() => setProjection("isometric")}
-            title="Isometric view"
-            aria-label="Isometric 2D semantic occupancy"
-          >
-            <Box className="size-3.5" />
-          </button>
-        </div>
+        <span className="font-mono text-[9px] uppercase text-slate-500">
+          {components.length}/{MAX_SCENE_OBJECTS} objects
+        </span>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
-        <div className="relative min-h-64 overflow-hidden border border-slate-800 bg-[#080b10]">
-          {artifact && row !== undefined ? (
-            <canvas
-              ref={canvasRef}
-              width={projection === "top-down" ? artifact.width : 750}
-              height={projection === "top-down" ? artifact.height : 315}
-              className="mx-auto block max-h-[620px] w-full object-contain [image-rendering:pixelated]"
-              onMouseLeave={() => setPointer(null)}
-              onMouseMove={(event) => {
-                const coordinates = rasterCoordinates(
-                  event,
-                  artifact,
-                  projection,
-                );
-                if (!coordinates) {
-                  setPointer(null);
-                  return;
-                }
-                const [rasterRow, rasterCol] = coordinates;
-                setPointer({
-                  rasterRow,
-                  rasterCol,
-                  values: SEMANTIC_OCCUPANCY_CLASS_NAMES.map(
-                    (_, classIndex) =>
-                      semanticOccupancyValue(
-                        artifact.probability,
-                        artifact,
-                        row,
-                        classIndex,
-                        rasterRow,
-                        rasterCol,
-                      ),
-                  ),
-                });
-              }}
-            />
+      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1fr)_260px]">
+        <div
+          className="relative h-[430px] min-w-0 overflow-hidden rounded-md border border-slate-800 bg-[#05090d] sm:h-[540px] xl:h-[620px]"
+          onPointerLeave={() => setPointer(null)}
+        >
+          {artifact && row !== undefined && pixels ? (
+            <>
+              <Canvas
+                aria-label="Interactive 3D semantic occupancy scene"
+                camera={{
+                  position: CAMERA_PRESETS.orbit.position,
+                  fov: CAMERA_PRESETS.orbit.fov,
+                  near: 0.1,
+                  far: 420,
+                }}
+                dpr={[1, 1.5]}
+                frameloop="demand"
+                gl={{
+                  alpha: false,
+                  antialias: true,
+                  powerPreference: "high-performance",
+                  preserveDrawingBuffer: true,
+                }}
+                shadows
+                onCreated={({ gl }) => {
+                  gl.outputColorSpace = THREE.SRGBColorSpace;
+                  gl.toneMapping = THREE.ACESFilmicToneMapping;
+                  gl.toneMappingExposure = 1.08;
+                }}
+              >
+                <OccupancyScene
+                  artifact={artifact}
+                  cameraPreset={cameraPreset}
+                  components={components}
+                  objectOpacity={opacity}
+                  onPointerRead={updatePointer}
+                  pixels={pixels}
+                />
+              </Canvas>
+
+              <div
+                className="absolute top-2 right-2 flex gap-1"
+                role="group"
+                aria-label="Semantic occupancy camera"
+              >
+                <CameraButton
+                  active={cameraPreset === "orbit"}
+                  label="Orbit view"
+                  onClick={() => setCameraPreset("orbit")}
+                >
+                  <Orbit className="size-4" />
+                </CameraButton>
+                <CameraButton
+                  active={cameraPreset === "top"}
+                  label="Top view"
+                  onClick={() => setCameraPreset("top")}
+                >
+                  <MapIcon className="size-4" />
+                </CameraButton>
+                <CameraButton
+                  active={cameraPreset === "ego"}
+                  label="Ego view"
+                  onClick={() => setCameraPreset("ego")}
+                >
+                  <CarFront className="size-4" />
+                </CameraButton>
+              </div>
+
+              <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-3 rounded border border-slate-700/80 bg-slate-950/80 px-2 py-1.5 font-mono text-[9px] text-slate-400 backdrop-blur">
+                <span className="flex items-center gap-1">
+                  <span className="size-2 bg-[#62df7b]" /> Vehicle
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="size-2 bg-[#ef73cf]" /> VRU
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="size-2 bg-[#f39a42]" /> Obstacle
+                </span>
+              </div>
+
+              {pointer && (
+                <div className="pointer-events-none absolute top-2 left-2 min-w-40 rounded border border-slate-700 bg-slate-950/92 p-2 font-mono text-[9px] text-slate-300 shadow-xl backdrop-blur">
+                  <p className="mb-1 text-slate-500">
+                    x{" "}
+                    {(
+                      (artifact.height * (2 / 3) -
+                        (pointer.rasterRow + 0.5)) *
+                      METERS_PER_CELL
+                    ).toFixed(1)}{" "}
+                    m · y{" "}
+                    {(
+                      (artifact.width / 2 -
+                        (pointer.rasterCol + 0.5)) *
+                      METERS_PER_CELL
+                    ).toFixed(1)}{" "}
+                    m
+                  </p>
+                  {pointerRows.slice(0, 4).map((entry) => (
+                    <p
+                      key={entry.name}
+                      className="flex items-center justify-between gap-3"
+                    >
+                      <span className="flex items-center gap-1">
+                        <span
+                          className="size-2"
+                          style={{
+                            backgroundColor: `rgb(${entry.color.join(",")})`,
+                          }}
+                        />
+                        {entry.label}
+                      </span>
+                      <span>{entry.value.toFixed(3)}</span>
+                    </p>
+                  ))}
+                </div>
+              )}
+            </>
           ) : (
             <div
               role="status"
-              className="flex min-h-64 items-center justify-center px-6 text-center text-xs text-slate-500"
+              className="flex h-full min-h-64 items-center justify-center px-6 text-center text-xs text-slate-500"
             >
               {status === "loading"
                 ? "Loading semantic occupancy..."
@@ -340,36 +723,11 @@ export function SemanticOccupancyView({
                   : "No semantic occupancy artifact for this model."}
             </div>
           )}
-          {pointer && (
-            <div className="pointer-events-none absolute left-2 top-2 min-w-40 border border-slate-700 bg-slate-950/95 p-2 font-mono text-[9px] text-slate-300">
-              <p className="mb-1 text-slate-500">
-                x {(120 - (pointer.rasterRow + 0.5) * 0.4).toFixed(1)} m · y{" "}
-                {(60 - (pointer.rasterCol + 0.5) * 0.4).toFixed(1)} m
-              </p>
-              {pointerRows.slice(0, 4).map((entry) => (
-                <p
-                  key={entry.name}
-                  className="flex items-center justify-between gap-3"
-                >
-                  <span className="flex items-center gap-1">
-                    <span
-                      className="size-2"
-                      style={{
-                        backgroundColor: `rgb(${entry.color.join(",")})`,
-                      }}
-                    />
-                    {entry.label}
-                  </span>
-                  <span>{entry.value.toFixed(3)}</span>
-                </p>
-              ))}
-            </div>
-          )}
         </div>
 
-        <div className="space-y-4">
+        <div className="min-w-0 space-y-4">
           <div
-            className="grid grid-cols-3 border border-slate-800"
+            className="grid grid-cols-3 overflow-hidden rounded border border-slate-800"
             role="tablist"
             aria-label="Semantic occupancy source"
           >
@@ -380,10 +738,10 @@ export function SemanticOccupancyView({
                 role="tab"
                 disabled={value !== "prediction" && !hasTeacher}
                 aria-selected={mode === value}
-                className={`px-2 py-1.5 text-[10px] capitalize ${
+                className={`min-w-0 px-2 py-2 text-[10px] capitalize transition-colors ${
                   mode === value
                     ? "bg-slate-700 text-white"
-                    : "text-slate-400"
+                    : "text-slate-400 hover:bg-slate-900"
                 } disabled:cursor-not-allowed disabled:text-slate-700`}
                 onClick={() => setMode(value)}
               >
@@ -398,7 +756,8 @@ export function SemanticOccupancyView({
               <span className="font-mono">{threshold.toFixed(2)}</span>
             </span>
             <input
-              className="w-full accent-sky-500"
+              aria-label="Semantic confidence threshold"
+              className="w-full accent-cyan-400"
               type="range"
               min="0"
               max="1"
@@ -414,7 +773,8 @@ export function SemanticOccupancyView({
               <span className="font-mono">{opacity.toFixed(2)}</span>
             </span>
             <input
-              className="w-full accent-sky-500"
+              aria-label="Semantic layer opacity"
+              className="w-full accent-cyan-400"
               type="range"
               min="0.1"
               max="1"
@@ -446,7 +806,7 @@ export function SemanticOccupancyView({
                   className="sr-only"
                 />
                 <span
-                  className={`size-3 shrink-0 border ${
+                  className={`size-3 shrink-0 rounded-sm border ${
                     enabled[index]
                       ? "border-transparent"
                       : "border-slate-600 bg-transparent"
@@ -468,10 +828,10 @@ export function SemanticOccupancyView({
           {mode === "error" && hasTeacher && (
             <div className="flex gap-4 font-mono text-[9px] text-slate-500">
               <span className="flex items-center gap-1">
-                <span className="size-2 bg-rose-500" /> FP
+                <span className="size-2 bg-[#ff365f]" /> FP
               </span>
               <span className="flex items-center gap-1">
-                <span className="size-2 bg-cyan-400" /> FN
+                <span className="size-2 bg-[#35dff4]" /> FN
               </span>
             </div>
           )}
