@@ -1,0 +1,221 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: us-west-2
+    FLYTE_PROJECT: auto-e2e
+    FLYTE_DOMAIN: development
+    WORKFLOW_NAME: >-
+      Platform.pipelines.workflows.wf_pack_nuplan_snapshot_reactive_dataset
+    FLYTE_VERSION: ""
+    EXECUTION_NAME: ""
+    SNAPSHOT_MANIFEST_URI: ""
+    DATASETS_BUCKET: ""
+    ARCHIVE_IDS_JSON: "[]"
+    LIMIT_TOTAL_SCENARIOS: "8"
+    IMAGE_SIZE: "256"
+    SAMPLES_PER_SHARD: "100"
+    MAX_REJECTION_FRACTION: "0.25"
+    WAIT_FOR_COMPLETION: "false"
+    WAIT_TIMEOUT_SECONDS: "21600"
+
+phases:
+  install:
+    commands:
+      - pip install -q flytekit==1.16.24
+  pre_build:
+    commands:
+      - test -n "${FLYTE_VERSION}"
+      - test -n "${EXECUTION_NAME}"
+      - test -n "${SNAPSHOT_MANIFEST_URI}"
+      - test -n "${DATASETS_BUCKET}"
+      - printf '%s' "${SNAPSHOT_MANIFEST_URI}" | grep -Eq '^s3://'
+      - printf '%s' "${DATASETS_BUCKET}" | grep -Eq '^[a-z0-9][a-z0-9.-]+$'
+      - printf '%s' "${EXECUTION_NAME}" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+      - test "${#EXECUTION_NAME}" -le 63
+      - printf '%s' "${LIMIT_TOTAL_SCENARIOS}" | grep -Eq '^[0-9]+$'
+      - printf '%s' "${IMAGE_SIZE}" | grep -Eq '^[1-9][0-9]*$'
+      - printf '%s' "${SAMPLES_PER_SHARD}" | grep -Eq '^[1-9][0-9]*$'
+      - printf '%s' "${WAIT_FOR_COMPLETION}" | grep -Eq '^(true|false)$'
+      - printf '%s' "${WAIT_TIMEOUT_SECONDS}" | grep -Eq '^[1-9][0-9]*$'
+      - |
+        python3 - <<'PY'
+        import json
+        import os
+
+        value = json.loads(os.environ["ARCHIVE_IDS_JSON"])
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise ValueError("ARCHIVE_IDS_JSON must be a JSON string list")
+        fraction = float(os.environ["MAX_REJECTION_FRACTION"])
+        if not 0.0 <= fraction < 1.0:
+            raise ValueError(
+                "MAX_REJECTION_FRACTION must be in [0, 1)"
+            )
+        PY
+      - |
+        cat > /tmp/flyte.yaml << EOF
+        admin:
+          endpoint: dns:///k8s-flyte-flyteadm-be92e7737c-cf0d1a0f3df10f77.elb.us-west-2.amazonaws.com:81
+          insecure: true
+        EOF
+  build:
+    commands:
+      - |
+        python3 - <<'PY'
+        import json
+        import os
+        import time
+
+        import grpc
+        from flytekit.configuration import Config
+        from flytekit.exceptions.user import (
+            FlyteEntityAlreadyExistsException,
+            FlyteEntityNotExistException,
+        )
+        from flytekit.models.core.execution import WorkflowExecutionPhase
+        from flytekit.remote import FlyteRemote
+        from flytekit.types.file import FlyteFile
+
+        project = os.environ["FLYTE_PROJECT"]
+        domain = os.environ["FLYTE_DOMAIN"]
+        workflow_name = os.environ["WORKFLOW_NAME"]
+        version = os.environ["FLYTE_VERSION"]
+        execution_name = os.environ["EXECUTION_NAME"]
+        archive_ids = json.loads(os.environ["ARCHIVE_IDS_JSON"])
+        wait_for_completion = (
+            os.environ["WAIT_FOR_COMPLETION"] == "true"
+        )
+        inputs = {
+            "snapshot_manifest": FlyteFile(
+                os.environ["SNAPSHOT_MANIFEST_URI"]
+            ),
+            "datasets_bucket": os.environ["DATASETS_BUCKET"],
+            "archive_ids": archive_ids or None,
+            "limit_total_scenarios": int(
+                os.environ["LIMIT_TOTAL_SCENARIOS"]
+            ),
+            "image_size": int(os.environ["IMAGE_SIZE"]),
+            "samples_per_shard": int(
+                os.environ["SAMPLES_PER_SHARD"]
+            ),
+            "max_rejection_fraction": float(
+                os.environ["MAX_REJECTION_FRACTION"]
+            ),
+            "aws_region": os.environ["AWS_DEFAULT_REGION"],
+        }
+        remote = FlyteRemote(
+            config=Config.auto(config_file="/tmp/flyte.yaml"),
+            default_project=project,
+            default_domain=domain,
+        )
+        launch_plan = remote.fetch_launch_plan(
+            project=project,
+            domain=domain,
+            name=workflow_name,
+            version=version,
+        )
+
+        def grpc_code(error):
+            visited = set()
+            candidate = error
+            while candidate is not None and id(candidate) not in visited:
+                visited.add(id(candidate))
+                if isinstance(candidate, grpc.RpcError):
+                    return candidate.code()
+                candidate = (
+                    candidate.__cause__
+                    if candidate.__cause__ is not None
+                    else candidate.__context__
+                )
+            return None
+
+        transient_codes = {
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc.StatusCode.INTERNAL,
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.UNKNOWN,
+        }
+        deadline = time.monotonic() + 300
+        execution = None
+        while execution is None:
+            try:
+                execution = remote.fetch_execution(
+                    project=project,
+                    domain=domain,
+                    name=execution_name,
+                )
+            except FlyteEntityNotExistException:
+                pass
+            except Exception as error:
+                if grpc_code(error) not in transient_codes:
+                    raise
+            if execution is None:
+                try:
+                    execution = remote.execute(
+                        launch_plan,
+                        inputs=inputs,
+                        execution_name=execution_name,
+                        wait=False,
+                    )
+                except FlyteEntityAlreadyExistsException:
+                    pass
+                except Exception as error:
+                    if grpc_code(error) not in transient_codes:
+                        raise
+            if execution is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "timed out fetching or creating Flyte execution"
+                    )
+                time.sleep(5)
+
+        print(f"FLYTE_EXECUTION_ID={execution.id.name}", flush=True)
+        if not wait_for_completion:
+            print("FLYTE_EXECUTION_DETACHED=true", flush=True)
+            raise SystemExit(0)
+
+        terminal_phases = {
+            WorkflowExecutionPhase.ABORTED,
+            WorkflowExecutionPhase.FAILED,
+            WorkflowExecutionPhase.SUCCEEDED,
+            WorkflowExecutionPhase.TIMED_OUT,
+        }
+        deadline = (
+            time.monotonic()
+            + int(os.environ["WAIT_TIMEOUT_SECONDS"])
+        )
+        while True:
+            try:
+                execution = remote.sync_execution(
+                    execution,
+                    sync_nodes=True,
+                )
+            except Exception as error:
+                code = grpc_code(error)
+                if code not in transient_codes:
+                    raise
+                print(
+                    f"FLYTE_ADMIN_TRANSIENT_RETRY={code.name}",
+                    flush=True,
+                )
+            else:
+                if execution.closure.phase in terminal_phases:
+                    break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for {execution_name}"
+                )
+            time.sleep(15)
+
+        phase = execution.closure.phase
+        phase_name = WorkflowExecutionPhase.enum_to_string(phase)
+        print(f"FLYTE_EXECUTION_PHASE={phase_name}", flush=True)
+        if phase != WorkflowExecutionPhase.SUCCEEDED:
+            raise SystemExit(
+                f"Flyte execution {execution.id.name} ended in {phase_name}"
+            )
+        print(f"FLYTE_EXECUTION_OUTPUTS={execution.outputs}", flush=True)
+        PY
