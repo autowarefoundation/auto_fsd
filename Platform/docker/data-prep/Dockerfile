@@ -62,6 +62,8 @@ RUN pip install --no-cache-dir \
     networkx \
     "osmium==4.3.1" \
     "geopandas>=0.14,<1.0" \
+    "pyogrio==0.12.1" \
+    "rasterio==1.4.3" \
     "hydra-core>=1.3,<1.4" \
     pyquaternion \
     "SQLAlchemy>=1.4.54,<2.0" \
@@ -75,6 +77,12 @@ RUN pip install --no-cache-dir \
     "boto3==1.43.0" \
     pyarrow \
     && pip install --no-cache-dir --no-deps "lerobot-dataset==0.5.0"
+
+# nuPlan imports aioboto3 even when its local blob store is selected. Keep the
+# existing Flyte-compatible aiobotocore/botocore stack instead of resolving the
+# older versions declared by aioboto3 package metadata.
+RUN pip install --no-cache-dir --no-deps "aioboto3==15.5.0" \
+    && python -c "from nuplan.database.maps_db.gpkg_mapsdb import GPKGMapsDB"
 
 COPY Model/ /workspace/Model/
 COPY Platform/pipelines/ /workspace/Platform/pipelines/
