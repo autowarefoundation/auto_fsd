@@ -418,6 +418,7 @@ function OccupancyScene({
   objectOpacity,
   onPointerRead,
   pixels,
+  showDemoStreetscape,
 }: {
   artifact: SemanticOccupancyArtifact;
   cameraPreset: CameraPreset;
@@ -425,6 +426,7 @@ function OccupancyScene({
   objectOpacity: number;
   onPointerRead: (rasterRow: number, rasterCol: number) => void;
   pixels: Uint8Array;
+  showDemoStreetscape: boolean;
 }) {
   const groundWidth = artifact.width * METERS_PER_CELL;
   const groundLength = artifact.height * METERS_PER_CELL;
@@ -438,6 +440,7 @@ function OccupancyScene({
         groundCenterZ={groundCenterZ}
         groundLength={groundLength}
         groundWidth={groundWidth}
+        showDemoStreetscape={showDemoStreetscape}
         viewMode={cameraPreset}
       />
       <SemanticGround
@@ -497,10 +500,12 @@ function CameraButton({
 
 export function SemanticOccupancyView({
   artifact,
+  demoEnvironment = false,
   row,
   status,
 }: {
   artifact: SemanticOccupancyArtifact | null;
+  demoEnvironment?: boolean;
   row: number | undefined;
   status: "idle" | "loading" | "ready" | "unavailable" | "error";
 }) {
@@ -651,6 +656,7 @@ export function SemanticOccupancyView({
                   objectOpacity={opacity}
                   onPointerRead={updatePointer}
                   pixels={pixels}
+                  showDemoStreetscape={demoEnvironment}
                 />
               </Canvas>
 
