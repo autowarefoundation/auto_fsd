@@ -74,6 +74,7 @@ RUN pip install --no-cache-dir \
     timm \
     scipy \
     pyproj==3.7.2 \
+    "pytest==9.0.3" \
     "boto3==1.43.0" \
     pyarrow \
     && pip install --no-cache-dir --no-deps "lerobot-dataset==0.5.0"
@@ -82,7 +83,8 @@ RUN pip install --no-cache-dir \
 # existing Flyte-compatible aiobotocore/botocore stack instead of resolving the
 # older versions declared by aioboto3 package metadata.
 RUN pip install --no-cache-dir --no-deps "aioboto3==15.5.0" \
-    && python -c "from nuplan.database.maps_db.gpkg_mapsdb import GPKGMapsDB"
+    && python -c "from nuplan.database.maps_db.gpkg_mapsdb import GPKGMapsDB" \
+    && python -c "from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder"
 
 COPY Model/ /workspace/Model/
 COPY Platform/pipelines/ /workspace/Platform/pipelines/
