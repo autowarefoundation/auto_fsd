@@ -20,6 +20,18 @@ spec:
       effect: NoSchedule
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: gpu-canary-flavor
+spec:
+  nodeLabels:
+    workload-type: gpu-canary
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: WorkloadPriorityClass
 metadata:
   name: research-low
@@ -68,6 +80,36 @@ spec:
     reclaimWithinCohort: Never
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: gpu-canary-queue
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: auto-e2e-development
+  resourceGroups:
+    - coveredResources:
+        - cpu
+        - memory
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: cpu
+              nominalQuota: "16"
+            - name: memory
+              nominalQuota: 64Gi
+    - coveredResources:
+        - nvidia.com/gpu
+      flavors:
+        - name: gpu-canary-flavor
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: "2"
+  preemption:
+    withinClusterQueue: Never
+    reclaimWithinCohort: Never
+---
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: training
@@ -76,6 +118,14 @@ metadata:
     kueue.x-k8s.io/default-queue: "true"
 spec:
   clusterQueue: training-queue
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: gpu-canary
+  namespace: auto-e2e-development
+spec:
+  clusterQueue: gpu-canary-queue
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
