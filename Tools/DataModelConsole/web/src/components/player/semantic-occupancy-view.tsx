@@ -2,8 +2,11 @@
 
 import {
   Environment,
+  Grid,
   Lightformer,
+  MeshReflectorMaterial,
   OrbitControls,
+  Sky,
 } from "@react-three/drei";
 import {
   Canvas,
@@ -237,17 +240,33 @@ function SemanticGround({
         rotation={[-Math.PI / 2, 0, 0]}
       >
         <planeGeometry args={[groundWidth, groundLength]} />
-        <meshStandardMaterial
+        <MeshReflectorMaterial
+          blur={[192, 48]}
           color="#11191c"
-          metalness={0.08}
-          roughness={0.96}
+          depthScale={0.36}
+          maxDepthThreshold={1.25}
+          metalness={0.42}
+          minDepthThreshold={0.3}
+          mirror={0.3}
+          mixBlur={0.75}
+          mixStrength={3.2}
+          resolution={256}
+          roughness={0.68}
         />
       </mesh>
-      <gridHelper
-        args={[Math.max(groundWidth, groundLength), 36, "#315260", "#1c3038"]}
+      <Grid
+        args={[groundWidth, groundLength]}
+        cellColor="#1d3943"
+        cellSize={2}
+        cellThickness={0.42}
+        fadeDistance={190}
+        fadeStrength={1.15}
+        followCamera={false}
+        infiniteGrid={false}
         position={[0, -0.045, groundCenterZ]}
-        material-transparent
-        material-opacity={0.42}
+        sectionColor="#426b78"
+        sectionSize={10}
+        sectionThickness={0.78}
       />
       <mesh
         position={[0, 0, groundCenterZ]}
@@ -273,11 +292,18 @@ function SemanticGround({
 function CameraRig({ preset }: { preset: CameraPreset }) {
   const controlsRef =
     useRef<OrbitControlsImpl>(null) as MutableRefObject<OrbitControlsImpl | null>;
-  const { camera, invalidate } = useThree();
+  const { camera, invalidate, size } = useThree();
 
   useEffect(() => {
     const definition = CAMERA_PRESETS[preset];
-    camera.position.set(...definition.position);
+    const aspect = size.width / Math.max(size.height, 1);
+    const distanceScale = aspect < 0.9 ? 1.38 : 1;
+    const position = definition.position.map(
+      (coordinate, index) =>
+        definition.target[index] +
+        (coordinate - definition.target[index]) * distanceScale,
+    ) as [number, number, number];
+    camera.position.set(...position);
     camera.up.set(...definition.up);
     if (camera instanceof THREE.PerspectiveCamera) {
       camera.fov = definition.fov;
@@ -287,7 +313,7 @@ function CameraRig({ preset }: { preset: CameraPreset }) {
     controlsRef.current?.update();
     camera.lookAt(...definition.target);
     invalidate();
-  }, [camera, invalidate, preset]);
+  }, [camera, invalidate, preset, size.height, size.width]);
 
   return (
     <OrbitControls
@@ -435,8 +461,16 @@ function OccupancyScene({
 }) {
   return (
     <>
-      <color attach="background" args={["#05090d"]} />
-      <fog attach="fog" args={["#05090d", 92, 225]} />
+      <color attach="background" args={["#061017"]} />
+      <fog attach="fog" args={["#07141b", 105, 245]} />
+      <Sky
+        distance={450}
+        mieCoefficient={0.006}
+        mieDirectionalG={0.82}
+        rayleigh={0.62}
+        sunPosition={[-90, 18, -120]}
+        turbidity={7.5}
+      />
       <Environment resolution={128}>
         <Lightformer
           color="#e7faff"
@@ -469,6 +503,13 @@ function OccupancyScene({
         castShadow
         intensity={2.35}
         position={[-22, 42, -14]}
+        shadow-bias={-0.00018}
+        shadow-camera-bottom={-85}
+        shadow-camera-far={190}
+        shadow-camera-left={-90}
+        shadow-camera-near={1}
+        shadow-camera-right={90}
+        shadow-camera-top={145}
         shadow-mapSize-width={1024}
         shadow-mapSize-height={1024}
       />
