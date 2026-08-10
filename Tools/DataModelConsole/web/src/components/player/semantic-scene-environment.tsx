@@ -413,15 +413,195 @@ export function SemanticGround({
   );
 }
 
+const DEMO_STREETLIGHT_Z = [-42, -14, 14, 42, 70, 98] as const;
+
+function DemoStreetlight({
+  side,
+  z,
+}: {
+  side: -1 | 1;
+  z: number;
+}) {
+  return (
+    <group position={[side * 43.5, 0, z]}>
+      <mesh castShadow position={[0, 3.2, 0]}>
+        <cylinderGeometry args={[0.08, 0.13, 6.4, 12]} />
+        <meshPhysicalMaterial
+          color="#647078"
+          envMapIntensity={1.8}
+          metalness={0.86}
+          roughness={0.25}
+        />
+      </mesh>
+      <mesh position={[-side * 1.05, 6.18, 0]}>
+        <boxGeometry args={[2.1, 0.1, 0.12]} />
+        <meshPhysicalMaterial
+          color="#59656c"
+          metalness={0.82}
+          roughness={0.28}
+        />
+      </mesh>
+      <mesh position={[-side * 2.02, 6.02, 0]}>
+        <boxGeometry args={[0.36, 0.14, 0.28]} />
+        <meshBasicMaterial
+          color={new THREE.Color(3.8, 3.25, 2.2)}
+          toneMapped={false}
+        />
+      </mesh>
+      {Math.abs(z - 14) <= 28 && (
+        <pointLight
+          color="#ffe9bd"
+          decay={2}
+          distance={18}
+          intensity={24}
+          position={[-side * 2.02, 5.8, 0]}
+        />
+      )}
+    </group>
+  );
+}
+
+function DemoTrafficLight({
+  side,
+}: {
+  side: -1 | 1;
+}) {
+  return (
+    <group position={[side * 37.5, 0, 30]} rotation={[0, -side * Math.PI / 2, 0]}>
+      <mesh castShadow position={[0, 3.4, 0]}>
+        <cylinderGeometry args={[0.1, 0.16, 6.8, 12]} />
+        <meshPhysicalMaterial
+          color="#334047"
+          metalness={0.84}
+          roughness={0.24}
+        />
+      </mesh>
+      <mesh position={[0, 6.45, 2.8]}>
+        <boxGeometry args={[0.13, 0.13, 5.6]} />
+        <meshPhysicalMaterial
+          color="#334047"
+          metalness={0.84}
+          roughness={0.24}
+        />
+      </mesh>
+      <group position={[0, 5.85, 5.38]}>
+        <mesh castShadow>
+          <boxGeometry args={[0.44, 1.45, 0.42]} />
+          <meshPhysicalMaterial
+            color="#11191d"
+            metalness={0.58}
+            roughness={0.3}
+          />
+        </mesh>
+        {[
+          { color: new THREE.Color(4.5, 0.04, 0.08), y: 0.45 },
+          { color: new THREE.Color(0.25, 0.12, 0.02), y: 0 },
+          { color: new THREE.Color(0.02, 0.22, 0.08), y: -0.45 },
+        ].map((lamp) => (
+          <mesh
+            key={lamp.y}
+            position={[0, lamp.y, 0.221]}
+          >
+            <circleGeometry args={[0.13, 20]} />
+            <meshBasicMaterial color={lamp.color} toneMapped={false} />
+          </mesh>
+        ))}
+      </group>
+    </group>
+  );
+}
+
+function DemoStreetscape({
+  groundCenterZ,
+  groundLength,
+}: {
+  groundCenterZ: number;
+  groundLength: number;
+}) {
+  const railPosts = useMemo(
+    () =>
+      Array.from(
+        { length: Math.floor(groundLength / 8) },
+        (_, index) => groundCenterZ - groundLength / 2 + index * 8 + 4,
+      ),
+    [groundCenterZ, groundLength],
+  );
+
+  return (
+    <group name="mock-only-streetscape">
+      {([-1, 1] as const).map((side) => (
+        <group key={`demo-road-edge-${side}`}>
+          <mesh
+            receiveShadow
+            position={[side * 41.2, 0.02, groundCenterZ]}
+          >
+            <boxGeometry args={[1.2, 0.24, groundLength]} />
+            <meshPhysicalMaterial
+              color="#899196"
+              envMapIntensity={0.75}
+              metalness={0.08}
+              roughness={0.82}
+            />
+          </mesh>
+          <mesh
+            receiveShadow
+            position={[side * 44.1, 0.04, groundCenterZ]}
+          >
+            <boxGeometry args={[4.6, 0.16, groundLength]} />
+            <meshPhysicalMaterial
+              color="#404b50"
+              envMapIntensity={0.55}
+              metalness={0.1}
+              roughness={0.9}
+            />
+          </mesh>
+          <mesh
+            castShadow
+            position={[side * 42.25, 0.7, groundCenterZ]}
+          >
+            <boxGeometry args={[0.12, 0.18, groundLength]} />
+            <meshPhysicalMaterial
+              color="#9aa6ab"
+              envMapIntensity={1.9}
+              metalness={0.9}
+              roughness={0.2}
+            />
+          </mesh>
+          {railPosts.map((z) => (
+            <mesh
+              key={`guardrail-${side}-${z}`}
+              castShadow
+              position={[side * 42.25, 0.4, z]}
+            >
+              <boxGeometry args={[0.14, 0.8, 0.14]} />
+              <meshPhysicalMaterial
+                color="#707d83"
+                metalness={0.84}
+                roughness={0.26}
+              />
+            </mesh>
+          ))}
+          {DEMO_STREETLIGHT_Z.map((z) => (
+            <DemoStreetlight key={`streetlight-${side}-${z}`} side={side} z={z} />
+          ))}
+          <DemoTrafficLight side={side} />
+        </group>
+      ))}
+    </group>
+  );
+}
+
 export function SceneEnvironment({
   groundCenterZ,
   groundLength,
   groundWidth,
+  showDemoStreetscape = false,
   viewMode = "orbit",
 }: {
   groundCenterZ: number;
   groundLength: number;
   groundWidth: number;
+  showDemoStreetscape?: boolean;
   viewMode?: "ego" | "orbit" | "top";
 }) {
   const { gl, invalidate, size } = useThree();
@@ -501,6 +681,12 @@ export function SceneEnvironment({
         intensity={0.36}
         position={[-26, 9, 25]}
       />
+      {showDemoStreetscape && (
+        <DemoStreetscape
+          groundCenterZ={groundCenterZ}
+          groundLength={groundLength}
+        />
+      )}
       <ContactShadows
         blur={2.6}
         color="#020609"
