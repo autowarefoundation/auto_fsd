@@ -30,6 +30,9 @@ const BODY_SECTIONS: readonly BodySection[] = [
 const HEADLIGHT_COLOR = new Color(3.8, 4.8, 5.2);
 const TAILLIGHT_COLOR = new Color(4.5, 0.08, 0.24);
 const BODY_SHELL_COLOR = new Color(0.12, 1.45, 2.2);
+const TURN_SIGNAL_COLOR = new Color(5.2, 1.35, 0.08);
+
+type EgoViewMode = "ego" | "orbit" | "top";
 
 function signedPower(value: number, exponent: number): number {
   return Math.sign(value) * Math.abs(value) ** exponent;
@@ -255,13 +258,116 @@ function GroundSignature() {
   );
 }
 
-export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
+function HeadlightRoadReflection({
+  viewMode,
+}: {
+  viewMode: EgoViewMode;
+}) {
+  const opacity =
+    viewMode === "ego" ? 0.2 : viewMode === "top" ? 0.045 : 0.1;
+  return (
+    <group>
+      {([-0.58, 0.58] as const).map((x) => (
+        <group key={`headlight-road-${x}`}>
+          <mesh
+            position={[x, 0.018, 6.5]}
+            rotation={[-Math.PI / 2, 0, 0]}
+            scale={[0.78, 5.4, 1]}
+          >
+            <circleGeometry args={[1, 48]} />
+            <meshBasicMaterial
+              blending={AdditiveBlending}
+              color={HEADLIGHT_COLOR}
+              depthWrite={false}
+              opacity={opacity * 0.34}
+              side={DoubleSide}
+              toneMapped={false}
+              transparent
+            />
+          </mesh>
+          <mesh
+            position={[x, 0.022, 5.6]}
+            rotation={[-Math.PI / 2, 0, 0]}
+            scale={[0.18, 4.2, 1]}
+          >
+            <circleGeometry args={[1, 40]} />
+            <meshBasicMaterial
+              blending={AdditiveBlending}
+              color={HEADLIGHT_COLOR}
+              depthWrite={false}
+              opacity={opacity}
+              side={DoubleSide}
+              toneMapped={false}
+              transparent
+            />
+          </mesh>
+        </group>
+      ))}
+    </group>
+  );
+}
+
+function PanelLine({
+  position,
+  rotation,
+  size,
+}: {
+  position: [number, number, number];
+  rotation?: [number, number, number];
+  size: [number, number, number];
+}) {
+  return (
+    <RoundedBox
+      args={size}
+      position={position}
+      radius={0.008}
+      rotation={rotation}
+      smoothness={2}
+    >
+      <meshPhysicalMaterial
+        color="#263239"
+        envMapIntensity={1.5}
+        metalness={0.72}
+        roughness={0.22}
+      />
+    </RoundedBox>
+  );
+}
+
+export const PremiumEgoVehicle = memo(function PremiumEgoVehicle({
+  viewMode = "orbit",
+}: {
+  viewMode?: EgoViewMode;
+}) {
   const bodyGeometry = useMemo(createBodyGeometry, []);
   useEffect(() => () => bodyGeometry.dispose(), [bodyGeometry]);
 
   return (
     <group name="auto-e2e-premium-ego-vehicle" position={[0, 0.02, 0]}>
       <GroundSignature />
+      <HeadlightRoadReflection viewMode={viewMode} />
+
+      <pointLight
+        color="#f7fbff"
+        decay={2}
+        distance={10}
+        intensity={viewMode === "ego" ? 18 : 12}
+        position={[-2.4, 4.2, -0.8]}
+      />
+      <pointLight
+        color="#46e5ff"
+        decay={2}
+        distance={7}
+        intensity={7}
+        position={[2.8, 1.8, -1.4]}
+      />
+      <pointLight
+        color="#ff365f"
+        decay={2}
+        distance={6}
+        intensity={4}
+        position={[-2.6, 1.1, -1.8]}
+      />
 
       <RoundedBox
         args={[1.72, 0.18, 3.86]}
@@ -372,6 +478,46 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
 
       {([-1, 1] as const).map((side) => (
         <group key={`ego-side-${side}`}>
+          <PanelLine
+            position={[side * 1.075, 0.68, -0.52]}
+            rotation={[0, 0, side * 0.025]}
+            size={[0.025, 0.48, 0.025]}
+          />
+          <PanelLine
+            position={[side * 1.07, 0.66, 0.64]}
+            rotation={[0, 0, side * 0.025]}
+            size={[0.025, 0.45, 0.025]}
+          />
+          <RoundedBox
+            args={[0.055, 0.09, 3.02]}
+            position={[side * 1.03, 0.26, 0]}
+            radius={0.025}
+            smoothness={3}
+          >
+            <meshPhysicalMaterial
+              clearcoat={0.65}
+              color="#10191e"
+              envMapIntensity={2}
+              metalness={0.78}
+              roughness={0.2}
+            />
+          </RoundedBox>
+          {([-1.48, 1.48] as const).map((z) => (
+            <mesh
+              key={`wheel-arch-${side}-${z}`}
+              position={[side * 1.082, 0.44, z]}
+              rotation={[0, Math.PI / 2, 0]}
+            >
+              <torusGeometry args={[0.47, 0.026, 8, 44]} />
+              <meshPhysicalMaterial
+                clearcoat={0.8}
+                color="#172229"
+                envMapIntensity={2.2}
+                metalness={0.82}
+                roughness={0.16}
+              />
+            </mesh>
+          ))}
           <RoundedBox
             args={[0.045, 0.07, 2.36]}
             position={[side * 0.84, 1.16, -0.2]}
@@ -417,20 +563,45 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
         </group>
       ))}
 
+      {([-0.72, 0.72] as const).map((x) => (
+        <PanelLine
+          key={`hood-line-${x}`}
+          position={[x, 0.985, 1.48]}
+          rotation={[-0.045, 0, 0]}
+          size={[0.022, 0.018, 1.22]}
+        />
+      ))}
+      <PanelLine
+        position={[0, 0.99, 1.01]}
+        size={[1.38, 0.018, 0.022]}
+      />
+
       {([-0.6, 0.6] as const).map((x) => (
-        <RoundedBox
-          key={`headlight-${x}`}
-          args={[0.58, 0.075, 0.055]}
-          position={[x, 0.76, 2.29]}
-          rotation={[0, 0, x < 0 ? -0.12 : 0.12]}
-          radius={0.03}
-          smoothness={4}
-        >
-          <meshBasicMaterial
-            color={HEADLIGHT_COLOR}
-            toneMapped={false}
-          />
-        </RoundedBox>
+        <group key={`headlight-${x}`}>
+          <RoundedBox
+            args={[0.58, 0.075, 0.055]}
+            position={[x, 0.76, 2.29]}
+            rotation={[0, 0, x < 0 ? -0.12 : 0.12]}
+            radius={0.03}
+            smoothness={4}
+          >
+            <meshBasicMaterial
+              color={HEADLIGHT_COLOR}
+              toneMapped={false}
+            />
+          </RoundedBox>
+          <mesh position={[x, 0.69, 2.326]}>
+            <circleGeometry args={[0.105, 24]} />
+            <meshBasicMaterial color={HEADLIGHT_COLOR} toneMapped={false} />
+          </mesh>
+          <mesh position={[x < 0 ? x - 0.27 : x + 0.27, 0.7, 2.325]}>
+            <circleGeometry args={[0.055, 20]} />
+            <meshBasicMaterial
+              color={TURN_SIGNAL_COLOR}
+              toneMapped={false}
+            />
+          </mesh>
+        </group>
       ))}
       <RoundedBox
         args={[1.36, 0.08, 0.06]}
@@ -440,6 +611,17 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
       >
         <meshBasicMaterial color={TAILLIGHT_COLOR} toneMapped={false} />
       </RoundedBox>
+      {([-0.82, 0.82] as const).map((x) => (
+        <RoundedBox
+          key={`rear-lamp-${x}`}
+          args={[0.32, 0.13, 0.065]}
+          position={[x, 0.68, -2.3]}
+          radius={0.04}
+          smoothness={3}
+        >
+          <meshBasicMaterial color={TAILLIGHT_COLOR} toneMapped={false} />
+        </RoundedBox>
+      ))}
       <RoundedBox
         args={[1.18, 0.1, 0.055]}
         position={[0, 0.35, 2.35]}
@@ -453,6 +635,34 @@ export const PremiumEgoVehicle = memo(function PremiumEgoVehicle() {
           roughness={0.24}
         />
       </RoundedBox>
+      <RoundedBox
+        args={[1.52, 0.17, 0.28]}
+        position={[0, 0.25, -2.23]}
+        radius={0.055}
+        smoothness={3}
+      >
+        <meshPhysicalMaterial
+          color="#071015"
+          envMapIntensity={2.1}
+          metalness={0.82}
+          roughness={0.2}
+        />
+      </RoundedBox>
+      {([-0.54, -0.18, 0.18, 0.54] as const).map((x) => (
+        <RoundedBox
+          key={`rear-diffuser-${x}`}
+          args={[0.035, 0.2, 0.34]}
+          position={[x, 0.19, -2.28]}
+          radius={0.012}
+          smoothness={2}
+        >
+          <meshPhysicalMaterial
+            color="#111b20"
+            metalness={0.88}
+            roughness={0.18}
+          />
+        </RoundedBox>
+      ))}
 
       <mesh
         position={[0, 1.075, 1.42]}
