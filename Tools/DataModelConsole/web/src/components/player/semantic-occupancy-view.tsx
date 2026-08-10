@@ -1,6 +1,10 @@
 "use client";
 
-import { OrbitControls } from "@react-three/drei";
+import {
+  Environment,
+  Lightformer,
+  OrbitControls,
+} from "@react-three/drei";
 import {
   Canvas,
   type ThreeEvent,
@@ -80,10 +84,10 @@ interface CameraPresetDefinition {
 
 const CAMERA_PRESETS: Record<CameraPreset, CameraPresetDefinition> = {
   orbit: {
-    position: [54, 52, -35],
-    target: [0, 0, 28],
+    position: [28, 24, -20],
+    target: [0, 0.8, 26],
     up: [0, 1, 0],
-    fov: 46,
+    fov: 43,
   },
   top: {
     position: [0, 142, 30.01],
@@ -92,8 +96,8 @@ const CAMERA_PRESETS: Record<CameraPreset, CameraPresetDefinition> = {
     fov: 43,
   },
   ego: {
-    position: [0, 3.4, -7.8],
-    target: [0, 1.05, 24],
+    position: [0, 2.8, -6.8],
+    target: [0, 1, 26],
     up: [0, 1, 0],
     fov: 56,
   },
@@ -250,12 +254,16 @@ function SemanticGround({
         rotation={[-Math.PI / 2, 0, 0]}
       >
         <planeGeometry args={[groundWidth, groundLength]} />
-        <meshBasicMaterial
+        <meshPhysicalMaterial
+          clearcoat={0.12}
+          clearcoatRoughness={0.5}
+          envMapIntensity={0.32}
           map={texture}
-          transparent
           alphaTest={0.01}
           depthWrite={false}
-          toneMapped={false}
+          metalness={0.14}
+          roughness={0.84}
+          transparent
         />
       </mesh>
     </>
@@ -429,14 +437,45 @@ function OccupancyScene({
     <>
       <color attach="background" args={["#05090d"]} />
       <fog attach="fog" args={["#05090d", 92, 225]} />
-      <ambientLight intensity={0.52} />
-      <hemisphereLight args={["#d6f8ff", "#071013", 1.35]} />
+      <Environment resolution={128}>
+        <Lightformer
+          color="#e7faff"
+          form="rect"
+          intensity={4.5}
+          position={[-18, 18, -12]}
+          rotation={[Math.PI / 2, 0, 0]}
+          scale={[28, 18, 1]}
+        />
+        <Lightformer
+          color="#60e9ff"
+          form="rect"
+          intensity={3}
+          position={[18, 8, 8]}
+          rotation={[0, -Math.PI / 2, 0]}
+          scale={[18, 5, 1]}
+        />
+        <Lightformer
+          color="#ff4d76"
+          form="rect"
+          intensity={1.5}
+          position={[-16, 4, 20]}
+          rotation={[0, Math.PI / 2, 0]}
+          scale={[10, 3, 1]}
+        />
+      </Environment>
+      <ambientLight intensity={0.38} />
+      <hemisphereLight args={["#d6f8ff", "#071013", 1.05]} />
       <directionalLight
         castShadow
-        intensity={2.6}
-        position={[-28, 48, -18]}
+        intensity={2.35}
+        position={[-22, 42, -14]}
         shadow-mapSize-width={1024}
         shadow-mapSize-height={1024}
+      />
+      <directionalLight
+        color="#7aeaff"
+        intensity={0.8}
+        position={[24, 16, -8]}
       />
       <SemanticGround artifact={artifact} pixels={pixels} />
       {components.map((component, index) => (
