@@ -7181,7 +7181,7 @@ def pack_nuplan_snapshot_reactive_dataset(
         db_files=materialized.db_files,
         output_directory=output,
         source_revision=manifest["dataset_revision"],
-        map_version=manifest["map_version"],
+        map_version=materialized.map_version,
         limit_total_scenarios=limit_total_scenarios,
         image_size=image_size,
         samples_per_shard=samples_per_shard,
@@ -7196,9 +7196,11 @@ def pack_nuplan_snapshot_reactive_dataset(
         "raw_snapshot_manifest_sha256": hashlib.sha256(
             manifest_bytes
         ).hexdigest(),
+        "raw_snapshot_map_version": manifest["map_version"],
         "raw_source_contract_sha256": (
             manifest["source_contract_sha256"]
         ),
+        "materialized_map_version": materialized.map_version,
         "sensor_complete_log_count": len(
             materialized.sensor_log_names
         ),
