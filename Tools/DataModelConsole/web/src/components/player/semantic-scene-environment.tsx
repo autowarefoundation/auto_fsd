@@ -2,30 +2,31 @@
 
 import {
   ContactShadows,
+  Effects,
   Environment,
+  GradientTexture,
   Grid,
   MeshReflectorMaterial,
-  Sky,
 } from "@react-three/drei";
 import { useThree } from "@react-three/fiber";
-import {
-  Bloom,
-  BrightnessContrast,
-  EffectComposer,
-  HueSaturation,
-  N8AO,
-  ToneMapping,
-  Vignette,
-} from "@react-three/postprocessing";
 import { Suspense, useEffect, useMemo } from "react";
-import { ToneMappingMode } from "postprocessing";
 import * as THREE from "three";
+import {
+  ACESFilmicToneMappingShader,
+  BrightnessContrastShader,
+  GammaCorrectionShader,
+  HueSaturationShader,
+  ShaderPass,
+  SSAOPass,
+  UnrealBloomPass,
+  VignetteShader,
+} from "three-stdlib";
 
 import type { SemanticOccupancyArtifact } from "@/lib/semantic-occupancy";
 
 const HDRI_PATH =
   "/assets/semantic-occupancy/poly-haven/studio_small_09_1k.hdr";
-const SEMANTIC_GLOW = new THREE.Color(2.4, 2.4, 2.4);
+const SEMANTIC_GLOW = new THREE.Color(1.45, 1.45, 1.45);
 
 interface GroundTextures {
   asphalt: THREE.DataTexture;
@@ -283,10 +284,10 @@ export function SemanticGround({
           maxDepthThreshold={1.2}
           metalness={0.5}
           minDepthThreshold={0.22}
-          mirror={0.54}
+          mirror={0.32}
           mixBlur={0.82}
-          mixStrength={2.1}
-          opacity={0.24}
+          mixStrength={1.45}
+          opacity={0.14}
           resolution={compact ? 128 : 256}
           roughness={0.48}
           transparent
@@ -328,11 +329,12 @@ export function SemanticGround({
           displacementMap={semanticTextures.confidence}
           displacementScale={0.16}
           emissive="#ffffff"
-          emissiveIntensity={0.46}
+          emissiveIntensity={0.035}
           emissiveMap={semanticTextures.raster}
           envMapIntensity={0.42}
           map={semanticTextures.raster}
           metalness={0.18}
+          opacity={0.34}
           roughness={0.58}
           side={THREE.DoubleSide}
           transparent
@@ -340,7 +342,7 @@ export function SemanticGround({
       </mesh>
 
       <mesh
-        position={[0, 0.18, groundCenterZ]}
+        position={[0, 0.045, groundCenterZ]}
         rotation={[-Math.PI / 2, 0, 0]}
       >
         <planeGeometry args={[groundWidth, groundLength]} />
@@ -375,28 +377,39 @@ export function SceneEnvironment({
     <>
       <color attach="background" args={["#050d13"]} />
       <fog attach="fog" args={["#07131a", 92, 236]} />
-      <Sky
-        distance={420}
-        mieCoefficient={0.008}
-        mieDirectionalG={0.88}
-        rayleigh={0.34}
-        sunPosition={[-110, 5, -135]}
-        turbidity={9.2}
-      />
+      <mesh
+        frustumCulled={false}
+        position={[0, 28, 45]}
+        renderOrder={-100}
+      >
+        <sphereGeometry args={[350, 32, 18]} />
+        <meshBasicMaterial
+          depthWrite={false}
+          fog={false}
+          side={THREE.BackSide}
+          toneMapped={false}
+        >
+          <GradientTexture
+            colors={["#02050b", "#061522", "#173344", "#744b5d"]}
+            size={1024}
+            stops={[0, 0.38, 0.7, 1]}
+          />
+        </meshBasicMaterial>
+      </mesh>
       <Suspense fallback={null}>
         <Environment
           background={false}
-          environmentIntensity={1.55}
+          environmentIntensity={0.72}
           environmentRotation={[0, 0.42, 0]}
           files={HDRI_PATH}
         />
       </Suspense>
-      <ambientLight intensity={0.22} />
-      <hemisphereLight args={["#bfeeff", "#05090b", 0.78]} />
+      <ambientLight intensity={0.1} />
+      <hemisphereLight args={["#a5d7e5", "#030607", 0.42]} />
       <directionalLight
         castShadow
         color="#f5fbff"
-        intensity={2.55}
+        intensity={1.05}
         position={[-22, 42, -14]}
         shadow-bias={-0.00018}
         shadow-camera-bottom={-85}
@@ -410,12 +423,12 @@ export function SceneEnvironment({
       />
       <directionalLight
         color="#62e9ff"
-        intensity={1.25}
+        intensity={0.58}
         position={[30, 18, -12]}
       />
       <directionalLight
         color="#ff476f"
-        intensity={0.72}
+        intensity={0.36}
         position={[-26, 9, 25]}
       />
       <ContactShadows
@@ -424,7 +437,7 @@ export function SceneEnvironment({
         far={8}
         frames={1}
         height={groundLength}
-        opacity={0.62}
+        opacity={0.48}
         position={[0, 0.045, groundCenterZ]}
         resolution={compact ? 256 : 512}
         smooth
@@ -435,33 +448,66 @@ export function SceneEnvironment({
 }
 
 export function ScenePostProcessing() {
-  const { size } = useThree();
+  const { camera, scene, size } = useThree();
   const compact = size.width < 700;
+  const passes = useMemo(() => {
+    const ssao = new SSAOPass(scene, camera, size.width, size.height);
+    ssao.kernelRadius = compact ? 5 : 8;
+    ssao.minDistance = 0.0015;
+    ssao.maxDistance = 0.085;
+
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(size.width, size.height),
+      compact ? 0.17 : 0.24,
+      0.52,
+      0.88,
+    );
+
+    const contrast = new ShaderPass(BrightnessContrastShader);
+    contrast.uniforms.brightness.value = -0.008;
+    contrast.uniforms.contrast.value = 0.045;
+
+    const saturation = new ShaderPass(HueSaturationShader);
+    saturation.uniforms.saturation.value = 0.08;
+
+    const vignette = new ShaderPass(VignetteShader);
+    vignette.uniforms.offset.value = 1.02;
+    vignette.uniforms.darkness.value = 0.78;
+
+    const toneMapping = new ShaderPass(ACESFilmicToneMappingShader);
+    toneMapping.uniforms.exposure.value = 0.66;
+    const gamma = new ShaderPass(GammaCorrectionShader);
+
+    return {
+      bloom,
+      contrast,
+      gamma,
+      saturation,
+      ssao,
+      toneMapping,
+      vignette,
+    };
+  }, [camera, compact, scene, size.height, size.width]);
+
+  useEffect(
+    () => () => {
+      Object.values(passes).forEach((pass) => pass.dispose());
+    },
+    [passes],
+  );
 
   return (
-    <EffectComposer
-      depthBuffer
-      multisampling={compact ? 0 : 4}
+    <Effects
+      disableGamma
+      multisamping={compact ? 0 : 4}
     >
-      <N8AO
-        aoRadius={compact ? 2.2 : 3.2}
-        denoiseRadius={8}
-        denoiseSamples={4}
-        distanceFalloff={0.78}
-        halfRes
-        intensity={compact ? 1.3 : 1.65}
-        quality={compact ? "performance" : "medium"}
-      />
-      <Bloom
-        intensity={0.58}
-        luminanceSmoothing={0.32}
-        luminanceThreshold={1.02}
-        mipmapBlur
-      />
-      <BrightnessContrast brightness={0.012} contrast={0.055} />
-      <HueSaturation saturation={0.08} />
-      <Vignette darkness={0.28} eskil={false} offset={0.24} />
-      <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
-    </EffectComposer>
+      <primitive object={passes.ssao} />
+      <primitive object={passes.bloom} />
+      <primitive object={passes.contrast} />
+      <primitive object={passes.saturation} />
+      <primitive object={passes.vignette} />
+      <primitive object={passes.toneMapping} />
+      <primitive object={passes.gamma} />
+    </Effects>
   );
 }
