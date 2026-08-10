@@ -438,6 +438,7 @@ function OccupancyScene({
         groundCenterZ={groundCenterZ}
         groundLength={groundLength}
         groundWidth={groundWidth}
+        viewMode={cameraPreset}
       />
       <SemanticGround
         artifact={artifact}
@@ -452,10 +453,10 @@ function OccupancyScene({
           opacity={objectOpacity}
         />
       ))}
-      <EgoVehicle />
+      <EgoVehicle viewMode={cameraPreset} />
       <GroundInteraction artifact={artifact} onRead={onPointerRead} />
       <CameraRig preset={cameraPreset} />
-      <ScenePostProcessing />
+      <ScenePostProcessing viewMode={cameraPreset} />
     </>
   );
 }
@@ -511,12 +512,20 @@ export function SemanticOccupancyView({
   const [enabled, setEnabled] = useState(
     SEMANTIC_OCCUPANCY_CLASS_NAMES.map(() => true),
   );
+  const [compactViewport, setCompactViewport] = useState(false);
   const [pointer, setPointer] = useState<PointerReading | null>(null);
   const hasTeacher = Boolean(artifact?.teacher && artifact.validBits);
 
   useEffect(() => {
     if (!hasTeacher && mode !== "prediction") setMode("prediction");
   }, [hasTeacher, mode]);
+
+  useEffect(() => {
+    const updateViewport = () => setCompactViewport(window.innerWidth < 700);
+    updateViewport();
+    window.addEventListener("resize", updateViewport);
+    return () => window.removeEventListener("resize", updateViewport);
+  }, []);
 
   const pixels = useMemo(
     () =>
@@ -615,7 +624,7 @@ export function SemanticOccupancyView({
                   near: 0.1,
                   far: 420,
                 }}
-                dpr={[1, 1.5]}
+                dpr={compactViewport ? [1, 1.15] : [1, 1.75]}
                 frameloop="demand"
                 gl={{
                   alpha: false,
