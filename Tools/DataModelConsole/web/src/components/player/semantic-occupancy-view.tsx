@@ -1,16 +1,10 @@
 "use client";
 
-import {
-  Environment,
-  Grid,
-  Lightformer,
-  MeshReflectorMaterial,
-  OrbitControls,
-  Sky,
-} from "@react-three/drei";
+import { OrbitControls } from "@react-three/drei";
 import {
   Canvas,
   type ThreeEvent,
+  useFrame,
   useThree,
 } from "@react-three/fiber";
 import { CarFront, Map as MapIcon, Orbit } from "lucide-react";
@@ -31,6 +25,11 @@ import {
   SemanticPedestrian,
   SemanticVehicle,
 } from "@/components/player/semantic-scene-models";
+import {
+  SceneEnvironment,
+  ScenePostProcessing,
+  SemanticGround,
+} from "@/components/player/semantic-scene-environment";
 import {
   extractSemanticOccupancyComponents,
   SEMANTIC_OCCUPANCY_CLASS_NAMES,
@@ -198,101 +197,22 @@ function sourcePixels(
   return pixels;
 }
 
-function SemanticGround({
-  artifact,
-  pixels,
-}: {
-  artifact: SemanticOccupancyArtifact;
-  pixels: Uint8Array;
-}) {
-  const texture = useMemo(() => {
-    const next = new THREE.DataTexture(
-      pixels,
-      artifact.width,
-      artifact.height,
-      THREE.RGBAFormat,
-      THREE.UnsignedByteType,
-    );
-    next.colorSpace = THREE.SRGBColorSpace;
-    next.magFilter = THREE.NearestFilter;
-    next.minFilter = THREE.LinearFilter;
-    next.generateMipmaps = false;
-    next.wrapS = THREE.RepeatWrapping;
-    next.repeat.x = -1;
-    next.offset.x = 1;
-    next.needsUpdate = true;
-    return next;
-  }, [artifact.height, artifact.width, pixels]);
-
-  useEffect(() => () => texture.dispose(), [texture]);
-
-  const groundWidth = artifact.width * METERS_PER_CELL;
-  const groundLength = artifact.height * METERS_PER_CELL;
-  const groundCenterZ =
-    (artifact.height * (2 / 3) - artifact.height / 2) *
-    METERS_PER_CELL;
-
-  return (
-    <>
-      <mesh
-        receiveShadow
-        position={[0, -0.08, groundCenterZ]}
-        rotation={[-Math.PI / 2, 0, 0]}
-      >
-        <planeGeometry args={[groundWidth, groundLength]} />
-        <MeshReflectorMaterial
-          blur={[192, 48]}
-          color="#11191c"
-          depthScale={0.36}
-          maxDepthThreshold={1.25}
-          metalness={0.42}
-          minDepthThreshold={0.3}
-          mirror={0.3}
-          mixBlur={0.75}
-          mixStrength={3.2}
-          resolution={256}
-          roughness={0.68}
-        />
-      </mesh>
-      <Grid
-        args={[groundWidth, groundLength]}
-        cellColor="#1d3943"
-        cellSize={2}
-        cellThickness={0.42}
-        fadeDistance={190}
-        fadeStrength={1.15}
-        followCamera={false}
-        infiniteGrid={false}
-        position={[0, -0.045, groundCenterZ]}
-        sectionColor="#426b78"
-        sectionSize={10}
-        sectionThickness={0.78}
-      />
-      <mesh
-        position={[0, 0, groundCenterZ]}
-        rotation={[-Math.PI / 2, 0, 0]}
-      >
-        <planeGeometry args={[groundWidth, groundLength]} />
-        <meshPhysicalMaterial
-          clearcoat={0.12}
-          clearcoatRoughness={0.5}
-          envMapIntensity={0.32}
-          map={texture}
-          alphaTest={0.01}
-          depthWrite={false}
-          metalness={0.14}
-          roughness={0.84}
-          transparent
-        />
-      </mesh>
-    </>
-  );
-}
-
 function CameraRig({ preset }: { preset: CameraPreset }) {
   const controlsRef =
     useRef<OrbitControlsImpl>(null) as MutableRefObject<OrbitControlsImpl | null>;
   const { camera, invalidate, size } = useThree();
+  const transitionRef = useRef<{
+    active: boolean;
+    elapsed: number;
+    fromFov: number;
+    fromPosition: THREE.Vector3;
+    fromTarget: THREE.Vector3;
+    fromUp: THREE.Vector3;
+    toFov: number;
+    toPosition: THREE.Vector3;
+    toTarget: THREE.Vector3;
+    toUp: THREE.Vector3;
+  } | null>(null);
 
   useEffect(() => {
     const definition = CAMERA_PRESETS[preset];
@@ -303,17 +223,63 @@ function CameraRig({ preset }: { preset: CameraPreset }) {
         definition.target[index] +
         (coordinate - definition.target[index]) * distanceScale,
     ) as [number, number, number];
-    camera.position.set(...position);
-    camera.up.set(...definition.up);
-    if (camera instanceof THREE.PerspectiveCamera) {
-      camera.fov = definition.fov;
-      camera.updateProjectionMatrix();
-    }
-    controlsRef.current?.target.set(...definition.target);
-    controlsRef.current?.update();
-    camera.lookAt(...definition.target);
+    transitionRef.current = {
+      active: true,
+      elapsed: 0,
+      fromFov:
+        camera instanceof THREE.PerspectiveCamera
+          ? camera.fov
+          : definition.fov,
+      fromPosition: camera.position.clone(),
+      fromTarget:
+        controlsRef.current?.target.clone() ??
+        new THREE.Vector3(...definition.target),
+      fromUp: camera.up.clone(),
+      toFov: definition.fov,
+      toPosition: new THREE.Vector3(...position),
+      toTarget: new THREE.Vector3(...definition.target),
+      toUp: new THREE.Vector3(...definition.up),
+    };
     invalidate();
   }, [camera, invalidate, preset, size.height, size.width]);
+
+  useFrame((_, delta) => {
+    const transition = transitionRef.current;
+    if (!transition?.active) return;
+    transition.elapsed = Math.min(transition.elapsed + delta, 0.72);
+    const progress = transition.elapsed / 0.72;
+    const eased =
+      progress < 0.5
+        ? 4 * progress ** 3
+        : 1 - (-2 * progress + 2) ** 3 / 2;
+    camera.position.lerpVectors(
+      transition.fromPosition,
+      transition.toPosition,
+      eased,
+    );
+    camera.up
+      .lerpVectors(transition.fromUp, transition.toUp, eased)
+      .normalize();
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.fov = THREE.MathUtils.lerp(
+        transition.fromFov,
+        transition.toFov,
+        eased,
+      );
+      camera.updateProjectionMatrix();
+    }
+    controlsRef.current?.target.lerpVectors(
+      transition.fromTarget,
+      transition.toTarget,
+      eased,
+    );
+    controlsRef.current?.update();
+    if (progress >= 1) {
+      transition.active = false;
+      return;
+    }
+    invalidate();
+  });
 
   return (
     <OrbitControls
@@ -329,6 +295,11 @@ function CameraRig({ preset }: { preset: CameraPreset }) {
       maxPolarAngle={Math.PI * 0.495}
       screenSpacePanning
       onChange={() => invalidate()}
+      onStart={() => {
+        if (transitionRef.current) {
+          transitionRef.current.active = false;
+        }
+      }}
     />
   );
 }
@@ -459,66 +430,24 @@ function OccupancyScene({
   onPointerRead: (rasterRow: number, rasterCol: number) => void;
   pixels: Uint8Array;
 }) {
+  const groundWidth = artifact.width * METERS_PER_CELL;
+  const groundLength = artifact.height * METERS_PER_CELL;
+  const groundCenterZ =
+    (artifact.height * (2 / 3) - artifact.height / 2) *
+    METERS_PER_CELL;
+
   return (
     <>
-      <color attach="background" args={["#061017"]} />
-      <fog attach="fog" args={["#07141b", 105, 245]} />
-      <Sky
-        distance={450}
-        mieCoefficient={0.006}
-        mieDirectionalG={0.82}
-        rayleigh={0.62}
-        sunPosition={[-90, 18, -120]}
-        turbidity={7.5}
+      <SceneEnvironment
+        groundCenterZ={groundCenterZ}
+        groundLength={groundLength}
+        groundWidth={groundWidth}
       />
-      <Environment resolution={128}>
-        <Lightformer
-          color="#e7faff"
-          form="rect"
-          intensity={4.5}
-          position={[-18, 18, -12]}
-          rotation={[Math.PI / 2, 0, 0]}
-          scale={[28, 18, 1]}
-        />
-        <Lightformer
-          color="#60e9ff"
-          form="rect"
-          intensity={3}
-          position={[18, 8, 8]}
-          rotation={[0, -Math.PI / 2, 0]}
-          scale={[18, 5, 1]}
-        />
-        <Lightformer
-          color="#ff4d76"
-          form="rect"
-          intensity={1.5}
-          position={[-16, 4, 20]}
-          rotation={[0, Math.PI / 2, 0]}
-          scale={[10, 3, 1]}
-        />
-      </Environment>
-      <ambientLight intensity={0.38} />
-      <hemisphereLight args={["#d6f8ff", "#071013", 1.05]} />
-      <directionalLight
-        castShadow
-        intensity={2.35}
-        position={[-22, 42, -14]}
-        shadow-bias={-0.00018}
-        shadow-camera-bottom={-85}
-        shadow-camera-far={190}
-        shadow-camera-left={-90}
-        shadow-camera-near={1}
-        shadow-camera-right={90}
-        shadow-camera-top={145}
-        shadow-mapSize-width={1024}
-        shadow-mapSize-height={1024}
+      <SemanticGround
+        artifact={artifact}
+        metersPerCell={METERS_PER_CELL}
+        pixels={pixels}
       />
-      <directionalLight
-        color="#7aeaff"
-        intensity={0.8}
-        position={[24, 16, -8]}
-      />
-      <SemanticGround artifact={artifact} pixels={pixels} />
       {components.map((component, index) => (
         <SceneObject
           key={`${component.classIndex}:${component.errorKind}:${component.centroidRow}:${component.centroidCol}:${index}`}
@@ -530,6 +459,7 @@ function OccupancyScene({
       <EgoVehicle />
       <GroundInteraction artifact={artifact} onRead={onPointerRead} />
       <CameraRig preset={cameraPreset} />
+      <ScenePostProcessing />
     </>
   );
 }
