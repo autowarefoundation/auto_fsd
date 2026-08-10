@@ -314,10 +314,12 @@ function componentPosition(
 function SceneObject({
   artifact,
   component,
+  decorativeVariants,
   opacity,
 }: {
   artifact: SemanticOccupancyArtifact;
   component: SemanticOccupancyComponent;
+  decorativeVariants: boolean;
   opacity: number;
 }) {
   const majorSpan = component.majorSpanCells * METERS_PER_CELL;
@@ -359,6 +361,7 @@ function SceneObject({
     <SemanticObstacle
       color={color}
       confidence={component.meanConfidence}
+      decorativeVariants={decorativeVariants}
       errorKind={component.errorKind}
       length={majorSpan}
       opacity={opacity}
@@ -453,6 +456,7 @@ function OccupancyScene({
           key={`${component.classIndex}:${component.errorKind}:${component.centroidRow}:${component.centroidCol}:${index}`}
           artifact={artifact}
           component={component}
+          decorativeVariants={showDemoStreetscape}
           opacity={objectOpacity}
         />
       ))}
