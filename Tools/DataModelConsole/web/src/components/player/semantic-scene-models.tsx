@@ -1,9 +1,21 @@
 "use client";
 
-import { RoundedBox } from "@react-three/drei";
+import { RoundedBox, useGLTF } from "@react-three/drei";
 import type { ThreeElements } from "@react-three/fiber";
-import { memo } from "react";
-import { AdditiveBlending, DoubleSide } from "three";
+import {
+  memo,
+  Suspense,
+  useEffect,
+  useMemo,
+} from "react";
+import {
+  AdditiveBlending,
+  Color,
+  DoubleSide,
+  Material,
+  Mesh,
+  MeshStandardMaterial,
+} from "three";
 
 type ScenePosition = [number, number, number];
 
@@ -26,6 +38,49 @@ interface SemanticObstacleProps extends SemanticModelProps {
   width: number;
   yaw: number;
 }
+
+interface VehicleAsset {
+  height: number;
+  nativeSize: ScenePosition;
+  path: string;
+}
+
+const ASSET_ROOT =
+  "/assets/semantic-occupancy/kenney-car-kit";
+
+const VEHICLE_ASSETS = {
+  ego: {
+    path: `${ASSET_ROOT}/race-future.glb`,
+    nativeSize: [1.2, 0.833, 2.66],
+    height: 1.14,
+  },
+  sedan: {
+    path: `${ASSET_ROOT}/sedan-sports.glb`,
+    nativeSize: [1.3, 1.1, 2.55],
+    height: 1.5,
+  },
+  suv: {
+    path: `${ASSET_ROOT}/suv-luxury.glb`,
+    nativeSize: [1.5, 1.3, 2.85],
+    height: 1.82,
+  },
+  van: {
+    path: `${ASSET_ROOT}/van.glb`,
+    nativeSize: [1.5, 1.35, 2.75],
+    height: 2.05,
+  },
+} satisfies Record<string, VehicleAsset>;
+
+const OBSTACLE_ASSETS = {
+  box: {
+    path: `${ASSET_ROOT}/box.glb`,
+    nativeSize: [0.715, 0.715, 0.715] as ScenePosition,
+  },
+  cone: {
+    path: `${ASSET_ROOT}/cone.glb`,
+    nativeSize: [0.476, 0.595, 0.476] as ScenePosition,
+  },
+};
 
 function SemanticMaterial({
   color,
@@ -54,6 +109,70 @@ function SemanticMaterial({
   );
 }
 
+function SemanticAsset({
+  color,
+  confidence,
+  opacity,
+  path,
+  scale,
+  tintStrength,
+}: {
+  color: string;
+  confidence: number;
+  opacity: number;
+  path: string;
+  scale: ScenePosition;
+  tintStrength: number;
+}) {
+  const { scene } = useGLTF(path, false, false);
+  const clone = useMemo(() => {
+    const next = scene.clone(true);
+    const tint = new Color(color);
+    next.traverse((child) => {
+      if (!(child instanceof Mesh)) return;
+      child.castShadow = true;
+      child.receiveShadow = true;
+      const sourceMaterials = Array.isArray(child.material)
+        ? child.material
+        : [child.material];
+      const materials = sourceMaterials.map((source) => {
+        const material = source.clone();
+        if (material instanceof MeshStandardMaterial) {
+          material.color.lerp(tint, tintStrength);
+          material.emissive.copy(tint);
+          material.emissiveIntensity =
+            0.015 + confidence * 0.035;
+          material.envMapIntensity = 2.1;
+          material.opacity = opacity;
+          material.roughness = Math.min(material.roughness, 0.34);
+          material.transparent = opacity < 1;
+          material.depthWrite = opacity >= 0.55;
+        }
+        return material;
+      });
+      child.material = Array.isArray(child.material)
+        ? materials
+        : materials[0];
+    });
+    return next;
+  }, [color, confidence, opacity, scene, tintStrength]);
+
+  useEffect(
+    () => () => {
+      clone.traverse((child) => {
+        if (!(child instanceof Mesh)) return;
+        const materials = Array.isArray(child.material)
+          ? child.material
+          : [child.material];
+        materials.forEach((material: Material) => material.dispose());
+      });
+    },
+    [clone],
+  );
+
+  return <primitive object={clone} scale={scale} />;
+}
+
 function GroundHalo({
   color,
   confidence,
@@ -63,7 +182,7 @@ function GroundHalo({
   color: string;
   confidence: number;
   opacity: number;
-  scale: [number, number, number];
+  scale: ScenePosition;
 }) {
   return (
     <mesh
@@ -85,152 +204,95 @@ function GroundHalo({
   );
 }
 
-function Wheel({
-  position,
-  radius,
+function VehicleFallback({
+  color,
+  length,
+  opacity,
+  width,
 }: {
-  position: ScenePosition;
-  radius: number;
+  color: string;
+  length: number;
+  opacity: number;
+  width: number;
 }) {
   return (
-    <group position={position} rotation={[0, 0, Math.PI / 2]}>
-      <mesh castShadow>
-        <cylinderGeometry args={[radius, radius, radius * 0.58, 16]} />
-        <meshPhysicalMaterial
-          color="#05080a"
-          envMapIntensity={1.4}
-          metalness={0.45}
-          roughness={0.5}
-        />
-      </mesh>
-      <mesh position={[0, radius * 0.3, 0]}>
-        <cylinderGeometry
-          args={[radius * 0.54, radius * 0.54, radius * 0.04, 12]}
-        />
-        <meshPhysicalMaterial
-          color="#a8b6bf"
-          clearcoat={0.7}
-          envMapIntensity={2}
-          metalness={0.95}
-          roughness={0.13}
-        />
-      </mesh>
-    </group>
+    <RoundedBox
+      args={[width, Math.min(1, width * 0.48), length]}
+      castShadow
+      position={[0, Math.min(0.5, width * 0.24), 0]}
+      radius={Math.min(0.25, width * 0.12)}
+      smoothness={3}
+    >
+      <meshPhysicalMaterial
+        clearcoat={0.8}
+        color={color}
+        metalness={0.55}
+        opacity={opacity}
+        roughness={0.24}
+        transparent={opacity < 1}
+      />
+    </RoundedBox>
   );
 }
 
 export const EgoVehicle = memo(function EgoVehicle() {
-  const wheelPositions: ScenePosition[] = [
-    [-1.02, 0.4, -1.45],
-    [1.02, 0.4, -1.45],
-    [-1.02, 0.4, 1.46],
-    [1.02, 0.4, 1.46],
-  ];
-
+  const asset = VEHICLE_ASSETS.ego;
+  const width = 2.08;
+  const length = 4.72;
   return (
-    <group
-      name="auto-e2e-ego-vehicle"
-      position={[0, 0.02, 0]}
-      scale={[1.08, 1.08, 1.08]}
-    >
+    <group name="auto-e2e-ego-vehicle" position={[0, 0.025, 0]}>
       <GroundHalo
         color="#5de9ff"
         confidence={1}
-        opacity={0.95}
-        scale={[1.48, 2.65, 1]}
+        opacity={0.96}
+        scale={[1.52, 2.7, 1]}
       />
-      <RoundedBox
-        args={[2.05, 0.58, 4.65]}
-        castShadow
-        position={[0, 0.58, 0]}
-        radius={0.24}
-        receiveShadow
-        smoothness={5}
-      >
-        <meshPhysicalMaterial
-          clearcoat={1}
-          clearcoatRoughness={0.08}
-          color="#cbd7df"
-          envMapIntensity={2.8}
-          iridescence={0.2}
-          iridescenceIOR={1.55}
-          metalness={0.92}
-          roughness={0.12}
-        />
-      </RoundedBox>
-      <RoundedBox
-        args={[1.62, 0.66, 2.42]}
-        castShadow
-        position={[0, 1.02, -0.18]}
-        radius={0.3}
-        smoothness={5}
-      >
-        <meshPhysicalMaterial
-          clearcoat={1}
-          clearcoatRoughness={0.04}
-          color="#071217"
-          envMapIntensity={3.2}
-          metalness={0.7}
-          roughness={0.06}
-          thickness={0.35}
-          transmission={0.16}
-        />
-      </RoundedBox>
-      <RoundedBox
-        args={[1.72, 0.16, 1.18]}
-        position={[0, 0.83, 1.48]}
-        radius={0.08}
-        smoothness={3}
-      >
-        <meshPhysicalMaterial
-          clearcoat={1}
-          color="#e0e9ee"
-          envMapIntensity={2.6}
-          metalness={0.9}
-          roughness={0.1}
-        />
-      </RoundedBox>
-      {[-1, 1].map((side) => (
-        <mesh
-          key={`ego-side-${side}`}
-          position={[side * 1.035, 0.56, 0.18]}
-          scale={[0.025, 0.055, 1.58]}
-        >
-          <boxGeometry />
-          <meshBasicMaterial
-            color="#8ef5ff"
-            toneMapped={false}
+      <Suspense
+        fallback={
+          <VehicleFallback
+            color="#d7e3e9"
+            length={length}
+            opacity={1}
+            width={width}
           />
-        </mesh>
-      ))}
-      {[-0.58, 0.58].map((x) => (
-        <RoundedBox
-          key={`ego-headlight-${x}`}
-          args={[0.58, 0.085, 0.06]}
-          position={[x, 0.65, 2.34]}
-          radius={0.03}
-          smoothness={2}
-        >
-          <meshBasicMaterial
-            color="#eaffff"
-            toneMapped={false}
-          />
-        </RoundedBox>
-      ))}
-      <RoundedBox
-        args={[1.42, 0.075, 0.055]}
-        position={[0, 0.67, -2.34]}
-        radius={0.025}
-        smoothness={2}
+        }
       >
-        <meshBasicMaterial color="#ff284f" toneMapped={false} />
-      </RoundedBox>
-      {wheelPositions.map((position) => (
-        <Wheel key={position.join(":")} position={position} radius={0.38} />
-      ))}
+        <SemanticAsset
+          color="#5de9ff"
+          confidence={1}
+          opacity={1}
+          path={asset.path}
+          scale={[
+            width / asset.nativeSize[0],
+            asset.height / asset.nativeSize[1],
+            length / asset.nativeSize[2],
+          ]}
+          tintStrength={0.08}
+        />
+      </Suspense>
+      <mesh position={[0, 0.09, 0]} scale={[0.78, 0.025, 1.9]}>
+        <boxGeometry />
+        <meshBasicMaterial
+          blending={AdditiveBlending}
+          color="#42e7ff"
+          depthWrite={false}
+          opacity={0.2}
+          toneMapped={false}
+          transparent
+        />
+      </mesh>
     </group>
   );
 });
+
+function vehicleAssetFor(
+  length: number,
+  position: ScenePosition,
+): VehicleAsset {
+  if (length >= 7.2) return VEHICLE_ASSETS.van;
+  if (position[0] < -3 || length >= 5.5) return VEHICLE_ASSETS.suv;
+  return VEHICLE_ASSETS.sedan;
+}
 
 export const SemanticVehicle = memo(function SemanticVehicle({
   color,
@@ -241,17 +303,7 @@ export const SemanticVehicle = memo(function SemanticVehicle({
   width,
   yaw,
 }: SemanticVehicleProps) {
-  const radius = Math.min(0.28, width * 0.13);
-  const wheelRadius = Math.min(0.38, width * 0.19);
-  const axleX = width * 0.51;
-  const axleZ = length * 0.31;
-  const wheelPositions: ScenePosition[] = [
-    [-axleX, wheelRadius, -axleZ],
-    [axleX, wheelRadius, -axleZ],
-    [-axleX, wheelRadius, axleZ],
-    [axleX, wheelRadius, axleZ],
-  ];
-
+  const asset = vehicleAssetFor(length, position);
   return (
     <group position={position} rotation={[0, yaw, 0]}>
       <GroundHalo
@@ -260,81 +312,29 @@ export const SemanticVehicle = memo(function SemanticVehicle({
         opacity={opacity}
         scale={[width * 0.72, length * 0.62, 1]}
       />
-      <RoundedBox
-        args={[width, 0.58, length]}
-        castShadow
-        position={[0, 0.57, 0]}
-        radius={radius}
-        receiveShadow
-        smoothness={4}
+      <Suspense
+        fallback={
+          <VehicleFallback
+            color={color}
+            length={length}
+            opacity={opacity}
+            width={width}
+          />
+        }
       >
-        <SemanticMaterial
+        <SemanticAsset
           color={color}
           confidence={confidence}
           opacity={opacity}
+          path={asset.path}
+          scale={[
+            width / asset.nativeSize[0],
+            asset.height / asset.nativeSize[1],
+            length / asset.nativeSize[2],
+          ]}
+          tintStrength={0.2}
         />
-      </RoundedBox>
-      <RoundedBox
-        args={[width * 0.76, 0.56, length * 0.5]}
-        castShadow
-        position={[0, 0.97, -length * 0.055]}
-        radius={radius}
-        smoothness={4}
-      >
-        <meshPhysicalMaterial
-          clearcoat={0.96}
-          clearcoatRoughness={0.06}
-          color="#0b171d"
-          envMapIntensity={2.5}
-          metalness={0.62}
-          opacity={opacity}
-          roughness={0.08}
-          transparent={opacity < 1}
-        />
-      </RoundedBox>
-      <RoundedBox
-        args={[width * 0.78, 0.12, length * 0.28]}
-        position={[0, 0.82, length * 0.32]}
-        radius={0.06}
-        smoothness={3}
-      >
-        <SemanticMaterial
-          color={color}
-          confidence={confidence}
-          opacity={opacity}
-          metalness={0.76}
-          roughness={0.16}
-        />
-      </RoundedBox>
-      {wheelPositions.map((wheelPosition) => (
-        <Wheel
-          key={wheelPosition.join(":")}
-          position={wheelPosition}
-          radius={wheelRadius}
-        />
-      ))}
-      {[-width * 0.27, width * 0.27].map((x) => (
-        <mesh
-          key={`headlight-${x}`}
-          position={[x, 0.64, length * 0.505]}
-          scale={[width * 0.17, 0.045, 0.025]}
-        >
-          <boxGeometry />
-          <meshBasicMaterial color="#e8ffff" toneMapped={false} />
-        </mesh>
-      ))}
-      <mesh
-        position={[0, 0.64, -length * 0.505]}
-        scale={[width * 0.31, 0.035, 0.025]}
-      >
-        <boxGeometry />
-        <meshBasicMaterial
-          color="#ff3359"
-          opacity={opacity}
-          toneMapped={false}
-          transparent={opacity < 1}
-        />
-      </mesh>
+      </Suspense>
     </group>
   );
 });
@@ -418,6 +418,39 @@ export const SemanticPedestrian = memo(function SemanticPedestrian({
   );
 });
 
+function ObstacleFallback({
+  color,
+  height,
+  length,
+  opacity,
+  width,
+}: {
+  color: string;
+  height: number;
+  length: number;
+  opacity: number;
+  width: number;
+}) {
+  return (
+    <RoundedBox
+      args={[width, height, length]}
+      castShadow
+      position={[0, height / 2, 0]}
+      radius={Math.min(0.16, width * 0.1, length * 0.1)}
+      smoothness={3}
+    >
+      <meshPhysicalMaterial
+        clearcoat={0.6}
+        color={color}
+        metalness={0.4}
+        opacity={opacity}
+        roughness={0.32}
+        transparent={opacity < 1}
+      />
+    </RoundedBox>
+  );
+}
+
 export const SemanticObstacle = memo(function SemanticObstacle({
   color,
   confidence,
@@ -428,8 +461,12 @@ export const SemanticObstacle = memo(function SemanticObstacle({
   width,
   yaw,
 }: SemanticObstacleProps) {
-  const panelHeight = Math.max(0.55, height * 0.74);
-  const cornerX = Math.max(0.2, width * 0.34);
+  const isCone = width <= 1.5 && length <= 1.5;
+  const asset = isCone
+    ? OBSTACLE_ASSETS.cone
+    : OBSTACLE_ASSETS.box;
+  const targetHeight = isCone ? Math.max(0.7, height) : height;
+
   return (
     <group position={position} rotation={[0, yaw, 0]}>
       <GroundHalo
@@ -438,72 +475,30 @@ export const SemanticObstacle = memo(function SemanticObstacle({
         opacity={opacity}
         scale={[width * 0.68, length * 0.66, 1]}
       />
-      <RoundedBox
-        args={[width, panelHeight, length]}
-        castShadow
-        position={[0, panelHeight / 2, 0]}
-        radius={Math.min(0.18, width * 0.12, length * 0.12)}
-        receiveShadow
-        smoothness={3}
+      <Suspense
+        fallback={
+          <ObstacleFallback
+            color={color}
+            height={targetHeight}
+            length={length}
+            opacity={opacity}
+            width={width}
+          />
+        }
       >
-        <SemanticMaterial
+        <SemanticAsset
           color={color}
           confidence={confidence}
-          metalness={0.48}
           opacity={opacity}
-          roughness={0.3}
-        />
-      </RoundedBox>
-      <RoundedBox
-        args={[width * 0.82, 0.12, length * 0.82]}
-        position={[0, panelHeight + 0.05, 0]}
-        radius={0.05}
-        smoothness={2}
-      >
-        <meshPhysicalMaterial
-          clearcoat={0.75}
-          color="#202b30"
-          envMapIntensity={1.7}
-          metalness={0.75}
-          opacity={opacity}
-          roughness={0.22}
-          transparent={opacity < 1}
-        />
-      </RoundedBox>
-      {[-0.23, 0, 0.23].map((offset) => (
-        <mesh
-          key={`stripe-${offset}`}
-          position={[
-            offset * width,
-            panelHeight * 0.54,
-            length / 2 + 0.018,
+          path={asset.path}
+          scale={[
+            width / asset.nativeSize[0],
+            targetHeight / asset.nativeSize[1],
+            length / asset.nativeSize[2],
           ]}
-          rotation={[0, 0, -0.58]}
-          scale={[width * 0.22, 0.045, 0.025]}
-        >
-          <boxGeometry />
-          <meshBasicMaterial
-            color={offset === 0 ? "#f8fbff" : color}
-            opacity={opacity}
-            toneMapped={false}
-            transparent={opacity < 1}
-          />
-        </mesh>
-      ))}
-      {[-cornerX, cornerX].map((x) => (
-        <mesh
-          key={`beacon-${x}`}
-          position={[x, panelHeight + 0.18, 0]}
-        >
-          <cylinderGeometry args={[0.09, 0.12, 0.25, 10]} />
-          <meshBasicMaterial
-            color={color}
-            opacity={opacity}
-            toneMapped={false}
-            transparent={opacity < 1}
-          />
-        </mesh>
-      ))}
+          tintStrength={0.16}
+        />
+      </Suspense>
     </group>
   );
 });
