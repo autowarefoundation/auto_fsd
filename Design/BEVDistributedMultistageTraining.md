@@ -125,7 +125,39 @@ including mini and full split archives that may contain overlapping logs.
 Training manifests, rather than acquisition, are responsible for removing
 duplicate samples.
 
-After acquisition, a packing run MUST receive the authorized snapshot assets:
+After acquisition, the first real-data training gate MUST pack directly from
+one immutable raw snapshot:
+
+```text
+snapshot manifest
+  -> select maps + database + camera + LiDAR archives
+  -> download and verify one archive at a time
+  -> normalize the official ZIP layout in ephemeral storage
+  -> retain only DB logs with all eight cameras and LiDAR
+  -> build Reactive shards
+  -> discard the materialized raw tree
+```
+
+The materialized raw directory MUST NOT be published as another dataset
+artifact. The pack task uses a bounded CPU-only Pod with `500Gi` ephemeral
+storage, removes each downloaded ZIP after extraction, and publishes only the
+Reactive shards and their provenance manifest. The packed manifest records the
+raw snapshot ID, raw manifest SHA-256, source contract SHA-256, selected archive
+IDs, and complete sensor-log count. A selected archive set MUST contain maps,
+database, camera, and LiDAR data before any large object is downloaded.
+
+The official ZIP layout is normalized to the nuPlan devkit hierarchy:
+
+- map contents are stripped from the `nuplan-maps-v1.0/` wrapper into `maps/`;
+- DB files are flattened into `nuplan-v1.1/splits/<split>/`;
+- camera and LiDAR wrapper directories are merged under
+  `nuplan-v1.1/sensor_blobs/<log>/`.
+
+ZIP traversal entries and symbolic links MUST be rejected. The materializer
+MUST match DB filenames to sensor-log directories and reject snapshots with no
+complete camera-plus-LiDAR log.
+
+The packing run receives the authorized snapshot assets:
 
 - nuPlan DB files;
 - map root and exact map version;
@@ -253,7 +285,7 @@ a changed dataset, world size, objective, geometry, or shard assignment.
 The production workflow is:
 
 ```text
-pack_nuplan_reactive_dataset
+wf_pack_nuplan_snapshot_reactive_dataset
   -> validate_nuplan_manifest
   -> train_reactive_stage_a_ray_8
 
