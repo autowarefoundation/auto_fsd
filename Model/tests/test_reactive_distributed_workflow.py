@@ -93,6 +93,23 @@ def test_two_rank_canary_targets_dedicated_gpu_placement_pool():
         (item.key, item.operator, item.effect)
         for item in canary_spec.tolerations
     ] == [("nvidia.com/gpu", "Exists", "NoSchedule")]
+    canary_container = canary_spec.containers[0]
+    assert canary_container.resources.requests == {
+        "cpu": "3",
+        "memory": "12Gi",
+        "nvidia.com/gpu": "1",
+    }
+    assert canary_container.resources.limits == {
+        "cpu": "3",
+        "memory": "12Gi",
+        "nvidia.com/gpu": "1",
+    }
+    assert canary_spec.volumes[0].empty_dir.size_limit == "4Gi"
+    assert (
+        distributed_training.RAY_2.worker_node_config[0]
+        .ray_start_params["num-cpus"]
+        == "3"
+    )
 
     for config in (
         distributed_training.RAY_4,
@@ -104,6 +121,13 @@ def test_two_rank_canary_targets_dedicated_gpu_placement_pool():
         assert worker_spec.node_selector == {
             "workload-type": "gpu-training"
         }
+        worker_container = worker_spec.containers[0]
+        assert worker_container.resources.requests == {
+            "cpu": "4",
+            "memory": "16Gi",
+            "nvidia.com/gpu": "1",
+        }
+        assert worker_spec.volumes[0].empty_dir.size_limit == "8Gi"
 
     assert (
         distributed_training.train_reactive_stage_ray_2.metadata.labels[
@@ -164,8 +188,17 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
         for item in canary_pool["template"]["spec"]["requirements"]
     }
     assert requirements["node.kubernetes.io/instance-type"] == [
-        "g6e.2xlarge"
+        "g6.xlarge",
+        "g6.2xlarge",
+        "g6e.xlarge",
+        "g6e.2xlarge",
+        "g7.2xlarge",
+        "g7e.2xlarge",
     ]
+    assert not {
+        "g6f.xlarge",
+        "g6f.2xlarge",
+    }.intersection(requirements["node.kubernetes.io/instance-type"])
     assert requirements["karpenter.sh/capacity-type"] == ["on-demand"]
     assert requirements["topology.kubernetes.io/zone"] == [
         "us-west-2a"
