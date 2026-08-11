@@ -18,7 +18,13 @@ spec:
       requirements:
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: ["g6e.2xlarge"]
+          values:
+            - g6.xlarge
+            - g6.2xlarge
+            - g6e.xlarge
+            - g6e.2xlarge
+            - g7.2xlarge
+            - g7e.2xlarge
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
