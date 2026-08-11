@@ -29,6 +29,7 @@ from kubernetes.client import (
     V1EnvVar,
     V1LabelSelector,
     V1LabelSelectorRequirement,
+    V1PodAffinity,
     V1PodAffinityTerm,
     V1PodAntiAffinity,
     V1PodSpec,
@@ -141,6 +142,22 @@ def _worker_pod_template(
                 ),
             ],
             affinity=V1Affinity(
+                pod_affinity=V1PodAffinity(
+                    required_during_scheduling_ignored_during_execution=[
+                        V1PodAffinityTerm(
+                            label_selector=V1LabelSelector(
+                                match_expressions=[
+                                    V1LabelSelectorRequirement(
+                                        key="auto-e2e.training/role",
+                                        operator="In",
+                                        values=["ray-gpu-worker"],
+                                    ),
+                                ],
+                            ),
+                            topology_key="topology.kubernetes.io/zone",
+                        ),
+                    ],
+                ),
                 pod_anti_affinity=V1PodAntiAffinity(
                     required_during_scheduling_ignored_during_execution=[
                         V1PodAffinityTerm(
