@@ -23,6 +23,8 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from distributed_training.reactive_stage import (
+    _finalize_trajectory_validation,
+    _trajectory_validation_batch_sums,
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
     reactive_worker_resources,
@@ -236,6 +238,93 @@ def test_float64_gradient_clipping_rejects_non_finite_values():
 
     assert not finite
     assert torch.isnan(parameter.grad[0])
+
+
+def test_trajectory_validation_prefers_complete_horizon_metrics():
+    torch = pytest.importorskip("torch")
+    predicted = torch.zeros((2, 4, 2))
+    target = torch.zeros_like(predicted)
+    target[:, :, 0] = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 4.0, 6.0, 8.0],
+        ]
+    )
+    valid = torch.tensor(
+        [
+            [True, True, True, True],
+            [True, True, False, False],
+        ]
+    )
+
+    metrics = _finalize_trajectory_validation(
+        _trajectory_validation_batch_sums(
+            predicted,
+            target,
+            valid,
+        )
+    )
+
+    assert metrics["ade_6p4s_m"] == pytest.approx(2.5)
+    assert metrics["fde_6p4s_m"] == pytest.approx(4.0)
+    assert metrics["selection_ade_m"] == pytest.approx(2.5)
+    assert metrics["available_horizon_ade_m"] == pytest.approx(2.75)
+    assert metrics["available_horizon_fde_m"] == pytest.approx(4.0)
+    assert metrics["complete_samples"] == 1.0
+    assert metrics["valid_samples"] == 2.0
+    assert metrics["valid_points"] == 6.0
+    assert metrics["partial_horizon_fallback"] == 0.0
+
+
+def test_trajectory_validation_falls_back_to_available_horizon():
+    torch = pytest.importorskip("torch")
+    predicted = torch.zeros((2, 4, 2))
+    target = torch.zeros_like(predicted)
+    target[:, :, 0] = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 4.0, 6.0, 8.0],
+        ]
+    )
+    valid = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, True, True, False],
+        ]
+    )
+
+    metrics = _finalize_trajectory_validation(
+        _trajectory_validation_batch_sums(
+            predicted,
+            target,
+            valid,
+        )
+    )
+
+    assert "ade_6p4s_m" not in metrics
+    assert "fde_6p4s_m" not in metrics
+    assert metrics["selection_ade_m"] == pytest.approx(2.75)
+    assert metrics["selection_fde_m"] == pytest.approx(4.0)
+    assert metrics["complete_samples"] == 0.0
+    assert metrics["valid_samples"] == 2.0
+    assert metrics["valid_points"] == 5.0
+    assert metrics["partial_horizon_fallback"] == 1.0
+
+
+def test_trajectory_validation_rejects_batches_without_valid_points():
+    torch = pytest.importorskip("torch")
+    predicted = torch.zeros((1, 4, 2))
+    target = torch.zeros_like(predicted)
+    valid = torch.zeros((1, 4), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="no valid trajectories"):
+        _finalize_trajectory_validation(
+            _trajectory_validation_batch_sums(
+                predicted,
+                target,
+                valid,
+            )
+        )
 
 
 def test_ray_checkpoint_uri_restores_s3_scheme_within_storage():
