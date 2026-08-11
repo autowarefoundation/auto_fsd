@@ -450,6 +450,7 @@ def test_nuplan_snapshot_pack_workflow_binds_materialization_contract():
         bindings["limit_total_scenarios"].promise.var
         == "limit_total_scenarios"
     )
+    assert bindings["pack_workers"].promise.var == "pack_workers"
 
 
 def test_nuplan_snapshot_pack_launcher_is_detached_and_bounded():
@@ -467,10 +468,14 @@ def test_nuplan_snapshot_pack_launcher_is_detached_and_bounded():
     assert 'WAIT_FOR_COMPLETION: "false"' in buildspec
     assert "FLYTE_EXECUTION_DETACHED=true" in buildspec
     assert "MAX_REJECTION_FRACTION" in buildspec
+    assert 'PACK_WORKERS: "8"' in buildspec
+    assert '"pack_workers": int(os.environ["PACK_WORKERS"])' in buildspec
     assert re.search(r"\b[0-9]{12}\b", buildspec) is None
     workflow_source = Path(workflows.__file__).read_text()
     assert 'ephemeral_storage="500Gi"' in workflow_source
-    assert 'cache_version="nuplan-snapshot-pack-v1"' in workflow_source
+    assert 'cpu="32"' in workflow_source
+    assert 'mem="128Gi"' in workflow_source
+    assert 'cache_version="nuplan-snapshot-pack-v2"' in workflow_source
 
 
 def test_l2d_reactive_pack_workflow_binds_osm_and_target_contract():
