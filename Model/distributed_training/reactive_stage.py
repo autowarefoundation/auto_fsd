@@ -333,6 +333,46 @@ def normalize_ray_checkpoint_uri(
     return checkpoint_uri
 
 
+def select_best_ray_checkpoint(
+    result: Any,
+    *,
+    metric: str = "validation_selection_ade_m",
+    mode: str = "min",
+) -> tuple[Any, dict[str, Any]]:
+    """Return the validation-best checkpoint and its matching metrics."""
+    best_checkpoint = result.get_best_checkpoint(
+        metric=metric,
+        mode=mode,
+    )
+    if best_checkpoint is None:
+        raise RuntimeError(
+            f"Reactive Ray training returned no best checkpoint for {metric}"
+        )
+    best_path = str(best_checkpoint.path).rstrip("/")
+    best_checkpoints = getattr(result, "best_checkpoints", None)
+    if not best_checkpoints:
+        raise RuntimeError(
+            "Reactive Ray training returned no scored checkpoint metrics"
+        )
+    for checkpoint, raw_metrics in best_checkpoints:
+        if str(checkpoint.path).rstrip("/") != best_path:
+            continue
+        metrics = dict(raw_metrics)
+        if metric not in metrics or not math.isfinite(float(metrics[metric])):
+            raise RuntimeError(
+                "Reactive Ray best checkpoint has invalid selection metrics"
+            )
+        checkpoint_sha256 = str(metrics.get("checkpoint_sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256):
+            raise RuntimeError(
+                "Reactive Ray best checkpoint has invalid checkpoint_sha256"
+            )
+        return best_checkpoint, metrics
+    raise RuntimeError(
+        "Reactive Ray best checkpoint has no matching scored metrics"
+    )
+
+
 def _seed_epoch(seed: int, rank: int, epoch: int) -> None:
     import torch
 
@@ -1165,17 +1205,16 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
         ),
     )
     result = trainer.fit()
-    if result.checkpoint is None:
-        raise RuntimeError("Reactive Ray training returned no checkpoint")
+    best_checkpoint, metrics = select_best_ray_checkpoint(result)
     checkpoint_uri = normalize_ray_checkpoint_uri(
-        str(result.checkpoint.path),
+        str(best_checkpoint.path),
         str(config["storage_path"]),
     )
-    metrics = dict(result.metrics)
     if int(metrics.get("world_size", 0)) != int(config["num_workers"]):
         raise RuntimeError(
             f"Reactive Ray result has unexpected world size: {metrics}"
         )
+    latest_metrics = dict(result.metrics)
     history = []
     metrics_dataframe = getattr(result, "metrics_dataframe", None)
     if metrics_dataframe is not None:
@@ -1189,6 +1228,7 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
         "checkpoint_file_uri": f"{checkpoint_uri}/checkpoint.pt",
         "checkpoint_uri": checkpoint_uri,
         "history": history,
+        "latest_metrics": latest_metrics,
         "metrics": metrics,
         "run_name": str(config["run_name"]),
         "storage_path": str(config["storage_path"]),
