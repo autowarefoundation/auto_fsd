@@ -105,6 +105,22 @@ def test_two_rank_canary_targets_dedicated_gpu_placement_pool():
         "nvidia.com/gpu": "1",
     }
     assert canary_spec.volumes[0].empty_dir.size_limit == "4Gi"
+    assert canary_spec.affinity.pod_affinity is not None
+    same_zone_term = (
+        canary_spec.affinity.pod_affinity
+        .required_during_scheduling_ignored_during_execution[0]
+    )
+    assert same_zone_term.topology_key == "topology.kubernetes.io/zone"
+    assert (
+        same_zone_term.label_selector.match_expressions[0].values
+        == ["ray-gpu-worker"]
+    )
+    assert canary_spec.affinity.pod_anti_affinity is not None
+    distinct_node_term = (
+        canary_spec.affinity.pod_anti_affinity
+        .required_during_scheduling_ignored_during_execution[0]
+    )
+    assert distinct_node_term.topology_key == "kubernetes.io/hostname"
     assert (
         distributed_training.RAY_2.worker_node_config[0]
         .ray_start_params["num-cpus"]
@@ -164,7 +180,22 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
             "tags": {
                 "Name": "auto-e2e-platform-private-us-west-2a"
             }
-        }
+        },
+        {
+            "tags": {
+                "Name": "auto-e2e-platform-private-us-west-2b"
+            }
+        },
+        {
+            "tags": {
+                "Name": "auto-e2e-platform-private-us-west-2c"
+            }
+        },
+        {
+            "tags": {
+                "Name": "auto-e2e-platform-private-us-west-2d"
+            }
+        },
     ]
 
     node_pools = {
@@ -201,7 +232,10 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
     }.intersection(requirements["node.kubernetes.io/instance-type"])
     assert requirements["karpenter.sh/capacity-type"] == ["on-demand"]
     assert requirements["topology.kubernetes.io/zone"] == [
-        "us-west-2a"
+        "us-west-2a",
+        "us-west-2b",
+        "us-west-2c",
+        "us-west-2d",
     ]
 
 
