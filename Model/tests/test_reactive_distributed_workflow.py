@@ -515,7 +515,7 @@ def test_canary_gate_requires_loss_decrease_and_stage_b_bev_off(tmp_path):
     common = {
         "train_route_reconstruction": 0.2,
         "train_trajectory": 1.0,
-        "validation_ade_6p4s_m": 2.0,
+        "validation_selection_ade_m": 2.0,
     }
     stage_a = metadata(
         [
