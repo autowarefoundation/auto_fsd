@@ -224,3 +224,18 @@ def test_discover_split_group_uids_scans_packed_metadata(tmp_path):
     assert sample_digest == hashlib.sha256(
         b"partition-a-sample-1\npartition-b-sample-0"
     ).hexdigest()
+
+
+def test_split_inventory_can_scan_one_rank_local_group(tmp_path):
+    root = tmp_path / "rank-local"
+    _write_group_metadata_tar(root, ["scene-only"])
+
+    with pytest.raises(ValueError, match="at least 2 split groups"):
+        discover_split_inventory([root])
+
+    inventory = discover_split_inventory(
+        [root],
+        minimum_group_count=1,
+    )
+    assert inventory.group_uids == ("scene-only",)
+    assert inventory.sample_count == 1
