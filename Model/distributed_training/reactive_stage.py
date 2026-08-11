@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import random
@@ -41,6 +42,90 @@ def reactive_worker_resources(
     if worker_cpus <= 0:
         raise ValueError("worker_cpus must be positive")
     return {"CPU": worker_cpus, "GPU": 1}
+
+
+def select_distributed_validation_groups(
+    rank_group_sample_counts: list[Mapping[str, int]],
+    *,
+    val_fraction: float,
+) -> tuple[str, ...]:
+    """Choose a deterministic exact holdout without emptying any rank."""
+    if not rank_group_sample_counts:
+        raise ValueError("rank group sample counts must not be empty")
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be between zero and one")
+
+    normalized: list[dict[str, int]] = []
+    all_groups: set[str] = set()
+    for rank, counts in enumerate(rank_group_sample_counts):
+        rank_counts: dict[str, int] = {}
+        for raw_group_uid, raw_count in counts.items():
+            group_uid = str(raw_group_uid)
+            sample_count = int(raw_count)
+            if not group_uid or sample_count <= 0:
+                raise ValueError(
+                    "rank group sample counts must contain non-empty groups "
+                    f"with positive counts; rank={rank}"
+                )
+            rank_counts[group_uid] = sample_count
+            all_groups.add(group_uid)
+        if not rank_counts:
+            raise ValueError(f"rank {rank} has no packed split groups")
+        normalized.append(rank_counts)
+
+    if len(all_groups) < 2:
+        raise ValueError(
+            "distributed exact validation requires at least two split groups"
+        )
+    target_count = max(
+        1,
+        min(
+            len(all_groups) - 1,
+            round(len(all_groups) * val_fraction),
+        ),
+    )
+    ordered_groups = sorted(
+        all_groups,
+        key=lambda group_uid: (
+            hashlib.sha256(group_uid.encode("utf-8")).digest(),
+            group_uid,
+        ),
+    )
+    remaining_by_rank = [
+        sum(rank_counts.values()) for rank_counts in normalized
+    ]
+    selected: list[str] = []
+    for group_uid in ordered_groups:
+        if len(selected) >= target_count:
+            break
+        candidate_counts = [
+            rank_counts.get(group_uid, 0)
+            for rank_counts in normalized
+        ]
+        if all(
+            remaining - candidate > 0
+            for remaining, candidate in zip(
+                remaining_by_rank,
+                candidate_counts,
+                strict=True,
+            )
+        ):
+            selected.append(group_uid)
+            remaining_by_rank = [
+                remaining - candidate
+                for remaining, candidate in zip(
+                    remaining_by_rank,
+                    candidate_counts,
+                    strict=True,
+                )
+            ]
+
+    if len(selected) != target_count:
+        raise ValueError(
+            "could not choose the requested validation group count without "
+            "emptying at least one rank; repack shards across ranks"
+        )
+    return tuple(sorted(selected))
 
 
 def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
@@ -654,6 +739,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     from ray.train.torch import get_device, prepare_model
 
     from data_parsing.pre_extracted import (
+        discover_split_inventory,
         make_multi_dataset_loader,
         passthrough_nodesplitter,
     )
@@ -706,6 +792,44 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         rank_shards,
         cache_root=cache_root,
     )
+    local_inventory = discover_split_inventory(
+        local_directories,
+        minimum_group_count=1,
+    )
+    local_group_sample_counts = {
+        group_uid: len(sample_uids)
+        for group_uid, sample_uids in (
+            local_inventory.sample_uids_by_group
+        )
+    }
+    rank_group_sample_counts: list[dict[str, int] | None] = [
+        None
+    ] * world_size
+    dist.all_gather_object(
+        rank_group_sample_counts,
+        local_group_sample_counts,
+    )
+    if any(item is None for item in rank_group_sample_counts):
+        raise RuntimeError("distributed split inventory is incomplete")
+    validation_group_uids = select_distributed_validation_groups(
+        [
+            item
+            for item in rank_group_sample_counts
+            if item is not None
+        ],
+        val_fraction=float(config["val_fraction"]),
+    )
+    validation_group_uid_digest = hashlib.sha256(
+        "\n".join(validation_group_uids).encode("utf-8")
+    ).hexdigest()
+    validation_sample_count = sum(
+        rank_counts.get(group_uid, 0)
+        for rank_counts in rank_group_sample_counts
+        if rank_counts is not None
+        for group_uid in validation_group_uids
+    )
+    if validation_sample_count <= 0:
+        raise RuntimeError("distributed validation group selection is empty")
 
     seed = int(config["training_seed"])
     _seed_epoch(seed, rank, 0)
@@ -783,6 +907,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
         "training_stage": stage.value,
+        "validation_group_count": len(validation_group_uids),
+        "validation_group_uid_digest": validation_group_uid_digest,
+        "validation_sample_count": validation_sample_count,
     }
     start_epoch = 1
     best_selection_ade = float("inf")
@@ -819,6 +946,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_global_batch": global_batch,
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
+        "validation_group_count": len(validation_group_uids),
+        "validation_group_uid_digest": validation_group_uid_digest,
+        "validation_group_uids": list(validation_group_uids),
+        "validation_sample_count": validation_sample_count,
     }
     started = time.perf_counter()
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
@@ -834,6 +965,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             pin_memory=True,
             decode_future_frames=False,
             nodesplitter=passthrough_nodesplitter,
+            validation_group_uids=validation_group_uids,
         )
         train_metrics = _train_fixed_steps(
             model,
@@ -859,6 +991,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             max_active_loaders=1,
             decode_future_frames=False,
             nodesplitter=passthrough_nodesplitter,
+            validation_group_uids=validation_group_uids,
         )
         validation = _evaluate_global_trajectory(
             model,
@@ -923,6 +1056,18 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                         "global_batch": global_batch,
                         "optimizer_steps_per_epoch": optimizer_steps,
                         "rank_evidence": rank_evidence,
+                        "validation_group_count": len(
+                            validation_group_uids
+                        ),
+                        "validation_group_uid_digest": (
+                            validation_group_uid_digest
+                        ),
+                        "validation_group_uids": list(
+                            validation_group_uids
+                        ),
+                        "validation_sample_count": (
+                            validation_sample_count
+                        ),
                         "world_size": world_size,
                     },
                     lineage=lineage,
@@ -973,6 +1118,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 ],
                 "validation_valid_points": validation["valid_points"],
                 "validation_valid_samples": validation["valid_samples"],
+                "validation_group_count": len(validation_group_uids),
+                "validation_group_uid_digest": (
+                    validation_group_uid_digest
+                ),
+                "validation_sample_count": validation_sample_count,
                 "world_size": world_size,
             }
             if "ade_6p4s_m" in validation:
