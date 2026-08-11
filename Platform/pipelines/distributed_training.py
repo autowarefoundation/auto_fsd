@@ -119,7 +119,13 @@ def _head_pod_template() -> PodTemplate:
     )
 
 
-def _worker_pod_template(*, workload_type: str) -> PodTemplate:
+def _worker_pod_template(
+    *,
+    workload_type: str,
+    cpu: str,
+    memory: str,
+    shm_size: str,
+) -> PodTemplate:
     return PodTemplate(
         primary_container_name="ray-worker",
         labels={"auto-e2e.training/role": "ray-gpu-worker"},
@@ -164,13 +170,13 @@ def _worker_pod_template(*, workload_type: str) -> PodTemplate:
                     ],
                     resources=V1ResourceRequirements(
                         requests={
-                            "cpu": "4",
-                            "memory": "16Gi",
+                            "cpu": cpu,
+                            "memory": memory,
                             "nvidia.com/gpu": "1",
                         },
                         limits={
-                            "cpu": "4",
-                            "memory": "16Gi",
+                            "cpu": cpu,
+                            "memory": memory,
                             "nvidia.com/gpu": "1",
                         },
                     ),
@@ -187,7 +193,7 @@ def _worker_pod_template(*, workload_type: str) -> PodTemplate:
                     name="dshm",
                     empty_dir=V1EmptyDirVolumeSource(
                         medium="Memory",
-                        size_limit="8Gi",
+                        size_limit=shm_size,
                     ),
                 ),
             ],
@@ -199,6 +205,9 @@ def _ray_job_config(
     replicas: int,
     *,
     worker_workload_type: str,
+    worker_cpu: str = "4",
+    worker_memory: str = "16Gi",
+    worker_shm_size: str = "8Gi",
 ) -> RayJobConfig:
     return RayJobConfig(
         head_node_config=HeadNodeConfig(
@@ -215,11 +224,14 @@ def _ray_job_config(
                 min_replicas=replicas,
                 max_replicas=replicas,
                 ray_start_params={
-                    "num-cpus": "4",
+                    "num-cpus": worker_cpu,
                     "num-gpus": "1",
                 },
                 pod_template=_worker_pod_template(
                     workload_type=worker_workload_type,
+                    cpu=worker_cpu,
+                    memory=worker_memory,
+                    shm_size=worker_shm_size,
                 ),
             ),
         ],
@@ -233,6 +245,9 @@ def _ray_job_config(
 RAY_2 = _ray_job_config(
     2,
     worker_workload_type="gpu-canary",
+    worker_cpu="3",
+    worker_memory="12Gi",
+    worker_shm_size="4Gi",
 )
 RAY_4 = _ray_job_config(
     4,
