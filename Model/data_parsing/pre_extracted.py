@@ -1095,6 +1095,8 @@ class PackedSplitInventory:
 
 def discover_split_inventory(
     shard_dirs: Sequence[str | Path],
+    *,
+    minimum_group_count: int = 2,
 ) -> PackedSplitInventory:
     """Read exact group and sample identities from packed shard metadata.
 
@@ -1105,6 +1107,8 @@ def discover_split_inventory(
     """
     import tarfile
 
+    if minimum_group_count <= 0:
+        raise ValueError("minimum_group_count must be positive")
     roots = [Path(shard_dir) for shard_dir in shard_dirs]
     if not roots:
         raise ValueError("at least one shard directory is required")
@@ -1163,10 +1167,10 @@ def discover_split_inventory(
                         group_uid, []
                     ).append(sample_uid)
 
-    if not sample_uids or len(group_uids) < 2:
+    if not sample_uids or len(group_uids) < minimum_group_count:
         raise ValueError(
-            "exact validation splitting requires metadata for at least two "
-            "split groups"
+            "exact validation splitting requires metadata for at least "
+            f"{minimum_group_count} split groups"
         )
     return PackedSplitInventory(
         group_uids=tuple(sorted(group_uids)),
