@@ -28,6 +28,7 @@ from distributed_training.reactive_stage import (
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
     reactive_worker_resources,
+    select_distributed_validation_groups,
     validate_reactive_stage_config,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
@@ -201,6 +202,37 @@ def test_fixed_step_count_uses_global_effective_batch():
         per_rank_batch_size=1,
         gradient_accumulation_steps=4,
     ) == 6
+
+
+def test_exact_validation_groups_keep_training_samples_on_every_rank():
+    selected = select_distributed_validation_groups(
+        [
+            {
+                "nuplan-log-de6928217e1d599af467": 1,
+                "nuplan-log-6c2206ef7923aaa0fcc1": 2,
+                "nuplan-log-03e7cb00494f4098167a": 1,
+            },
+            {
+                "nuplan-log-237f1f6f15baa6a1faa6": 1,
+                "nuplan-log-4d499edda36f30464fe8": 1,
+                "nuplan-log-6c2206ef7923aaa0fcc1": 2,
+            },
+        ],
+        val_fraction=0.25,
+    )
+
+    assert selected == ("nuplan-log-de6928217e1d599af467",)
+
+
+def test_exact_validation_groups_fail_when_a_rank_would_be_empty():
+    with pytest.raises(ValueError, match="repack shards across ranks"):
+        select_distributed_validation_groups(
+            [
+                {"scene-a": 4},
+                {"scene-b": 4},
+            ],
+            val_fraction=0.5,
+        )
 
 
 def test_restarting_iterator_repeats_finite_loader():
