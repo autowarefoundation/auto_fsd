@@ -308,6 +308,11 @@ def _flyte_remote_uri(value: FlyteDirectory | FlyteFile) -> str:
     return uri.rstrip("/")
 
 
+def _reactive_worker_cpus(num_workers: int) -> int:
+    """Match Ray actors to the corresponding worker pod CPU limit."""
+    return 3 if num_workers == 2 else 4
+
+
 def _run_reactive_stage_task(
     *,
     shards: List[FlyteDirectory],
@@ -380,6 +385,7 @@ def _run_reactive_stage_task(
         "use_gpu": True,
         "val_fraction": val_fraction,
         "weight_decay": weight_decay,
+        "worker_cpus": _reactive_worker_cpus(num_workers),
     })
     metadata_path = (
         Path("/tmp/reactive-ray")
