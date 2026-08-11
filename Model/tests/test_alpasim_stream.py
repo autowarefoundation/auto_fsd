@@ -358,7 +358,19 @@ class TestOfflineKitScenesParity:
         )
 
     def test_camera_topology_parity(self) -> None:
-        pass
+        """Verify the AlpaSim stream parser topology matches the KIT offline topology.
+        
+        This parity check ensures that the names and order of the 7 camera streams
+        expected by the runtime parser perfectly match the dataset training pipeline.
+        """
+        from data_parsing.kit_scenes.camera import CAMERA_NAMES as OFFLINE_NAMES
+        
+        assert PARSER_CAMERA_NAMES == list(OFFLINE_NAMES), (
+            f"Runtime parser camera topology MUST match the offline training topology.\n"
+            f"Parser:  {PARSER_CAMERA_NAMES}\n"
+            f"Offline: {OFFLINE_NAMES}"
+        )
+        assert len(PARSER_CAMERA_NAMES) == 7, "AutoE2E expects exactly 7 cameras."
 
 
 
