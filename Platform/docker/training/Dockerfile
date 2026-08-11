@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 WORKDIR /workspace
 
@@ -25,6 +25,9 @@ RUN pip install --no-cache-dir \
     numpy \
     pyproj==3.7.2 \
     boto3==1.43.0
+
+RUN python -c \
+    "import torch; assert torch.__version__.startswith('2.7.1'); assert torch.version.cuda == '12.8'"
 
 # Cache the exact Stage A backbone in the immutable training image so all
 # workers avoid identical runtime downloads.
