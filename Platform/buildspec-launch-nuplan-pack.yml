@@ -16,6 +16,7 @@ env:
     IMAGE_SIZE: "256"
     SAMPLES_PER_SHARD: "100"
     MAX_REJECTION_FRACTION: "0.25"
+    PACK_WORKERS: "8"
     WAIT_FOR_COMPLETION: "false"
     WAIT_TIMEOUT_SECONDS: "21600"
 
@@ -36,6 +37,7 @@ phases:
       - printf '%s' "${LIMIT_TOTAL_SCENARIOS}" | grep -Eq '^[0-9]+$'
       - printf '%s' "${IMAGE_SIZE}" | grep -Eq '^[1-9][0-9]*$'
       - printf '%s' "${SAMPLES_PER_SHARD}" | grep -Eq '^[1-9][0-9]*$'
+      - printf '%s' "${PACK_WORKERS}" | grep -Eq '^[1-9][0-9]*$'
       - printf '%s' "${WAIT_FOR_COMPLETION}" | grep -Eq '^(true|false)$'
       - printf '%s' "${WAIT_TIMEOUT_SECONDS}" | grep -Eq '^[1-9][0-9]*$'
       - |
@@ -103,6 +105,7 @@ phases:
             "max_rejection_fraction": float(
                 os.environ["MAX_REJECTION_FRACTION"]
             ),
+            "pack_workers": int(os.environ["PACK_WORKERS"]),
             "aws_region": os.environ["AWS_DEFAULT_REGION"],
         }
         remote = FlyteRemote(
