@@ -33,6 +33,16 @@ SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
+def reactive_worker_resources(
+    config: Mapping[str, Any],
+) -> dict[str, int]:
+    """Return the Ray actor resources declared by the worker pod."""
+    worker_cpus = int(config.get("worker_cpus", 4))
+    if worker_cpus <= 0:
+        raise ValueError("worker_cpus must be positive")
+    return {"CPU": worker_cpus, "GPU": 1}
+
+
 def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
     """Validate the JSON-safe contract before starting a Ray cluster."""
     try:
@@ -54,6 +64,7 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         raise ValueError("gradient_accumulation_steps must be positive")
     if int(config.get("num_loader_workers", -1)) < 0:
         raise ValueError("num_loader_workers must be non-negative")
+    reactive_worker_resources(config)
     if not 0.0 < float(config.get("val_fraction", 0.0)) < 1.0:
         raise ValueError("val_fraction must be between zero and one")
     if float(config.get("learning_rate", 0.0)) <= 0.0:
@@ -904,7 +915,7 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
         scaling_config=train.ScalingConfig(
             num_workers=int(config["num_workers"]),
             use_gpu=True,
-            resources_per_worker={"CPU": 4, "GPU": 1},
+            resources_per_worker=reactive_worker_resources(config),
             placement_strategy="SPREAD",
         ),
         run_config=train.RunConfig(
