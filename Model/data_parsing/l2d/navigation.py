@@ -466,7 +466,9 @@ def _ego_flu_from_lon_lat(
         points[:, 0],
         ego_lat,
         ego_lon,
-        math.radians(heading_deg_cw_from_north),
+        # L2D headings are clockwise from north, while the projection
+        # helper expects a counter-clockwise angle from north.
+        math.radians(-heading_deg_cw_from_north),
     )
     return np.column_stack([y_forward, -x_right])
 
