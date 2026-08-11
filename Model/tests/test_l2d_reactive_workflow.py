@@ -25,6 +25,10 @@ def test_l2d_source_revision_is_one_immutable_commit():
     )
 
 
+def test_l2d_reactive_dataset_version_includes_heading_contract_fix():
+    assert workflows.L2D_REACTIVE_DATASET_VERSION == "v3.0-reactive-v2"
+
+
 def test_packed_episode_count_uses_explicit_partition_groups():
     assert workflows._packed_episode_count(0, ["185"]) == 1
     assert workflows._packed_episode_count(3, None) == 3
