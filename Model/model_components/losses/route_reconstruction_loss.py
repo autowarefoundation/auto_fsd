@@ -41,8 +41,16 @@ def _destination_heatmap_focal(
         * negative
     ).sum(dim=(1, 2))
     positive_count = positive.sum(dim=(1, 2))
-    normalizer = positive_count.clamp_min(1).to(logits.dtype)
-    return (positive_loss + negative_loss) / normalizer
+    positive_normalizer = positive_count.clamp_min(1).to(logits.dtype)
+    negative_normalizer = (
+        (negative_weights * negative).sum(dim=(1, 2))
+        .clamp_min(1.0)
+        .to(logits.dtype)
+    )
+    return (
+        positive_loss / positive_normalizer
+        + negative_loss / negative_normalizer
+    )
 
 
 class RouteReconstructionLoss(nn.Module):
