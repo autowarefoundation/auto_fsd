@@ -445,6 +445,83 @@ def _train_fixed_steps(
     }
 
 
+def _trajectory_validation_batch_sums(
+    predicted_xy,
+    target_xy,
+    valid,
+):
+    """Return full- and available-horizon validation sums."""
+    import torch
+
+    errors = torch.linalg.vector_norm(
+        predicted_xy - target_xy,
+        dim=-1,
+    )
+    valid_counts = valid.sum(dim=1)
+    has_valid = valid_counts > 0
+    complete = valid.all(dim=1)
+    safe_errors = torch.where(valid, errors, torch.zeros_like(errors))
+    available_ade = safe_errors.sum(dim=1) / valid_counts.clamp_min(1)
+    step_indices = torch.arange(
+        valid.shape[1],
+        device=valid.device,
+    ).unsqueeze(0)
+    last_valid_indices = torch.where(
+        valid,
+        step_indices,
+        torch.full_like(step_indices, -1),
+    ).amax(dim=1)
+    available_fde = errors.gather(
+        1,
+        last_valid_indices.clamp_min(0).unsqueeze(1),
+    ).squeeze(1)
+    return torch.stack(
+        (
+            available_ade[complete].sum(),
+            available_fde[complete].sum(),
+            complete.sum(),
+            available_ade[has_valid].sum(),
+            available_fde[has_valid].sum(),
+            has_valid.sum(),
+            valid_counts.sum(),
+        )
+    ).to(dtype=torch.float64)
+
+
+def _finalize_trajectory_validation(values) -> dict[str, float]:
+    complete_count = int(values[2].item())
+    valid_sample_count = int(values[5].item())
+    if valid_sample_count <= 0:
+        raise ValueError(
+            "Reactive distributed validation has no valid trajectories"
+        )
+
+    available_ade = float(values[3].item() / valid_sample_count)
+    available_fde = float(values[4].item() / valid_sample_count)
+    result = {
+        "available_horizon_ade_m": available_ade,
+        "available_horizon_fde_m": available_fde,
+        "complete_samples": float(complete_count),
+        "partial_horizon_fallback": float(complete_count <= 0),
+        "selection_ade_m": available_ade,
+        "selection_fde_m": available_fde,
+        "valid_points": float(values[6].item()),
+        "valid_samples": float(valid_sample_count),
+    }
+    if complete_count > 0:
+        ade_6p4s = float(values[0].item() / complete_count)
+        fde_6p4s = float(values[1].item() / complete_count)
+        result.update(
+            {
+                "ade_6p4s_m": ade_6p4s,
+                "fde_6p4s_m": fde_6p4s,
+                "selection_ade_m": ade_6p4s,
+                "selection_fde_m": fde_6p4s,
+            }
+        )
+    return result
+
+
 def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
     import torch
     import torch.distributed as dist
@@ -457,9 +534,7 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
     base = _base_model(model)
     was_training = base.training
     base.eval()
-    ade_sum = 0.0
-    fde_sum = 0.0
-    sample_count = 0
+    values = torch.zeros(7, dtype=torch.float64, device=device)
     try:
         with torch.no_grad():
             for item in loader:
@@ -515,37 +590,16 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
                     raise ValueError(
                         "trajectory target shape differs from rollout"
                     )
-                complete = valid.all(dim=1)
-                if not bool(complete.any()):
-                    continue
-                errors = torch.linalg.vector_norm(
-                    predicted_xy - target_xy,
-                    dim=-1,
+                values += _trajectory_validation_batch_sums(
+                    predicted_xy,
+                    target_xy,
+                    valid,
                 )
-                ade_sum += float(
-                    errors[complete].mean(dim=1).sum().item()
-                )
-                fde_sum += float(errors[complete, -1].sum().item())
-                sample_count += int(complete.sum().item())
     finally:
         base.train(was_training)
 
-    values = torch.tensor(
-        [ade_sum, fde_sum, float(sample_count)],
-        dtype=torch.float64,
-        device=device,
-    )
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
-    global_count = int(values[2].item())
-    if global_count <= 0:
-        raise ValueError(
-            "Reactive distributed validation has no complete trajectories"
-        )
-    return {
-        "ade_6p4s_m": float(values[0].item() / global_count),
-        "fde_6p4s_m": float(values[1].item() / global_count),
-        "complete_samples": float(global_count),
-    }
+    return _finalize_trajectory_validation(values)
 
 
 def _load_resume_checkpoint(
@@ -579,9 +633,15 @@ def _load_resume_checkpoint(
     optimizer.load_state_dict(payload["optimizer_state_dict"])
     scheduler.load_state_dict(payload["scheduler_state_dict"])
     training_state = payload.get("training_state") or {}
+    best_selection_ade = training_state.get("best_selection_ade_m")
+    if best_selection_ade is None:
+        best_selection_ade = training_state.get(
+            "best_ade_6p4s_m",
+            float("inf"),
+        )
     return (
         int(payload["epoch"]) + 1,
-        float(training_state.get("best_ade_6p4s_m", float("inf"))),
+        float(best_selection_ade),
     )
 
 
@@ -725,11 +785,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "training_stage": stage.value,
     }
     start_epoch = 1
-    best_ade = float("inf")
+    best_selection_ade = float("inf")
     restored = train.get_checkpoint()
     if restored is not None:
         with restored.as_directory() as checkpoint_directory:
-            start_epoch, best_ade = _load_resume_checkpoint(
+            start_epoch, best_selection_ade = _load_resume_checkpoint(
                 checkpoint_directory,
                 model=model,
                 optimizer=optimizer,
@@ -805,7 +865,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             validation_loader,
             device=device,
         )
-        scheduler.step(validation["ade_6p4s_m"])
+        scheduler.step(validation["selection_ade_m"])
         maximum_delta = _maximum_parameter_delta(
             model,
             world_size=world_size,
@@ -833,8 +893,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "shards": [shard.identity for shard in rank_shards],
             },
         )
-        is_best = validation["ade_6p4s_m"] < best_ade
-        best_ade = min(best_ade, validation["ade_6p4s_m"])
+        is_best = validation["selection_ade_m"] < best_selection_ade
+        best_selection_ade = min(
+            best_selection_ade,
+            validation["selection_ade_m"],
+        )
         checkpoint_sha256: str | None = None
         with tempfile.TemporaryDirectory() as checkpoint_directory:
             checkpoint = None
@@ -856,7 +919,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                     metrics=validation,
                     training_state={
                         "assignment_sha256": assignment_sha256,
-                        "best_ade_6p4s_m": best_ade,
+                        "best_selection_ade_m": best_selection_ade,
                         "global_batch": global_batch,
                         "optimizer_steps_per_epoch": optimizer_steps,
                         "rank_evidence": rank_evidence,
@@ -890,13 +953,35 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 ],
                 "train_total": train_metrics["total"],
                 "train_trajectory": train_metrics["trajectory"],
-                "validation_ade_6p4s_m": validation["ade_6p4s_m"],
+                "validation_available_horizon_ade_m": validation[
+                    "available_horizon_ade_m"
+                ],
+                "validation_available_horizon_fde_m": validation[
+                    "available_horizon_fde_m"
+                ],
                 "validation_complete_samples": validation[
                     "complete_samples"
                 ],
-                "validation_fde_6p4s_m": validation["fde_6p4s_m"],
+                "validation_partial_horizon_fallback": validation[
+                    "partial_horizon_fallback"
+                ],
+                "validation_selection_ade_m": validation[
+                    "selection_ade_m"
+                ],
+                "validation_selection_fde_m": validation[
+                    "selection_fde_m"
+                ],
+                "validation_valid_points": validation["valid_points"],
+                "validation_valid_samples": validation["valid_samples"],
                 "world_size": world_size,
             }
+            if "ade_6p4s_m" in validation:
+                metrics["validation_ade_6p4s_m"] = validation[
+                    "ade_6p4s_m"
+                ]
+                metrics["validation_fde_6p4s_m"] = validation[
+                    "fde_6p4s_m"
+                ]
             train.report(metrics, checkpoint=checkpoint)
 
 
@@ -924,7 +1009,7 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
             failure_config=train.FailureConfig(max_failures=2),
             checkpoint_config=train.CheckpointConfig(
                 num_to_keep=3,
-                checkpoint_score_attribute="validation_ade_6p4s_m",
+                checkpoint_score_attribute="validation_selection_ade_m",
                 checkpoint_score_order="min",
             ),
         ),
