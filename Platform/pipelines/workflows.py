@@ -7069,17 +7069,17 @@ def pack_nuplan_reactive_dataset(
     container_image=DATA_PREP_IMAGE,
     pod_template=_data_prep_pod_template(),
     requests=Resources(
-        cpu="16",
-        mem="64Gi",
+        cpu="32",
+        mem="128Gi",
         ephemeral_storage="500Gi",
     ),
     limits=Resources(
-        cpu="16",
-        mem="64Gi",
+        cpu="32",
+        mem="128Gi",
         ephemeral_storage="500Gi",
     ),
     cache=True,
-    cache_version="nuplan-snapshot-pack-v1",
+    cache_version="nuplan-snapshot-pack-v2",
 )
 def pack_nuplan_snapshot_reactive_dataset(
     snapshot_manifest: FlyteFile,
@@ -7089,6 +7089,7 @@ def pack_nuplan_snapshot_reactive_dataset(
     image_size: int = 256,
     samples_per_shard: int = 1000,
     max_rejection_fraction: float = 0.0,
+    pack_workers: int = 8,
     aws_region: str = "us-west-2",
 ) -> FlyteDirectory:
     """Materialize an immutable raw snapshot and emit Reactive shards."""
@@ -7186,6 +7187,7 @@ def pack_nuplan_snapshot_reactive_dataset(
         image_size=image_size,
         samples_per_shard=samples_per_shard,
         max_rejection_fraction=max_rejection_fraction,
+        pack_workers=pack_workers,
     )
     packed.update({
         "raw_archive_ids": [
@@ -10663,6 +10665,7 @@ def wf_pack_nuplan_snapshot_reactive_dataset(
     image_size: int = 256,
     samples_per_shard: int = 1000,
     max_rejection_fraction: float = 0.0,
+    pack_workers: int = 8,
     aws_region: str = "us-west-2",
 ) -> FlyteDirectory:
     """Build Stage A shards directly from an immutable raw snapshot."""
@@ -10674,6 +10677,7 @@ def wf_pack_nuplan_snapshot_reactive_dataset(
         image_size=image_size,
         samples_per_shard=samples_per_shard,
         max_rejection_fraction=max_rejection_fraction,
+        pack_workers=pack_workers,
         aws_region=aws_region,
     )
 
