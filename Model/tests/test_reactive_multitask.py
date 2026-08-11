@@ -384,6 +384,28 @@ def test_perfect_multitask_predictions_approach_zero():
     assert xy_loss.item() == pytest.approx(0.0)
 
 
+def test_destination_focal_loss_is_resolution_invariant():
+    objective = RouteReconstructionLoss()
+    losses = []
+    for height, width in ((8, 8), (450, 300)):
+        logits = torch.zeros(1, 2, height, width)
+        target = torch.zeros_like(logits)
+        target[:, 1, height // 2, width // 2] = 1.0
+        losses.append(
+            objective(
+                logits,
+                target,
+                torch.tensor([[False, True]]),
+            )
+        )
+
+    assert losses[0].item() == pytest.approx(
+        losses[1].item(),
+        rel=1e-6,
+    )
+    assert losses[1].item() < 0.1
+
+
 def test_trajectory_loss_reaches_all_reactive_modules(
     build_mock_model,
     device,
