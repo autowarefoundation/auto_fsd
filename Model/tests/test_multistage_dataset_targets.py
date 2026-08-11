@@ -6,6 +6,7 @@ import ast
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import tarfile
 import types
@@ -32,6 +33,7 @@ import data_parsing.nuplan.targets as nuplan_targets
 from data_processing.reactive_training_artifacts import (
     decode_bev_segmentation,
     decode_trajectory_xy,
+    wgs84_future_to_ego_xy,
 )
 from navigation.artifacts import decode_array
 from navigation.geometry import NavigationRasterGeometry
@@ -268,6 +270,62 @@ def test_l2d_navigation_uses_only_route_waypoints(monkeypatch):
     assert targets.route_channel_valid.tolist() == [True, True]
     assert targets.route_target[1].max() == pytest.approx(1.0)
     assert targets.route_node_count == 10
+
+
+@pytest.mark.parametrize(
+    "heading_deg_cw_from_north",
+    [90.0, 180.0, 271.25],
+)
+def test_l2d_navigation_matches_trajectory_heading_convention(
+    heading_deg_cw_from_north: float,
+):
+    ego_lat = 52.0
+    ego_lon = 8.0
+    east_m = 10.0
+    north_m = 4.0
+    degrees_to_meters = 6_378_137.0 * math.pi / 180.0
+    target_lat = ego_lat + north_m / degrees_to_meters
+    target_lon = ego_lon + (
+        east_m
+        / (
+            math.cos(math.radians(ego_lat))
+            * degrees_to_meters
+        )
+    )
+    gps = np.repeat(
+        np.asarray([[target_lat, target_lon]], dtype=np.float64),
+        65,
+        axis=0,
+    )
+    gps[0] = (ego_lat, ego_lon)
+
+    trajectory_xy, trajectory_valid = wgs84_future_to_ego_xy(
+        gps,
+        current_latitude_deg=ego_lat,
+        current_longitude_deg=ego_lon,
+        heading_deg_cw_from_north=heading_deg_cw_from_north,
+    )
+    navigation_xy = l2d_navigation._ego_flu_from_lon_lat(
+        np.asarray([[target_lon, target_lat]], dtype=np.float64),
+        ego_lat=ego_lat,
+        ego_lon=ego_lon,
+        heading_deg_cw_from_north=heading_deg_cw_from_north,
+    )
+
+    assert trajectory_valid[0]
+    np.testing.assert_allclose(
+        navigation_xy[0],
+        trajectory_xy[0],
+        rtol=0.0,
+        atol=1e-4,
+    )
+    if heading_deg_cw_from_north == 90.0:
+        np.testing.assert_allclose(
+            navigation_xy[0],
+            np.asarray([east_m, north_m]),
+            rtol=0.0,
+            atol=1e-4,
+        )
 
 
 def test_l2d_spatial_index_matches_full_graph_rasterization():
