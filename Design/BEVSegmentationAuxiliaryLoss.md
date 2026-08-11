@@ -688,7 +688,19 @@ L_corridor = 0.5 * L_weighted_bce + 0.5 * L_dice
 ```
 
 The destination heatmap uses a focal heatmap loss to avoid domination by
-background pixels:
+background pixels. Positive and weighted-negative terms are normalized
+independently:
+
+```text
+L_destination_focal =
+    sum(L_positive) / max(N_positive, 1)
+  + sum(L_weighted_negative) / max(sum(W_negative), 1)
+```
+
+This class-balanced normalization is required because the route head predicts
+the full `450 x 300` raster. Normalizing both terms only by the positive count
+would make the negative term scale with raster area and would cause the L2D
+destination loss to dominate the trajectory and corridor terms.
 
 ```text
 L_route_reconstruction =
