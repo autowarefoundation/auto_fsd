@@ -463,7 +463,7 @@ def verify_reactive_canary_training(
             "train_route_reconstruction",
             "train_total",
             "train_trajectory",
-            "validation_ade_6p4s_m",
+            "validation_selection_ade_m",
         )
         for epoch in history:
             if any(
