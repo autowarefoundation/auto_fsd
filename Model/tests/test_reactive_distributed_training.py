@@ -25,6 +25,7 @@ from distributed_training.reactive_data import (
 from distributed_training.reactive_stage import (
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
+    reactive_worker_resources,
     validate_reactive_stage_config,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
@@ -289,6 +290,7 @@ def _stage_config(stage: str) -> dict[str, object]:
         "storage_path": "s3://checkpoints/ray-train",
         "val_fraction": 0.1,
         "weight_decay": 0.01,
+        "worker_cpus": 4,
     }
 
 
@@ -307,6 +309,16 @@ def test_validate_stage_config_rejects_parent_and_batch_contract_changes():
     stage_b["per_rank_batch_size"] = 2
     with pytest.raises(ValueError, match="per_rank_batch_size"):
         validate_reactive_stage_config(stage_b)
+
+
+def test_reactive_worker_resources_follow_the_pod_cpu_contract():
+    config = _stage_config("nuplan_full")
+    config["worker_cpus"] = 3
+    assert reactive_worker_resources(config) == {"CPU": 3, "GPU": 1}
+
+    config["worker_cpus"] = 0
+    with pytest.raises(ValueError, match="worker_cpus"):
+        validate_reactive_stage_config(config)
 
 
 @pytest.mark.parametrize(
