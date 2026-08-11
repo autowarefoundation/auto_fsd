@@ -270,6 +270,11 @@ def test_ray_tasks_serialize_the_resolved_storage_path():
     )
 
 
+def test_reactive_ray_actor_cpus_match_worker_pod_limits():
+    assert distributed_training._reactive_worker_cpus(2) == 3
+    assert distributed_training._reactive_worker_cpus(8) == 4
+
+
 def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
     stage_a, stage_b = (
         distributed_training.wf_train_reactive_nuplan_l2d_ray_8.nodes
