@@ -33,6 +33,12 @@ spec:
   subnetSelectorTerms:
     - tags:
         Name: auto-e2e-platform-private-us-west-2a
+    - tags:
+        Name: auto-e2e-platform-private-us-west-2b
+    - tags:
+        Name: auto-e2e-platform-private-us-west-2c
+    - tags:
+        Name: auto-e2e-platform-private-us-west-2d
   securityGroupSelectorTerms:
     - tags:
         aws:eks:cluster-name: auto-e2e-platform
