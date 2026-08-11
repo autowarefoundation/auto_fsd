@@ -28,6 +28,7 @@ from distributed_training.reactive_stage import (
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
     reactive_worker_resources,
+    select_best_ray_checkpoint,
     select_distributed_validation_groups,
     validate_reactive_stage_config,
 )
@@ -378,6 +379,68 @@ def test_ray_checkpoint_uri_rejects_paths_outside_storage():
             "other-bucket/ray-train/run/checkpoint_0001",
             "s3://checkpoints/ray-train",
         )
+
+
+class _FakeCheckpoint:
+    def __init__(self, path: str):
+        self.path = path
+
+
+class _FakeRayResult:
+    def __init__(self, best_checkpoints):
+        self.best_checkpoints = best_checkpoints
+
+    def get_best_checkpoint(self, *, metric: str, mode: str):
+        assert mode == "min"
+        return min(
+            self.best_checkpoints,
+            key=lambda item: float(item[1][metric]),
+        )[0]
+
+
+def test_select_best_ray_checkpoint_returns_matching_epoch_metrics():
+    latest = _FakeCheckpoint("s3://checkpoints/run/checkpoint-epoch-4")
+    best = _FakeCheckpoint("s3://checkpoints/run/checkpoint-epoch-3/")
+    result = _FakeRayResult([
+        (
+            latest,
+            {
+                "checkpoint_sha256": "4" * 64,
+                "epoch": 4,
+                "validation_selection_ade_m": 29.87,
+            },
+        ),
+        (
+            best,
+            {
+                "checkpoint_sha256": "3" * 64,
+                "epoch": 3,
+                "validation_selection_ade_m": 29.74,
+            },
+        ),
+    ])
+
+    checkpoint, metrics = select_best_ray_checkpoint(result)
+
+    assert checkpoint is best
+    assert metrics["epoch"] == 3
+    assert metrics["checkpoint_sha256"] == "3" * 64
+
+
+def test_select_best_ray_checkpoint_rejects_missing_scored_metrics():
+    best = _FakeCheckpoint("s3://checkpoints/run/checkpoint-epoch-3")
+    result = _FakeRayResult([
+        (
+            best,
+            {
+                "checkpoint_sha256": "invalid",
+                "validation_selection_ade_m": 29.74,
+            },
+        )
+    ])
+
+    with pytest.raises(RuntimeError, match="checkpoint_sha256"):
+        select_best_ray_checkpoint(result)
 
 
 def test_rank_owned_nodesplitter_preserves_every_assigned_shard():
