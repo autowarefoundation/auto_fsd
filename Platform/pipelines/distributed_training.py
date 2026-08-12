@@ -270,6 +270,13 @@ RAY_4 = _ray_job_config(
     4,
     worker_workload_type="gpu-training",
 )
+RAY_REACTIVE_4 = _ray_job_config(
+    4,
+    worker_workload_type="gpu-performance",
+    worker_cpu="3",
+    worker_memory="12Gi",
+    worker_shm_size="4Gi",
+)
 RAY_8 = _ray_job_config(
     8,
     worker_workload_type="gpu-training",
@@ -327,7 +334,7 @@ def _flyte_remote_uri(value: FlyteDirectory | FlyteFile) -> str:
 
 def _reactive_worker_cpus(num_workers: int) -> int:
     """Match Ray actors to the corresponding worker pod CPU limit."""
-    return 3 if num_workers == 2 else 4
+    return 3 if num_workers in {2, 4} else 4
 
 
 def _run_reactive_stage_task(
@@ -595,6 +602,68 @@ def train_reactive_stage_ray_2(
 
 
 @task(
+    task_config=RAY_REACTIVE_4,
+    container_image=TRAINING_IMAGE,
+    retries=1,
+    labels={
+        "kueue.x-k8s.io/queue-name": "gpu-performance",
+        "kueue.x-k8s.io/priority-class": "research-low",
+    },
+    environment=RAY_TASK_ENVIRONMENT,
+)
+def train_reactive_stage_ray_4(
+    shards: List[FlyteDirectory],
+    stage: str,
+    parent_checkpoint: Optional[FlyteFile] = None,
+    backbone: str = "swin_v2_tiny",
+    epochs: int = 30,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-2,
+    grad_clip: float = 1.0,
+    val_fraction: float = 0.2,
+    num_loader_workers: int = 2,
+    training_seed: int = 149,
+    precision: str = "bf16",
+    gradient_accumulation_steps: int = 1,
+    steps_per_epoch: int = 0,
+    shuffle_buffer: int = 1000,
+    is_pretrained: bool = True,
+    bev_weight: float = 1.0,
+    route_weight: float = 1.0,
+    bev_pos_weights: Optional[List[float]] = None,
+    corridor_pos_weight: float = 1.0,
+) -> ReactiveRayOutput:
+    """Run a four-rank Reactive performance training stage."""
+    return _run_reactive_stage_task(
+        shards=shards,
+        stage=stage,
+        num_workers=4,
+        parent_checkpoint=parent_checkpoint,
+        backbone=backbone,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
+        val_fraction=val_fraction,
+        num_loader_workers=num_loader_workers,
+        training_seed=training_seed,
+        precision=precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        steps_per_epoch=steps_per_epoch,
+        shuffle_buffer=shuffle_buffer,
+        is_pretrained=is_pretrained,
+        bev_weight=bev_weight,
+        route_weight=route_weight,
+        bev_pos_weights=(
+            bev_pos_weights
+            if bev_pos_weights is not None
+            else [1.0] * 8
+        ),
+        corridor_pos_weight=corridor_pos_weight,
+    )
+
+
+@task(
     task_config=RAY_8,
     container_image=TRAINING_IMAGE,
     retries=1,
@@ -659,6 +728,37 @@ def train_reactive_stage_ray_8(
 @workflow
 def wf_ray_ddp_smoke_4(steps: int = 4) -> FlyteFile:
     return ray_ddp_smoke_4(steps=steps).report
+
+
+@workflow
+def wf_train_reactive_nuplan_ray_4(
+    nuplan_shards: List[FlyteDirectory],
+    epochs: int = 30,
+    learning_rate: float = 1e-4,
+    val_fraction: float = 0.2,
+    num_loader_workers: int = 2,
+    training_seed: int = 149,
+    precision: str = "bf16",
+    bev_weight: float = 1.0,
+    route_weight: float = 1.0,
+) -> ReactiveRayOutput:
+    """Train the four-rank nuPlan Stage A performance model."""
+    return train_reactive_stage_ray_4(
+        shards=nuplan_shards,
+        stage="nuplan_full",
+        parent_checkpoint=None,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        val_fraction=val_fraction,
+        num_loader_workers=num_loader_workers,
+        training_seed=training_seed,
+        precision=precision,
+        steps_per_epoch=0,
+        shuffle_buffer=1000,
+        is_pretrained=True,
+        bev_weight=bev_weight,
+        route_weight=route_weight,
+    )
 
 
 @workflow
