@@ -32,6 +32,18 @@ spec:
       effect: NoSchedule
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: gpu-performance-flavor
+spec:
+  nodeLabels:
+    workload-type: gpu-performance
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: WorkloadPriorityClass
 metadata:
   name: research-low
@@ -110,6 +122,36 @@ spec:
     reclaimWithinCohort: Never
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: gpu-performance-queue
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: auto-e2e-development
+  resourceGroups:
+    - coveredResources:
+        - cpu
+        - memory
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: cpu
+              nominalQuota: "24"
+            - name: memory
+              nominalQuota: 96Gi
+    - coveredResources:
+        - nvidia.com/gpu
+      flavors:
+        - name: gpu-performance-flavor
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: "4"
+  preemption:
+    withinClusterQueue: Never
+    reclaimWithinCohort: Never
+---
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: training
@@ -126,6 +168,14 @@ metadata:
   namespace: auto-e2e-development
 spec:
   clusterQueue: gpu-canary-queue
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: gpu-performance
+  namespace: auto-e2e-development
+spec:
+  clusterQueue: gpu-performance-queue
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
