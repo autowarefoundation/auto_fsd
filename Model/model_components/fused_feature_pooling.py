@@ -26,7 +26,7 @@ class FusedFeaturePooling(nn.Module):
         # Reduce fused BEV features to [batch, 1, 75, 50]
         features_channel_compressed = self.reduce_channels(fused_features)
         features_bev_compressed = self.reduce_bev(features_channel_compressed)
-        print(features_bev_compressed.shape)
+  
         # Flatten reduced BEV features to a vector of dim [batch x 3750]
         reduced_features = torch.flatten(features_bev_compressed, start_dim=1)
 
