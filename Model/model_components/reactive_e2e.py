@@ -228,6 +228,9 @@ class ReactiveE2E(nn.Module):
         # --- Fuse image BEV + navigation BEV ---
         fused_features = self.MapBEVFusion(image_bev, navigation_bev)
 
+        # --- Reduce fused image/map BEV features into a single feature vector ---
+        feature_vector = self.FusedFeaturePooling(fused_features)
+
         # --- Temporal Memory ---
         visual_ctx, ego_ctx = self.TemporalMemory(visual_history, egomotion_history)
 
@@ -247,7 +250,7 @@ class ReactiveE2E(nn.Module):
 
         # --- Trajectory Prediction ---
         trajectory = self.TrajectoryPlanner(
-            fused_features, visual_ctx, ego_ctx,
+            feature_vector, visual_ctx, ego_ctx,
             reasoning_latent=reasoning_latent,
             reasoning_horizon_tokens=reasoning_horizon_tokens,
             **kwargs,
