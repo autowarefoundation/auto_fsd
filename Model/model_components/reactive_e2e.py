@@ -109,7 +109,6 @@ class ReactiveE2E(nn.Module):
         self.TrajectoryPlanner = build_planner(
             planner_mode,
             embed_dim=embed_dim,
-            feature_dim = feature_dim,
             num_timesteps=num_timesteps,
             num_signals=num_signals,
             egomotion_dim=egomotion_dim,
