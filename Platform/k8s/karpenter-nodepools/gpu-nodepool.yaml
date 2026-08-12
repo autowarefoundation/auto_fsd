@@ -50,6 +50,86 @@ spec:
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
+  name: gpu-performance-reserved
+spec:
+  weight: 100
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        workload-type: gpu-performance
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: auto-e2e-gpu-performance-reserved
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["g6.2xlarge"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["reserved"]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-west-2a"]
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+  limits:
+    cpu: "16"
+    memory: 128Gi
+    nodes: "2"
+    nvidia.com/gpu: "2"
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-performance-ondemand
+spec:
+  weight: 10
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        workload-type: gpu-performance
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: auto-e2e-gpu-performance-ondemand
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["g6.2xlarge"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-west-2a"]
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+  limits:
+    cpu: "16"
+    memory: 128Gi
+    nodes: "2"
+    nvidia.com/gpu: "2"
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
   name: gpu-training
 spec:
   template:
