@@ -34,6 +34,22 @@ class AutoE2E(nn.Module):
                  reasoning_kwargs: Optional[Dict[str, Any]] = None):
         super(AutoE2E, self).__init__()
 
+        # Normalization of the egomotion history vector
+      
+        def normalize_egomotion(egomotion_history):
+            for i in range(0, len(egomotion_history[0]), 4):
+                # speed normalized equals raw speed in m/s divided by 33
+                # corresponding to a max speed of 74 mph
+                egomotion_history[0][i] = egomotion_history[0][i]/33
+      
+                # acceleration normalized equals raw acceleration in 
+                # ms/2 divided by 8, since that equates to harsh
+                # emergency braking maneouvre
+                egomotion_history[0][i+1] = egomotion_history[0][i+1]/8
+
+        self.normalize_egomotion = normalize_egomotion
+
+
         # Reactive model which runs at 10Hz and processes multi-camera inputs
         # a rendered map image and egomotion history to predict a driving trajectory
         # to reach the near-horizon navigational goal.
@@ -166,6 +182,12 @@ class AutoE2E(nn.Module):
                 f"absorb the argument silently and the model would run on "
                 f"geometry_type='pseudo' — a learned spatial prior, not your calibration."
             )
+
+        # Normalization function for egomotion_history
+        # scales the raw speed and acceleration values to a sensible range
+        # for the model
+        self.normalize_egomotion(egomotion_history)
+
 
         # World Action Model (1 Hz): produce the Encoded Visual History fed to the
         # reactive planner + reasoning branch, and (in training) the predicted
