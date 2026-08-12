@@ -41,7 +41,10 @@ class ReactiveE2E(nn.Module):
 
         # Pooling and reduction of the fused image/map BEV features to a unified
         # feature vector which can be consumed by the trajectory planner
-        self.FusedFeaturePooling = FusedFeaturePooling(embed_dim=embed_dim, feature_dim=feature_dim)
+        self.FusedFeaturePooling = FusedFeaturePooling(
+            embed_dim=embed_dim, 
+            feature_dim=feature_dim
+        )
 
         # For BEV fusion mode the spatial size is bev_h × bev_w (potentially non-square).
         # Read each dim with a default so a PARTIAL view_fusion_kwargs (e.g. only
