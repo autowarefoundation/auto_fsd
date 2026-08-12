@@ -27,7 +27,7 @@ class BezierPlanner(BasePlanner):
 
     """
 
-    def __init__(self, embed_dim=256, num_timesteps=64, num_signals=2,
+    def __init__(self, feature_dim = 3750, embed_dim=256, num_timesteps=64, num_signals=2,
                  num_controls=5, egomotion_dim=256, visual_history_dim=896,
                  reasoning_mode="none"):
         super().__init__()
