@@ -73,6 +73,7 @@ def test_reviewed_ray_topologies_have_fixed_worker_groups():
     for config in (
         distributed_training.RAY_2,
         distributed_training.RAY_4,
+        distributed_training.RAY_REACTIVE_4,
         distributed_training.RAY_8,
     ):
         workers = config.worker_node_config[0]
@@ -145,11 +146,37 @@ def test_two_rank_canary_targets_dedicated_gpu_placement_pool():
         }
         assert worker_spec.volumes[0].empty_dir.size_limit == "8Gi"
 
+    performance_spec = (
+        distributed_training.RAY_REACTIVE_4.worker_node_config[0]
+        .pod_template.pod_spec
+    )
+    assert performance_spec.node_selector == {
+        "workload-type": "gpu-performance"
+    }
+    performance_container = performance_spec.containers[0]
+    assert performance_container.resources.requests == {
+        "cpu": "3",
+        "memory": "12Gi",
+        "nvidia.com/gpu": "1",
+    }
+    assert performance_spec.volumes[0].empty_dir.size_limit == "4Gi"
+    assert (
+        distributed_training.RAY_REACTIVE_4.worker_node_config[0]
+        .ray_start_params["num-cpus"]
+        == "3"
+    )
+
     assert (
         distributed_training.train_reactive_stage_ray_2.metadata.labels[
             "kueue.x-k8s.io/queue-name"
         ]
         == "gpu-canary"
+    )
+    assert (
+        distributed_training.train_reactive_stage_ray_4.metadata.labels[
+            "kueue.x-k8s.io/queue-name"
+        ]
+        == "gpu-performance"
     )
     assert (
         distributed_training.train_reactive_stage_ray_8.metadata.labels[
@@ -238,6 +265,79 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
         "us-west-2d",
     ]
 
+    performance_classes = {
+        "auto-e2e-gpu-performance-reserved",
+        "auto-e2e-gpu-performance-ondemand",
+    }
+    assert performance_classes.issubset(node_classes)
+    for name in performance_classes:
+        spec = node_classes[name]["spec"]
+        assert spec["placementGroupSelector"] == {
+            "name": "auto-e2e-distributed-training-pg"
+        }
+        assert spec["subnetSelectorTerms"] == [
+            {
+                "tags": {
+                    "Name": "auto-e2e-platform-private-us-west-2a"
+                }
+            }
+        ]
+    reserved_class = node_classes[
+        "auto-e2e-gpu-performance-reserved"
+    ]["spec"]
+    assert reserved_class["capacityReservationSelectorTerms"] == [
+        {
+            "ownerID": "REPLACE_WITH_AWS_ACCOUNT_ID",
+            "tags": {"Name": "auto-e2e-gpu-canary"},
+        }
+    ]
+    assert "capacityReservationSelectorTerms" not in node_classes[
+        "auto-e2e-gpu-performance-ondemand"
+    ]["spec"]
+
+    performance_pools = {
+        name: node_pools[name]["spec"]
+        for name in (
+            "gpu-performance-reserved",
+            "gpu-performance-ondemand",
+        )
+    }
+    for spec in performance_pools.values():
+        assert spec["limits"] == {
+            "cpu": "16",
+            "memory": "128Gi",
+            "nodes": "2",
+            "nvidia.com/gpu": "2",
+        }
+        requirements = {
+            item["key"]: item["values"]
+            for item in spec["template"]["spec"]["requirements"]
+        }
+        assert requirements["node.kubernetes.io/instance-type"] == [
+            "g6.2xlarge"
+        ]
+        assert requirements["topology.kubernetes.io/zone"] == [
+            "us-west-2a"
+        ]
+    assert performance_pools["gpu-performance-reserved"][
+        "weight"
+    ] == 100
+    assert performance_pools["gpu-performance-ondemand"][
+        "weight"
+    ] == 10
+    assert {
+        item["key"]: item["values"]
+        for item in performance_pools["gpu-performance-reserved"][
+            "template"
+        ]["spec"]["requirements"]
+    }["karpenter.sh/capacity-type"] == ["reserved"]
+    assert {
+        item["key"]: item["values"]
+        for item in performance_pools["gpu-performance-ondemand"][
+            "template"
+        ]["spec"]["requirements"]
+    }["karpenter.sh/capacity-type"] == ["on-demand"]
+
 
 def test_gpu_canary_has_an_isolated_kueue_flavor_and_quota():
     platform_root = Path(distributed_training.__file__).parents[1]
@@ -283,6 +383,38 @@ def test_gpu_canary_has_an_isolated_kueue_flavor_and_quota():
     )
     assert local_queue["spec"]["clusterQueue"] == "gpu-canary-queue"
 
+    performance_flavor = by_kind_and_name[
+        ("ResourceFlavor", "gpu-performance-flavor")
+    ]["spec"]
+    assert performance_flavor["nodeLabels"] == {
+        "workload-type": "gpu-performance"
+    }
+    performance_queue = by_kind_and_name[
+        ("ClusterQueue", "gpu-performance-queue")
+    ]["spec"]
+    performance_gpu_group = next(
+        group
+        for group in performance_queue["resourceGroups"]
+        if group["coveredResources"] == ["nvidia.com/gpu"]
+    )
+    assert performance_gpu_group["flavors"] == [
+        {
+            "name": "gpu-performance-flavor",
+            "resources": [
+                {"name": "nvidia.com/gpu", "nominalQuota": "4"}
+            ],
+        }
+    ]
+    performance_local_queue = by_kind_and_name[
+        ("LocalQueue", "gpu-performance")
+    ]
+    assert performance_local_queue["metadata"]["namespace"] == (
+        "auto-e2e-development"
+    )
+    assert performance_local_queue["spec"]["clusterQueue"] == (
+        "gpu-performance-queue"
+    )
+
 
 def test_ray_tasks_serialize_the_resolved_storage_path():
     expected_environment = {
@@ -299,6 +431,9 @@ def test_ray_tasks_serialize_the_resolved_storage_path():
     assert distributed_training.train_reactive_stage_ray_2.environment == (
         expected_environment
     )
+    assert distributed_training.train_reactive_stage_ray_4.environment == (
+        expected_environment
+    )
     assert distributed_training.train_reactive_stage_ray_8.environment == (
         expected_environment
     )
@@ -306,7 +441,25 @@ def test_ray_tasks_serialize_the_resolved_storage_path():
 
 def test_reactive_ray_actor_cpus_match_worker_pod_limits():
     assert distributed_training._reactive_worker_cpus(2) == 3
+    assert distributed_training._reactive_worker_cpus(4) == 3
     assert distributed_training._reactive_worker_cpus(8) == 4
+
+
+def test_four_rank_performance_workflow_uses_full_stage_defaults():
+    node, = distributed_training.wf_train_reactive_nuplan_ray_4.nodes
+    assert node.flyte_entity.name.endswith(
+        "train_reactive_stage_ray_4"
+    )
+    bindings = {
+        binding.var: binding.binding
+        for binding in node.bindings
+    }
+    assert bindings["stage"].scalar.primitive.string_value == (
+        "nuplan_full"
+    )
+    assert bindings["epochs"].promise.var == "epochs"
+    assert bindings["val_fraction"].promise.var == "val_fraction"
+    assert bindings["precision"].promise.var == "precision"
 
 
 def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
