@@ -13,7 +13,7 @@ class ReactiveE2E(nn.Module):
     def __init__(self, backbone="swin_v2_tiny", num_views=7, embed_dim=256,
                  is_pretrained=True,
                  image_feature_size=8, view_fusion_kwargs=None,
-                 num_timesteps=64, num_signals=2, feature_dim = 3750,
+                 num_timesteps=64, num_signals=2, 
                  egomotion_dim=256,
                  visual_history_dim=896,
                  map_type="rasterized", map_context_channels=3,
@@ -42,8 +42,7 @@ class ReactiveE2E(nn.Module):
         # Pooling and reduction of the fused image/map BEV features to a unified
         # feature vector which can be consumed by the trajectory planner
         self.FusedFeaturePooling = FusedFeaturePooling(
-            embed_dim=embed_dim, 
-            feature_dim=feature_dim
+            embed_dim=embed_dim
         )
 
         # For BEV fusion mode the spatial size is bev_h × bev_w (potentially non-square).
