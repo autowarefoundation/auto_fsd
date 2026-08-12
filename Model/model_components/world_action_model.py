@@ -240,21 +240,52 @@ class FutureFeatureMapPredictor(nn.Module):
     Lightweight decoder: a shared linear seed -> ``[B, mid, hw, hw]`` followed by
     one 1x1 conv head per future step (keeps params modest vs a direct
     ``history_dim -> C*hw*hw`` linear).
+
+    Optional ``action_dim`` (#110 follow-up / action-sensitive JEPA): when set,
+    an action vector is projected into the same seed space and **added** as a
+    residual (Delta-JEPA style). The action projection is zero-initialised so
+    at init the predictor is byte-identical to the history-only path regardless
+    of the action values — same containment idea as the reasoning coupling gate.
     """
 
     def __init__(self, in_dim: int, channels: int, feature_hw: int,
-                 num_future_steps: int, mid: int = 128):
+                 num_future_steps: int, mid: int = 128,
+                 action_dim: int | None = None):
         super().__init__()
         self.channels, self.feature_hw, self.mid = channels, feature_hw, mid
         self.num_future_steps = num_future_steps
+        self.action_dim = action_dim
         self.seed = nn.Linear(in_dim, mid * feature_hw * feature_hw)
         self.act = nn.GELU()
         self.heads = nn.ModuleList(
             [nn.Conv2d(mid, channels, kernel_size=1) for _ in range(num_future_steps)])
+        if action_dim is not None:
+            if action_dim < 1:
+                raise ValueError(f"action_dim must be >= 1, got {action_dim}")
+            self.action_proj = nn.Linear(action_dim, mid * feature_hw * feature_hw)
+            # Zero-init → history-only behaviour at init (action residual is a no-op).
+            nn.init.zeros_(self.action_proj.weight)
+            nn.init.zeros_(self.action_proj.bias)
 
-    def forward(self, visual_history: torch.Tensor) -> list:
+    def forward(self, visual_history: torch.Tensor,
+                actions: torch.Tensor | None = None) -> list:
+        """Args:
+            visual_history: ``[B, in_dim]``
+            actions: optional ``[B, action_dim]`` or ``[B, T, action_dim]``
+                (mean-pooled over time). Ignored when ``action_dim`` is None.
+        """
         B = visual_history.shape[0]
         seed = self.act(self.seed(visual_history))
+        if self.action_dim is not None and actions is not None:
+            a = actions
+            if a.dim() == 3:
+                a = a.mean(dim=1)
+            if a.dim() != 2 or a.shape[-1] != self.action_dim:
+                raise ValueError(
+                    f"actions must be [B, {self.action_dim}] or "
+                    f"[B, T, {self.action_dim}]; got {tuple(a.shape)}"
+                )
+            seed = seed + self.action_proj(a)
         seed = seed.reshape(B, self.mid, self.feature_hw, self.feature_hw)
         return [head(seed) for head in self.heads]   # N x [B, C, hw, hw]
 
@@ -276,7 +307,8 @@ class WorldActionModel(nn.Module):
                  frame_embed_dim: int = 224, history_len: int = 4,
                  num_future_steps: Optional[int] = None, loss_type: str = "l1",
                  history_aggregator: str = "concat", feature_hw: int = 8,
-                 view_aggregator: str = "attention", num_views: int = 7):
+                 view_aggregator: str = "attention", num_views: int = 7,
+                 action_dim: Optional[int] = None):
         super().__init__()
         if history_aggregator not in ("concat", "attention"):
             raise ValueError(
@@ -291,6 +323,7 @@ class WorldActionModel(nn.Module):
         self.frame_embed_dim = frame_embed_dim
         self.feature_channels = feature_channels
         self.feature_hw = feature_hw
+        self.action_dim = action_dim
         self.visual_history_dim = history_len * frame_embed_dim  # 4*224 = 896
 
         # History aggregator: how the FIFO of frame embeddings becomes the
@@ -311,9 +344,11 @@ class WorldActionModel(nn.Module):
         # future backbone feature maps [B, C, hw, hw], not a pooled vector.
         self.target = JepaTargetEncoder(
             BackboneFeatureMap(backbone, feature_hw), mode="frozen")
-        # Future feature-map predictor: visual_history -> N x [B, C, hw, hw].
+        # Future feature-map predictor: visual_history (+ optional actions) ->
+        # N x [B, C, hw, hw]. action_dim enables Delta-JEPA style conditioning.
         self.future_predictor = FutureFeatureMapPredictor(
-            self.visual_history_dim, feature_channels, feature_hw, num_future_steps)
+            self.visual_history_dim, feature_channels, feature_hw, num_future_steps,
+            action_dim=action_dim)
         self.recon_loss = FeatureReconstructionLoss(
             num_future_steps=num_future_steps, loss_type=loss_type)
 
@@ -334,13 +369,22 @@ class WorldActionModel(nn.Module):
             return history_concat
         return self.history_pool(history_concat)
 
-    def predict_future(self, visual_history: torch.Tensor) -> list:
-        """``visual_history [B, visual_history_dim]`` -> list of ``num_future_steps``
-        predicted future backbone **feature maps** ``[B, feature_channels, hw, hw]``."""
-        return self.future_predictor(visual_history)
+    def predict_future(self, visual_history: torch.Tensor,
+                       actions: torch.Tensor | None = None) -> list:
+        """``visual_history [B, visual_history_dim]`` (+ optional actions) -> list of
+        ``num_future_steps`` predicted future backbone **feature maps**
+        ``[B, feature_channels, hw, hw]``.
+
+        When ``action_dim`` was set at construction, pass ``actions`` as
+        ``[B, action_dim]`` (or ``[B, T, action_dim]``) to condition the forecast.
+        At init the action residual is a no-op, so omitting actions (or passing
+        anything) matches the history-only path until the projection learns.
+        """
+        return self.future_predictor(visual_history, actions=actions)
 
     def forward(self, frame: torch.Tensor,
-                visual_history: torch.Tensor | None = None):
+                visual_history: torch.Tensor | None = None,
+                actions: torch.Tensor | None = None):
         """Per-tick (online) call, matching the AutoE2E wiring agreed 24/06:
 
             visual_embedding, future_state_pred = WorldActionModel(frame, visual_history)
@@ -351,6 +395,8 @@ class WorldActionModel(nn.Module):
             visual_history: ``[B, history_len*frame_embed_dim]`` current circular
                 buffer (the Encoded Visual History) used to predict the future;
                 ``None`` at the very first ticks / pure inference.
+            actions: optional action vector for Delta-JEPA conditioning (only
+                used when ``action_dim`` was set at construction).
 
         Returns:
             ``(visual_embedding, future_state_pred)`` where
@@ -364,8 +410,10 @@ class WorldActionModel(nn.Module):
               the model, in the training loop).
         """
         visual_embedding = self.encoder(frame)
-        future_state_pred = (self.predict_future(visual_history)
-                             if visual_history is not None else None)
+        future_state_pred = (
+            self.predict_future(visual_history, actions=actions)
+            if visual_history is not None else None
+        )
         return visual_embedding, future_state_pred
 
     def jepa_loss(self, future_state_pred: list,

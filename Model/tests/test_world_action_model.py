@@ -324,3 +324,41 @@ class TestAutoE2EWorldModelAttentionPool:
         out = m(cam, mp, vh, ego, mode="train", trajectory_target=torch.randn(2, 128, device=device))
         assert isinstance(out, tuple) and len(out) == 2
         assert out[1]["future_state_pred"] is not None and len(out[1]["future_state_pred"]) == 4
+
+
+def test_action_residual_noop_at_init(device):
+    """Zero-init action path: any action matches history-only prediction at init."""
+    m = _wam(device, action_dim=2)
+    vh = torch.randn(2, 896, device=device)
+    a0 = torch.zeros(2, 2, device=device)
+    a1 = torch.randn(2, 2, device=device)
+    with torch.no_grad():
+        base = m.predict_future(vh)
+        with_zero = m.predict_future(vh, actions=a0)
+        with_rand = m.predict_future(vh, actions=a1)
+    for b, z, r in zip(base, with_zero, with_rand):
+        assert torch.allclose(b, z, atol=1e-6)
+        assert torch.allclose(b, r, atol=1e-6)
+
+
+def test_action_residual_becomes_sensitive_after_open(device):
+    """After the action projection leaves zero, different actions diverge."""
+    torch.manual_seed(0)
+    m = _wam(device, action_dim=2).eval()
+    vh = torch.randn(2, 896, device=device)
+    a_brake = torch.tensor([[-2.0, 0.0], [-2.0, 0.0]], device=device)
+    a_accel = torch.tensor([[2.0, 0.0], [2.0, 0.0]], device=device)
+    with torch.no_grad():
+        m.future_predictor.action_proj.weight.normal_()
+        m.future_predictor.action_proj.bias.normal_()
+        pred_brake = m.predict_future(vh, actions=a_brake)
+        pred_accel = m.predict_future(vh, actions=a_accel)
+    assert not all(
+        torch.allclose(b, a, atol=1e-5) for b, a in zip(pred_brake, pred_accel)
+    )
+
+
+def test_default_world_model_has_no_action_dim(device):
+    m = _wam(device)
+    assert m.action_dim is None
+    assert not hasattr(m.future_predictor, "action_proj")
