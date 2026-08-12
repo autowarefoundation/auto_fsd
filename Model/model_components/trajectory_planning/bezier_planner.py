@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .base import BasePlanner
-#from .reasoning_coupling import ReasoningCoupling
+from .reasoning_coupling import ReasoningCoupling
 
 
 class BezierPlanner(BasePlanner):
@@ -47,7 +47,12 @@ class BezierPlanner(BasePlanner):
         self.num_controls = num_controls
         self.egomotion_dim = egomotion_dim
         self.visual_history_dim = visual_history_dim
-        combined_feature_dim = feature_dim + egomotion_dim + visual_history_dim
+        self.combined_feature_dim = feature_dim + egomotion_dim + visual_history_dim
+        self.reduced_combined_feature_dim = int(self.combined_feature_dim/2)
+
+        # Context aggregation: ego state + visual history + global BEV summary.
+        self.visual_history_proj = nn.Linear(visual_history_dim, visual_history_dim)
+
 
 
         # Zero-init the visual-history projection so the World-Model-derived
@@ -63,17 +68,17 @@ class BezierPlanner(BasePlanner):
         nn.init.zeros_(self.visual_history_proj.weight)
         nn.init.zeros_(self.visual_history_proj.bias)
         self.context_mlp = nn.Sequential(
-            nn.Linear(combined_feature_dim, combined_feature_dim/2),
+            nn.Linear(self.combined_feature_dim, self.reduced_combined_feature_dim),
             nn.GELU(),
-            nn.Linear(combined_feature_dim/2, combined_feature_dim/2),
+            nn.Linear(self.reduced_combined_feature_dim, self.reduced_combined_feature_dim),
         )
 
         # Reasoning coupling (zero-init; no-op at init). Injects the reasoning
         # branch into the planner context before the control head.
-        #self.reasoning_coupling = ReasoningCoupling(embed_dim, mode=reasoning_mode)
+        self.reasoning_coupling = ReasoningCoupling(embed_dim, mode=reasoning_mode)
 
         # Predict (num_controls x num_signals) Bezier control points.
-        self.control_head = nn.Linear(combined_feature_dim/2, num_controls * num_signals)
+        self.control_head = nn.Linear(self.reduced_combined_feature_dim, num_controls * num_signals)
 
 
         # Fixed Bernstein basis [num_timesteps, num_controls] (no scipy).
@@ -131,15 +136,18 @@ class BezierPlanner(BasePlanner):
 
         B = bev_features.shape[0]
 
-        context = torch.cat((bev_features, egomotion_history, visual_history), dim=0)
+        context = torch.cat((
+            bev_features, 
+            egomotion_history, 
+            visual_history), dim=1)
         
         # Zero-init reasoning residual (no-op at init; see ReasoningCoupling).
-        #context = self.reasoning_coupling(
-        #    context,
-        #    reasoning_latent=reasoning_latent,
-        #    horizon_tokens=reasoning_horizon_tokens,
-        #)
-        
+        context = self.reasoning_coupling(
+            context,
+            reasoning_latent=reasoning_latent,
+            horizon_tokens=reasoning_horizon_tokens,
+        )
+
         bezier_feature = self.context_mlp(context)                          # [B, C]
 
         control_points = self.control_head(bezier_feature).view(
