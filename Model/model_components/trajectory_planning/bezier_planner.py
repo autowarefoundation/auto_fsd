@@ -27,7 +27,7 @@ class BezierPlanner(BasePlanner):
 
     """
 
-    def __init__(self, feature_dim = 3750, embed_dim=256, num_timesteps=64, num_signals=2,
+    def __init__(self, feature_dim = 3750, num_timesteps=64, num_signals=2,
                  num_controls=5, egomotion_dim=256, visual_history_dim=896,
                  reasoning_mode="none"):
         super().__init__()
@@ -41,17 +41,13 @@ class BezierPlanner(BasePlanner):
                 f"num_controls ({num_controls}) cannot exceed num_timesteps "
                 f"({num_timesteps})."
             )
-        self.embed_dim = embed_dim
+      
         self.num_timesteps = num_timesteps
         self.num_signals = num_signals
         self.num_controls = num_controls
         self.egomotion_dim = egomotion_dim
         self.visual_history_dim = visual_history_dim
 
-        # Context aggregation: ego state + visual history + global BEV summary.
-        self.ego_state_proj = nn.Linear(egomotion_dim, embed_dim)
-        self.visual_history_proj = nn.Linear(visual_history_dim, embed_dim)
-        self.bev_proj = nn.Linear(embed_dim, embed_dim)
         # Zero-init the visual-history projection so the World-Model-derived
         # visual_history starts as a STRICT no-op and the planner learns to open
         # it only as the WM matures — mirroring the reasoning branch's zero-init
@@ -65,9 +61,9 @@ class BezierPlanner(BasePlanner):
         nn.init.zeros_(self.visual_history_proj.weight)
         nn.init.zeros_(self.visual_history_proj.bias)
         self.context_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(visual_history_dim, visual_history_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(visual_history_dim, visual_history_dim),
         )
 
         # Reasoning coupling (zero-init; no-op at init). Injects the reasoning
