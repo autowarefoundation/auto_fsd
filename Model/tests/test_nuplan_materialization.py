@@ -186,6 +186,42 @@ def test_selected_archives_must_include_all_components(tmp_path):
         select_snapshot_archives(manifest, ["missing"])
 
 
+def test_manifest_inventory_may_include_unselected_non_zip_files(tmp_path):
+    manifest, _ = _snapshot(tmp_path)
+    inventory = {
+        "archive_id": "sensor-mini-inventory",
+        "component": "sensor_blobs",
+        "extract_to": "nuplan-v1.1/sensor_blobs",
+        "filename": "nuplan_mini_sensor.txt",
+        "md5": "",
+        "object_uri": "s3://datasets/nuplan_mini_sensor.txt",
+        "sha256": "",
+        "size_bytes": 4,
+    }
+    manifest["archives"].append(inventory)
+    manifest["total_size_bytes"] += inventory["size_bytes"]
+
+    decoded = load_nuplan_snapshot_manifest(
+        json.dumps(manifest).encode("ascii")
+    )
+    selected = select_snapshot_archives(
+        decoded,
+        ["maps", "db", "camera", "lidar"],
+    )
+
+    assert [archive["archive_id"] for archive in selected] == [
+        "maps",
+        "db",
+        "camera",
+        "lidar",
+    ]
+    with pytest.raises(ValueError, match="must be ZIP files"):
+        select_snapshot_archives(
+            decoded,
+            ["maps", "db", "camera", "lidar", "sensor-mini-inventory"],
+        )
+
+
 def test_archive_digest_rejects_modified_payload(tmp_path):
     manifest, paths = _snapshot(tmp_path)
     archive = manifest["archives"][0]
