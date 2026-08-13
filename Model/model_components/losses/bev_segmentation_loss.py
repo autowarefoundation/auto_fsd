@@ -43,15 +43,16 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
             raise ValueError("target and valid_mask must match logits")
         if logits.shape[1] != self.pos_weight.numel():
             raise ValueError("logit channels differ from pos_weight")
-        target = target.to(device=logits.device, dtype=logits.dtype)
+        loss_logits = logits.float()
+        target = target.to(device=logits.device, dtype=torch.float32)
         valid = valid_mask.to(device=logits.device, dtype=torch.bool)
         active = valid.any(dim=(0, 2, 3))
         if not bool(active.any()):
-            return logits.sum() * 0.0
+            return loss_logits.sum() * 0.0
 
-        mask = valid.to(logits.dtype)
+        mask = valid.to(torch.float32)
         bce = F.binary_cross_entropy_with_logits(
-            logits,
+            loss_logits,
             target,
             pos_weight=self.pos_weight.view(1, -1, 1, 1),
             reduction="none",
@@ -59,7 +60,7 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
         valid_counts = mask.sum(dim=(0, 2, 3)).clamp_min(1.0)
         class_bce = (bce * mask).sum(dim=(0, 2, 3)) / valid_counts
 
-        probabilities = logits.sigmoid()
+        probabilities = loss_logits.sigmoid()
         intersection = (probabilities * target * mask).sum(
             dim=(0, 2, 3)
         )
