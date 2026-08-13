@@ -428,6 +428,53 @@ def test_destination_focal_loss_is_resolution_invariant():
     assert losses[1].item() < 0.1
 
 
+def test_route_loss_is_finite_for_extreme_bfloat16_logits():
+    logits = torch.full(
+        (1, 2, 4, 4),
+        20.0,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    target = torch.zeros_like(logits)
+    target[:, 0, 1:3, 1:3] = 1.0
+    target[:, 1, 2, 1] = 1.0
+
+    loss = RouteReconstructionLoss()(
+        logits,
+        target,
+        torch.ones(1, 2, dtype=torch.bool),
+    )
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_bev_loss_is_fp32_for_extreme_bfloat16_logits():
+    logits = torch.full(
+        (1, 8, 4, 4),
+        100.0,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    target = torch.zeros_like(logits)
+    target[:, :, 1:3, 1:3] = 1.0
+
+    loss = BEVSegmentationAuxiliaryLoss([1.0] * 8)(
+        logits,
+        target,
+        torch.ones_like(logits, dtype=torch.bool),
+    )
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
 def test_trajectory_loss_reaches_all_reactive_modules(
     build_mock_model,
     device,
