@@ -4622,12 +4622,24 @@ def train_il(
         "route_loss_gradient_budget": None,
         "objective_term_gradient_norms": None,
     }
-    optimizer_probe_name, optimizer_probe_parameter = next(
-        (name, parameter)
+    # Watch EVERY trainable planner parameter, not just the first one
+    # named_parameters() happens to yield. The probe asks "did the optimizer
+    # move the planner at all", and a single parameter cannot answer that: a
+    # zero-initialised projection fed an all-zero input is provably immovable
+    # (its gradient is zero, and AdamW's decoupled decay scales the parameter,
+    # so a zero parameter stays zero). BezierPlanner.visual_history_proj is
+    # exactly that whenever the World Model is off — which is the default, and
+    # which makes visual_history all-zero in the packed data. Probing it alone
+    # fails a perfectly healthy run.
+    optimizer_probe = [
+        (name, parameter, parameter.detach().clone())
         for name, parameter in model.named_parameters()
         if parameter.requires_grad and "TrajectoryPlanner" in name
-    )
-    optimizer_probe_before = optimizer_probe_parameter.detach().clone()
+    ]
+    if not optimizer_probe:
+        raise RuntimeError(
+            "no trainable TrajectoryPlanner parameters to verify progress on"
+        )
 
     def _branch_gradient_norm(name_fragment):
         total, count = 0.0, 0
@@ -5770,10 +5782,18 @@ def train_il(
             )
             break
 
-    optimizer_parameter_delta_norm = float(
+    # The planner moved if ANY of its parameters moved. Report the one that
+    # moved most, so a passing run still names a parameter and a failing run
+    # says how many were checked rather than pointing at one arbitrary name.
+    optimizer_probe_deltas = [
         (
-            optimizer_probe_parameter.detach() - optimizer_probe_before
-        ).norm().item()
+            name,
+            float((parameter.detach() - before).norm().item()),
+        )
+        for name, parameter, before in optimizer_probe
+    ]
+    optimizer_probe_name, optimizer_parameter_delta_norm = max(
+        optimizer_probe_deltas, key=lambda item: item[1]
     )
     if (
         not terminal_resume
@@ -5785,7 +5805,8 @@ def train_il(
         raise RuntimeError(
             "optimizer produced no parameter update: "
             f"steps={optimizer_step_count} "
-            f"parameter={optimizer_probe_name} "
+            f"parameters_checked={len(optimizer_probe_deltas)} "
+            f"largest_delta_parameter={optimizer_probe_name} "
             f"delta_norm={optimizer_parameter_delta_norm}"
         )
     first_gradient_evidence = gradient_evidence["first_step"] or {}
@@ -5998,6 +6019,9 @@ def train_il(
             "metric_history": metric_history,
             "optimizer_evidence": {
                 "step_count": optimizer_step_count,
+                "parameters_checked": len(optimizer_probe_deltas),
+                # The planner parameter that moved most, not an arbitrary one:
+                # the probe now watches every trainable planner parameter.
                 "probe_parameter": optimizer_probe_name,
                 "probe_parameter_delta_norm": (
                     optimizer_parameter_delta_norm
