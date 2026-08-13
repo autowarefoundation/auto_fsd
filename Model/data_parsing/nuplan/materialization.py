@@ -127,9 +127,9 @@ def validate_nuplan_snapshot_manifest(
             raw_archive.get("filename"),
             f"archives[{index}].filename",
         )
-        if PurePosixPath(filename).name != filename or not filename.endswith(".zip"):
+        if PurePosixPath(filename).name != filename:
             raise ValueError(
-                f"archives[{index}].filename must be a ZIP basename"
+                f"archives[{index}].filename must be a basename"
             )
         archives.append({
             "archive_id": archive_id,
@@ -195,6 +195,16 @@ def select_snapshot_archives(
         if missing_ids:
             raise ValueError(f"unknown nuPlan archive_ids: {missing_ids}")
         archives = [by_id[archive_id] for archive_id in requested]
+    non_zip_ids = [
+        archive["archive_id"]
+        for archive in archives
+        if not archive["filename"].endswith(".zip")
+    ]
+    if non_zip_ids:
+        raise ValueError(
+            "selected nuPlan archives must be ZIP files: "
+            f"{non_zip_ids}"
+        )
     components = {archive["component"] for archive in archives}
     missing_components = _REQUIRED_COMPONENTS - components
     if missing_components:
