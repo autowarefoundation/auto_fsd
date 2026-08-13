@@ -302,13 +302,19 @@ def test_gpu_canary_infrastructure_is_bounded_and_placement_backed():
             "gpu-performance-ondemand",
         )
     }
+    assert performance_pools["gpu-performance-reserved"]["limits"] == {
+        "cpu": "32",
+        "memory": "256Gi",
+        "nodes": "4",
+        "nvidia.com/gpu": "4",
+    }
+    assert performance_pools["gpu-performance-ondemand"]["limits"] == {
+        "cpu": "16",
+        "memory": "128Gi",
+        "nodes": "2",
+        "nvidia.com/gpu": "2",
+    }
     for spec in performance_pools.values():
-        assert spec["limits"] == {
-            "cpu": "16",
-            "memory": "128Gi",
-            "nodes": "2",
-            "nvidia.com/gpu": "2",
-        }
         requirements = {
             item["key"]: item["values"]
             for item in spec["template"]["spec"]["requirements"]
