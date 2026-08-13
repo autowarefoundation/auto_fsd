@@ -25,17 +25,17 @@ def _destination_heatmap_focal(
     logits: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
-    probabilities = logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
+    probabilities = logits.sigmoid()
     positive = target >= 1.0 - 1e-4
     negative = ~positive
     negative_weights = (1.0 - target).pow(4)
     positive_loss = (
-        -torch.log(probabilities)
+        F.softplus(-logits)
         * (1.0 - probabilities).pow(2)
         * positive
     ).sum(dim=(1, 2))
     negative_loss = (
-        -torch.log(1.0 - probabilities)
+        F.softplus(logits)
         * probabilities.pow(2)
         * negative_weights
         * negative
@@ -91,17 +91,18 @@ class RouteReconstructionLoss(nn.Module):
             raise ValueError("route target must match logits")
         if channel_valid.shape != logits.shape[:2]:
             raise ValueError("channel_valid must have shape [B,2]")
-        target = target.to(device=logits.device, dtype=logits.dtype)
+        loss_logits = logits.float()
+        target = target.to(device=logits.device, dtype=torch.float32)
         valid = channel_valid.to(device=logits.device, dtype=torch.bool)
         if not bool(valid.any()):
-            return logits.sum() * 0.0
+            return loss_logits.sum() * 0.0
 
-        sample_losses = logits.new_zeros(logits.shape[0])
-        sample_terms = logits.new_zeros(logits.shape[0])
+        sample_losses = loss_logits.new_zeros(logits.shape[0])
+        sample_terms = loss_logits.new_zeros(logits.shape[0])
 
         corridor_valid = valid[:, 0]
         if bool(corridor_valid.any()):
-            corridor_logits = logits[corridor_valid, 0]
+            corridor_logits = loss_logits[corridor_valid, 0]
             corridor_target = target[corridor_valid, 0]
             corridor_bce = F.binary_cross_entropy_with_logits(
                 corridor_logits,
@@ -122,7 +123,7 @@ class RouteReconstructionLoss(nn.Module):
         destination_valid = valid[:, 1]
         if bool(destination_valid.any()):
             destination_loss = _destination_heatmap_focal(
-                logits[destination_valid, 1],
+                loss_logits[destination_valid, 1],
                 target[destination_valid, 1],
             )
             sample_losses[destination_valid] += (
