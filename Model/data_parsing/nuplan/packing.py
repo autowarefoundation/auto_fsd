@@ -76,6 +76,10 @@ class _NuPlanPackWorkerConfig:
     samples_per_shard: int
 
 
+class _NuPlanNoScenariosError(ValueError):
+    """Signal that filtering removed every scenario in one DB partition."""
+
+
 def _quaternion_transform(
     translation_xyz: Any,
     quaternion_wxyz: Any,
@@ -718,20 +722,23 @@ def _partition_weighted_nuplan_db_files(
 
 def _pack_nuplan_partition(
     config: _NuPlanPackWorkerConfig,
-) -> dict[str, object]:
-    return pack_nuplan_local_dataset(
-        data_root=config.data_root,
-        map_root=config.map_root,
-        sensor_root=config.sensor_root,
-        db_files=config.partition.db_files,
-        output_directory=config.output_directory,
-        source_revision=config.source_revision,
-        map_version=config.map_version,
-        image_size=config.image_size,
-        samples_per_shard=config.samples_per_shard,
-        max_rejection_fraction=1.0,
-        pack_workers=1,
-    )
+) -> dict[str, object] | None:
+    try:
+        return pack_nuplan_local_dataset(
+            data_root=config.data_root,
+            map_root=config.map_root,
+            sensor_root=config.sensor_root,
+            db_files=config.partition.db_files,
+            output_directory=config.output_directory,
+            source_revision=config.source_revision,
+            map_version=config.map_version,
+            image_size=config.image_size,
+            samples_per_shard=config.samples_per_shard,
+            max_rejection_fraction=1.0,
+            pack_workers=1,
+        )
+    except _NuPlanNoScenariosError:
+        return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -747,11 +754,16 @@ def _merge_nuplan_pack_partitions(
     output: Path,
     partition_root: Path,
     partitions: Sequence[_NuPlanPackPartition],
-    manifests: Sequence[Mapping[str, object]],
+    manifests: Sequence[Mapping[str, object] | None],
     max_rejection_fraction: float,
 ) -> dict[str, object]:
     if len(partitions) != len(manifests) or not manifests:
         raise ValueError("nuPlan partition results are incomplete")
+    nonempty_manifests = [
+        manifest for manifest in manifests if manifest is not None
+    ]
+    if not nonempty_manifests:
+        raise ValueError("nuPlan parallel packing produced no scenarios")
 
     merged_shard_names: list[str] = []
     merged_shard_counts: dict[str, int] = {}
@@ -761,6 +773,8 @@ def _merge_nuplan_pack_partitions(
     split_group_count = 0
 
     for partition, manifest in zip(partitions, manifests):
+        if manifest is None:
+            continue
         worker_directory = partition_root / f"worker-{partition.index:03d}"
         shard_names = manifest.get("shard_names")
         shard_counts = manifest.get("shard_sample_counts")
@@ -835,16 +849,18 @@ def _merge_nuplan_pack_partitions(
             f"fraction={rejection_fraction:.6f}"
         )
 
-    merged = dict(manifests[0])
+    merged = dict(nonempty_manifests[0])
     merged.update({
         "bev_segmentation_count": accepted_count,
         "packing_partitions": [
             {
                 "db_file_count": len(partition.db_files),
+                "is_empty": manifest is None,
                 "scenario_estimate": partition.scenario_estimate,
             }
-            for partition in partitions
+            for partition, manifest in zip(partitions, manifests)
         ],
+        "packing_nonempty_workers": len(nonempty_manifests),
         "packing_workers": len(partitions),
         "rejected_samples": merged_rejections,
         "rejection_count": rejected_count,
@@ -1077,7 +1093,9 @@ def pack_nuplan_reactive_scenarios(
 
     total = len(accepted) + len(rejected)
     if total == 0:
-        raise ValueError("nuPlan scenario builder returned no scenarios")
+        raise _NuPlanNoScenariosError(
+            "nuPlan scenario builder returned no scenarios"
+        )
     rejection_fraction = len(rejected) / total
     if not accepted or rejection_fraction > max_rejection_fraction:
         raise ValueError(
