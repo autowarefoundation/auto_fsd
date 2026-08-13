@@ -2,6 +2,70 @@
 Autoware is supported by people like you, and all types and sizes of contribution are welcome. As a contributor, here are the guidelines that we would like you to follow for Autoware and its associated repositories.
 
 
+# AI-assisted contributions and AI slop
+
+We encourage contributors to use AI for coding, writing, translation, research,
+and other parts of the development process. AI use does not need to be
+disclosed. The contributor who submits an issue, pull request, review, or
+comment remains responsible for its accuracy, relevance, quality, licensing,
+and verification.
+
+In this project, **AI slop** means unverified or low-quality content submitted
+without reasonable effort to understand, check, and refine it, when doing so
+creates more work for maintainers than value for the project. This standard
+applies regardless of whether the content was produced by AI or by a person.
+AI-like writing style or the output of an AI detector is not evidence of AI
+slop.
+
+Issues, pull requests, reviews, and comments must be specific to this
+repository and must make a clear, technically grounded contribution. Examples
+of unacceptable content include:
+
+- Generic advice, restatements, or speculative recommendations that do not
+  engage with the current code or discussion
+- Repetitive, fragmented, off-topic, or bulk submissions
+- Invented APIs, results, citations, behavior, or other claims that have not
+  been checked
+- Claims that tests, training, or other validation were run when they were not
+- Code submitted without relevant validation or an honest statement of what
+  was and was not tested
+- Repeated failure to answer concrete maintainer questions about a submission
+
+Disagreement, an unsuccessful experiment, or a documented regression is not AI
+slop. Contributors should report limitations and negative results honestly.
+
+## Validation of code changes
+
+Contributors must make a reasonable effort to show that changed code works and
+is likely to advance the stated goal. Describe the checks that were run, their
+results, and any important limitations. We do not prescribe one execution
+environment or validation procedure for every contribution; the evidence
+should be appropriate for the change and sufficient for maintainers to assess
+it.
+
+Changes that can affect learned model behavior require stronger evidence. This
+includes changes to model architecture, fusion, planners, losses, training
+objectives, model inputs or targets, sampling, and dataset splits. Before such
+a pull request is marked ready for review, it must include results from
+training, report at least post-training ADE and FDE, and discuss what the
+results indicate about the change, including regressions, trade-offs, and
+limitations. A draft pull request may be opened while this validation is still
+in progress.
+
+Changes that do not affect learned model behavior, such as documentation, UI,
+CI, deployment, observability, or supporting pipeline changes, do not require
+ADE or FDE. They still require relevant tests or other evidence that the
+changed behavior works. A data or training pipeline change that can alter
+learned model behavior is treated as a model-affecting change.
+
+## Moderation
+
+Maintainers may close, lock, hide, or decline to review content that does not
+meet these standards, without providing a detailed review. Repeated or serious
+disruptive submissions may result in restrictions on further participation and
+may be escalated to the Autoware Foundation or reported to GitHub when the
+conduct also violates the applicable community or platform policies.
+
 # Code of Conduct
 To ensure the Autoware community stays open and inclusive, please follow the [Code of Conduct](https://github.com/autowarefoundation/autoware.privately-owned-vehicles/blob/main/CODE_OF_CONDUCT.md).
 
