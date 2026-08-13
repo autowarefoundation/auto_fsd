@@ -6,6 +6,7 @@ from .auxiliary_heads import (
 )
 from .backbone import Backbone
 from .feature_fusion import FeatureFusion
+from .fused_feature_pooling import FusedFeaturePooling
 from .trajectory_planning import build_planner
 from .map_encoder import build_map_encoder, build_map_bev_fusion
 from .temporal_memory import build_temporal_memory
@@ -16,7 +17,8 @@ class ReactiveE2E(nn.Module):
     def __init__(self, backbone="swin_v2_tiny", num_views=7, embed_dim=256,
                  is_pretrained=True,
                  image_feature_size=8, view_fusion_kwargs=None,
-                 num_timesteps=64, num_signals=2, egomotion_dim=256,
+                 num_timesteps=64, num_signals=2,
+                 egomotion_dim=256,
                  visual_history_dim=896,
                  map_type="rasterized", map_context_channels=3,
                  route_channels=2, enable_route_conditioning=True,
@@ -44,6 +46,15 @@ class ReactiveE2E(nn.Module):
             view_fusion_kwargs=view_fusion_kwargs,
         )
 
+        self.planner_mode = planner_mode
+        # Bezier consumes a fixed-size vector. The GRU and flow-matching
+        # planners retain the spatial BEV contract used by reactive training.
+        self.FusedFeaturePooling = (
+            FusedFeaturePooling(embed_dim=embed_dim)
+            if planner_mode == "bezier"
+            else None
+        )
+
         # For BEV fusion mode the spatial size is bev_h × bev_w (potentially non-square).
         # Read each dim with a default so a PARTIAL view_fusion_kwargs (e.g. only
         # pc_range) doesn't KeyError — the `or` only fires for None/empty, and the
@@ -52,7 +63,7 @@ class ReactiveE2E(nn.Module):
         map_output_h = vfk.get("bev_h", 450)
         map_output_w = vfk.get("bev_w", 300)
 
- 
+
         if map_context_channels <= 0 or route_channels <= 0:
             raise ValueError("navigation channel counts must be positive")
         self.map_context_channels = int(map_context_channels)
@@ -67,7 +78,7 @@ class ReactiveE2E(nn.Module):
             output_h=map_output_h,
             output_w=map_output_w,
         )
- 
+
         # Map BEV fusion: combines image BEV features with map BEV features
         self.MapBEVFusion = build_map_bev_fusion(
             map_fusion_mode,
@@ -303,6 +314,12 @@ class ReactiveE2E(nn.Module):
         else:
             fused_features = self.MapBEVFusion(image_bev, navigation_bev)
 
+        planner_features = (
+            self.FusedFeaturePooling(fused_features)
+            if self.FusedFeaturePooling is not None
+            else fused_features
+        )
+
         # --- Temporal Memory ---
         visual_ctx, ego_ctx = self.TemporalMemory(visual_history, egomotion_history)
 
@@ -322,7 +339,7 @@ class ReactiveE2E(nn.Module):
 
         # --- Trajectory Prediction ---
         trajectory = self.TrajectoryPlanner(
-            fused_features, visual_ctx, ego_ctx,
+            planner_features, visual_ctx, ego_ctx,
             reasoning_latent=reasoning_latent,
             reasoning_horizon_tokens=reasoning_horizon_tokens,
             **kwargs,

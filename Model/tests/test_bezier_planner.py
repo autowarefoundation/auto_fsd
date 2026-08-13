@@ -20,6 +20,7 @@ from model_components.trajectory_planning import (
 EMBED_DIM = 256
 EGO_DIM = 256
 VIS_DIM = 896
+BEZIER_FEATURE_DIM = 75 * 50
 
 
 class _MockBackbone(nn.Module):
@@ -44,8 +45,8 @@ class _MockBackbone(nn.Module):
         return outs
 
 
-def _make_inputs(batch_size, device, h=8, w=8):
-    bev = torch.randn(batch_size, EMBED_DIM, h, w, device=device)
+def _make_inputs(batch_size, device):
+    bev = torch.randn(batch_size, BEZIER_FEATURE_DIM, device=device)
     visual_history = torch.randn(batch_size, VIS_DIM, device=device)
     egomotion_history = torch.randn(batch_size, EGO_DIM, device=device)
     return bev, visual_history, egomotion_history
@@ -88,13 +89,13 @@ def test_registry_rejects_unknown():
         build_planner("does_not_exist")
 
 
-def test_resolution_invariant_to_bev_size(device):
-    """Planner must accept any BEV spatial resolution (global pooling)."""
+def test_rejects_spatial_bev_features(device):
+    """Pooling belongs to ReactiveE2E, not the Bezier planner."""
     planner = BezierPlanner(embed_dim=EMBED_DIM).to(device)
-    for h, w in [(8, 8), (45, 30), (7, 7)]:
-        bev, vis, ego = _make_inputs(2, device, h=h, w=w)
-        trajectory = planner(bev, vis, ego)
-        assert trajectory.shape == (2, 128)
+    _, vis, ego = _make_inputs(2, device)
+    spatial_bev = torch.randn(2, EMBED_DIM, 8, 8, device=device)
+    with pytest.raises(ValueError, match="bev_features must have shape"):
+        planner(spatial_bev, vis, ego)
 
 
 def test_configurable_timesteps_and_signals(device):

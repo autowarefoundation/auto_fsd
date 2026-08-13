@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional
 
+import torch
 import torch.nn as nn
 
 from .reactive_e2e import ReactiveE2E
@@ -17,11 +18,34 @@ _REMOVED_GEOMETRY_KWARGS = (
 )
 
 
+def normalize_egomotion_history(
+    egomotion_history: torch.Tensor,
+) -> torch.Tensor:
+    """Scale repeated speed/acceleration features without mutating the input."""
+    if not torch.is_floating_point(egomotion_history):
+        raise TypeError("egomotion_history must be a floating-point tensor")
+    if egomotion_history.ndim < 2:
+        raise ValueError(
+            "egomotion_history must have shape [..., egomotion_dim]"
+        )
+    feature_dim = egomotion_history.shape[-1]
+    if feature_dim % 4 != 0:
+        raise ValueError(
+            "egomotion_history last dimension must be divisible by 4, "
+            f"got {feature_dim}"
+        )
+    scale = egomotion_history.new_tensor((33.0, 8.0, 1.0, 1.0)).repeat(
+        feature_dim // 4
+    )
+    return egomotion_history / scale
+
+
 class AutoE2E(nn.Module):
     def __init__(self, backbone="swin_v2_tiny", num_views=7, embed_dim=256,
                  is_pretrained=True,
                  image_feature_size=8, view_fusion_kwargs=None,
-                 num_timesteps=64, num_signals=2, egomotion_dim=256,
+                 num_timesteps=64, num_signals=2,
+                 egomotion_dim=256,
                  visual_history_dim=896,
                  map_type="rasterized", map_context_channels=3,
                  route_channels=2, enable_route_conditioning=True,
@@ -47,7 +71,8 @@ class AutoE2E(nn.Module):
         self.Reactive_E2E = ReactiveE2E(backbone=backbone, num_views=num_views, embed_dim=embed_dim,
                  is_pretrained=is_pretrained,
                  image_feature_size=image_feature_size, view_fusion_kwargs=view_fusion_kwargs,
-                 num_timesteps=num_timesteps, num_signals=num_signals, egomotion_dim=egomotion_dim,
+                 num_timesteps=num_timesteps, num_signals=num_signals,
+                 egomotion_dim=egomotion_dim,
                  visual_history_dim=visual_history_dim,
                  map_type=map_type,
                  map_context_channels=map_context_channels,
@@ -175,6 +200,12 @@ class AutoE2E(nn.Module):
                 f"geometry_type='pseudo' — a learned spatial prior, not your calibration."
             )
 
+        # Normalization function for egomotion_history
+        # scales the raw speed and acceleration values to a sensible range
+        # for the model
+        egomotion_history = normalize_egomotion_history(egomotion_history)
+
+
         # World Action Model (1 Hz): produce the Encoded Visual History fed to the
         # reactive planner + reasoning branch, and (in training) the predicted
         # future feature maps for the JEPA loss. Two mutually exclusive paths:
@@ -267,5 +298,5 @@ class AutoE2E(nn.Module):
             aux_outputs = reactive_aux
             return trajectory, aux_outputs
         return trajectory
-        
-    
+
+

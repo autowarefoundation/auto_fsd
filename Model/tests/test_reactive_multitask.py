@@ -239,6 +239,28 @@ def test_reactive_model_emits_both_auxiliary_heads(
     assert auxiliary["route_reconstruction_logits"].shape == (2, 2, 8, 8)
 
 
+def test_gru_planner_retains_spatial_bev_contract(
+    build_mock_model,
+    device,
+):
+    model = _model(build_mock_model, device)
+    captured: list[tuple[int, ...]] = []
+
+    def _capture_planner_input(_module, args):
+        captured.append(tuple(args[0].shape))
+
+    handle = model.Reactive_E2E.TrajectoryPlanner.register_forward_pre_hook(
+        _capture_planner_input
+    )
+    try:
+        _forward(model, _inputs(device))
+    finally:
+        handle.remove()
+
+    assert model.Reactive_E2E.FusedFeaturePooling is None
+    assert captured == [(2, 256, 8, 8)]
+
+
 def test_bev_logits_do_not_depend_on_navigation(
     build_mock_model,
     device,

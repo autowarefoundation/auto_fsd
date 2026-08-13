@@ -1286,7 +1286,7 @@ def evaluate_reactive_multitask(
         ],
         "fusion_gate_mean_abs": (
             float(alpha.detach().abs().mean().cpu().item())
-            if torch.is_tensor(alpha)
+            if isinstance(alpha, torch.Tensor)
             else None
         ),
         "route_input_gradient_mean_abs": route_gradient_l1,

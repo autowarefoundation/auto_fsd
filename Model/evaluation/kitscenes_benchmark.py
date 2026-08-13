@@ -434,8 +434,6 @@ def wgs84_trajectory_to_ego_xy(
     current_pose: np.ndarray,
 ) -> np.ndarray:
     """Convert packed KITScenes poses to future ego-frame XY in metres."""
-    from pyproj import Transformer
-
     gps = np.asarray(gps_future, dtype=np.float64)
     pose = np.asarray(current_pose, dtype=np.float64)
     if gps.ndim != 3 or gps.shape[1:] != (65, 2):
@@ -455,6 +453,8 @@ def wgs84_trajectory_to_ego_xy(
         raise ValueError(
             "current pose does not match the first packed GPS point"
         )
+
+    from pyproj import Transformer
 
     flattened = gps.reshape(-1, 2)
     transformer = Transformer.from_crs(

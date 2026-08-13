@@ -25,7 +25,10 @@ B, EMBED, HZ = 3, 256, 5
 
 
 def _inputs(planner):
-    bev = torch.randn(B, EMBED, 8, 8)
+    if isinstance(planner, BezierPlanner):
+        bev = torch.randn(B, planner.feature_dim)
+    else:
+        bev = torch.randn(B, EMBED, 8, 8)
     vis = torch.randn(B, 896)
     ego = torch.randn(B, 256)
     latent = torch.randn(B, EMBED)
