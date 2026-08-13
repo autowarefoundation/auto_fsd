@@ -1,8 +1,3 @@
-"""Standalone eval — run against any saved checkpoint from train_one_combo.py.
-Usage:
-  python eval_checkpoint.py --ckpt checkpoints/swin_v2_tiny_residual_bezier_epoch0_step100.pt
-"""
-
 import argparse, json, sys, os
 from pathlib import Path
 import numpy as np
@@ -105,9 +100,19 @@ def main():
             camera_tiles = batch["visual_tiles"].to(device).float() / 255.0
             camera_tiles = (camera_tiles - img_mean) / img_std
             map_context  = batch["map_context"].to(device).float()
+            
             route_mask   = batch.get("route_mask")
             if route_mask is not None:
                 route_mask = route_mask.to(device).float()
+                
+            map_valid = batch.get("map_valid")
+            if map_valid is not None:
+                map_valid = map_valid.to(device)
+
+            route_valid = batch.get("route_valid")
+            if route_valid is not None:
+                route_valid = route_valid.to(device)
+                
             visual_history    = batch["visual_history"].to(device).float()
             egomotion_history = batch["egomotion_history"].to(device).float()
             trajectory_target = batch["trajectory_target"].to(device).float()
@@ -118,6 +123,8 @@ def main():
                 out = model(
                     camera_tiles, map_context, visual_history, egomotion_history,
                     route_mask=route_mask,
+                    route_valid=route_valid,        # added
+                    map_valid=map_valid,            # added
                     projection=PinholeProjection(camera_params),
                     geometry_type="pinhole",
                     mode="infer",  # <-- infer mode: returns trajectory directly, no loss

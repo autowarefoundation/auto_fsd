@@ -37,17 +37,26 @@ downloader = PinnedKITScenesDownloader(OUTPUT_DIR, revision=KITSCENES_DATA_REVIS
 
 ade3, fde3 = [], []
 skipped = 0
+network_failures = 0
 
 for i, scene_id in enumerate(val_ids):
     print(f"scene {i+1}/{len(val_ids)}: {scene_id[:8]}...", end=" ", flush=True)
     
-    # Simple retry block in case Hugging Face drops connection during evaluation
+    download_success = False
     for attempt in range(3):
         try:
             downloader.download([scene_id], expected_split="val")
+            download_success = True
             break
-        except Exception:
-            if attempt < 2: time.sleep(5)
+        except Exception as e:
+            print(f"  download attempt {attempt+1}/3 failed: {e}")
+            if attempt < 2:
+                time.sleep(5)
+                
+    if not download_success:
+        print(f"Scene {scene_id}: skipped due to persistent network failure (not a short scene)")
+        network_failures += 1
+        continue
 
     try:
         ds = KitScenesDataset(
@@ -76,7 +85,7 @@ for i, scene_id in enumerate(val_ids):
         gt_accel = tgt[:, 0]
         gt_curv  = tgt[:, 1]
 
-        # constant-velocity hold: repeat last observed action
+        # hold-last-action: repeat last observed action
         hold_accel = np.full(64, last_accel)
         hold_curv  = np.full(64, last_curv)
 
@@ -91,8 +100,9 @@ for i, scene_id in enumerate(val_ids):
     shutil.rmtree(OUTPUT_DIR / "data" / "val" / scene_id, ignore_errors=True)
 
 print(f"\n{'='*50}")
-print(f"Constant-velocity baseline — your 65-scene val split")
-print(f"Samples: {len(ade3)}  Skipped scenes: {skipped}")
+print("Hold-last-action baseline — your 65-scene val split")
+print("(repeats last observed accel+curvature; harder than zero-accel constant-velocity)")
+print(f"Samples: {len(ade3)}  Skipped (too short): {skipped}  Network failures: {network_failures}")
 print(f"ADE@3s: {np.mean(ade3):.3f} m")
 print(f"FDE@3s: {np.mean(fde3):.3f} m")
 print(f"(gate thresholds per #176: ADE@3s 2.0, FDE@3s 4.0)")
