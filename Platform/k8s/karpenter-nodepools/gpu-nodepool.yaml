@@ -82,10 +82,10 @@ spec:
         - key: nvidia.com/gpu
           effect: NoSchedule
   limits:
-    cpu: "16"
-    memory: 128Gi
-    nodes: "2"
-    nvidia.com/gpu: "2"
+    cpu: "32"
+    memory: 256Gi
+    nodes: "4"
+    nvidia.com/gpu: "4"
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
