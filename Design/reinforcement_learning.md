@@ -97,7 +97,7 @@ The plugin establishes a input/output contract for the AutoE2E model:
 
 **Input Observations (`PredictionInput`):**
 - **Visual Topology**: While the KITScenes dataset provides 9 cameras for comprehensive rendering and reconstruction, the AutoE2E model actively consumes a **7-camera subset** (the 1 long-range and 6 surround cameras). These are explicitly defined as: `camera_base_front_center`, `camera_ring_front`, `camera_ring_front_left`, `camera_ring_front_right`, `camera_ring_rear`, `camera_ring_rear_left`, `camera_ring_rear_right`.
-- **Telemetry**: Ego vehicle speed (*m/s*), acceleration (*m/s²*), and high-level routing `DriveCommand` (LEFT, STRAIGHT, RIGHT).
+- **Telemetry**: Ego vehicle speed (*m/s*), acceleration (*m/s²*), yaw rate (*rad/s*), and trajectory curvature (*1/m*), alongside a `route_mask` natively rendered from the scene's dynamic `ego_pose`.
 
 **Output Predictions (`ModelPrediction`):**
 - **`trajectory_xy`**: Projected waypoint coordinates `[64, 2]` in the rig frame (*X* forward, *Y* left).

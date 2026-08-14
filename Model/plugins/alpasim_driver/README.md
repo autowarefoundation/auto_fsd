@@ -32,7 +32,7 @@ graph TD
 
 ### Input Observations (`PredictionInput`)
 - **Visual Topology**: 7 KitScenes camera streams (`camera_base_front_center`, `camera_ring_front`, `camera_ring_front_left`, `camera_ring_front_right`, `camera_ring_rear`, `camera_ring_rear_left`, `camera_ring_rear_right`).
-- **Telemetry**: Scalar ego vehicle speed (*m/s*), acceleration (*m/s²*), and high-level routing `DriveCommand` (LEFT, STRAIGHT, RIGHT).
+- **Telemetry**: Scalar ego vehicle speed (*m/s*), acceleration (*m/s²*), yaw rate (*rad/s*), and trajectory curvature (*1/m*), alongside a `route_mask` natively rendered from the scene's dynamic `ego_pose`.
 
 ### Output Predictions (`ModelPrediction`)
 - **`trajectory_xy`**: Waypoint coordinates *[64, 2]* in rig frame (*X* forward, *Y* left).
