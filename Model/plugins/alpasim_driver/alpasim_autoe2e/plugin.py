@@ -249,10 +249,8 @@ class AutoE2EDriver(BaseTrajectoryModel):
             curr = ego_pose_history[-1]
             dt = (curr.timestamp_us - prev.timestamp_us) / 1_000_000.0
             
-            from scipy.spatial.transform import Rotation
-            
             def extract_yaw(quat: Any) -> float:
-                return float(Rotation.from_quat([quat.x, quat.y, quat.z, quat.w]).as_euler("ZYX")[0])
+                return float(math.atan2(2.0 * (quat.w * quat.z + quat.x * quat.y), 1.0 - 2.0 * (quat.y**2 + quat.z**2)))
             
             curr_yaw = extract_yaw(curr.pose.quat)
             ego_pose = (float(curr.pose.x), float(curr.pose.y), curr_yaw)

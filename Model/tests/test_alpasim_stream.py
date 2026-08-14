@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import numpy as np
 import pytest
@@ -526,7 +526,7 @@ class TestAlpasimDriverPlugin:
         """Verify that initializing with allow_mock=False fails fast when using mock dependencies."""
         from alpasim_autoe2e.plugin import IS_MOCK_MODE
         if IS_MOCK_MODE:
-            with pytest.raises(ImportError, match="allow_mock=False"):
+            with pytest.raises(ImportError, match="allow_mock=True"):
                 AutoE2EDriver(model_checkpoint="nonexistent.ckpt", allow_mock=False)
 
     def test_dynamic_camera_list(self) -> None:
