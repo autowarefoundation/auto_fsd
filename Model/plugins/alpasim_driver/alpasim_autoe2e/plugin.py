@@ -100,21 +100,27 @@ class AutoE2EDriver(BaseTrajectoryModel):
         super().__init__()
         self.allow_mock = allow_mock
         self.allow_untrained_model = allow_untrained_model
-
-        if IS_MOCK_MODE and not self.allow_mock:
+        
+        # In strict mode, verify AlpaSim integration exists
+        if not self.allow_mock and IS_MOCK_MODE:
             raise ImportError(
-                "alpasim_driver package is not installed and allow_mock=False. "
-                "Pass allow_mock=True when initializing AutoE2EDriver(allow_mock=True) to enable mock dependencies."
+                "alpasim.models is not available. Please install the alpasim package "
+                "or run with allow_mock=True."
             )
-
+            
         self.model_checkpoint = model_checkpoint
         
+        from .config import AutoE2EAlpaSimConfig
+        config = AutoE2EAlpaSimConfig(checkpoint_path=self.model_checkpoint)
+        
         if camera_ids is None:
-            from .config import AutoE2EAlpaSimConfig
-            camera_ids = AutoE2EAlpaSimConfig(checkpoint_path=self.model_checkpoint).camera_names
+            camera_ids = config.camera_names
         self._camera_ids = camera_ids
         
-        self.parser = AlpasimStreamParser(camera_names=self._camera_ids)
+        self.parser = AlpasimStreamParser(
+            camera_names=self._camera_ids,
+            scene_id=config.scene_id
+        )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
 
@@ -236,26 +242,27 @@ class AutoE2EDriver(BaseTrajectoryModel):
         
         yaw_rate = 0.0
         curvature = 0.0
+        ego_pose = None
         ego_pose_history = getattr(input_data, "ego_pose_history", None)
         if ego_pose_history and len(ego_pose_history) >= 2:
             prev = ego_pose_history[-2]
             curr = ego_pose_history[-1]
             dt = (curr.timestamp_us - prev.timestamp_us) / 1_000_000.0
+            
+            from scipy.spatial.transform import Rotation
+            
+            def extract_yaw(quat: Any) -> float:
+                return float(Rotation.from_quat([quat.x, quat.y, quat.z, quat.w]).as_euler("ZYX")[0])
+            
+            curr_yaw = extract_yaw(curr.pose.quat)
+            ego_pose = (float(curr.pose.x), float(curr.pose.y), curr_yaw)
+
             if dt > 0:
-                def extract_yaw(quat: Any) -> float:
-                    return math.atan2(
-                        2.0 * (quat.w * quat.z + quat.x * quat.y),
-                        1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z)
-                    )
-                try:
-                    prev_yaw = extract_yaw(prev.pose.quat)
-                    curr_yaw = extract_yaw(curr.pose.quat)
-                    diff = curr_yaw - prev_yaw
-                    diff = math.atan2(math.sin(diff), math.cos(diff))
-                    yaw_rate = diff / dt
-                    curvature = yaw_rate / max(speed, 0.1)
-                except AttributeError:
-                    pass  # Gracefully fallback to 0.0 if pose shape is mocked or unrecognized
+                prev_yaw = extract_yaw(prev.pose.quat)
+                diff = curr_yaw - prev_yaw
+                diff = math.atan2(math.sin(diff), math.cos(diff))
+                yaw_rate = diff / dt
+                curvature = yaw_rate / max(speed, 0.1)
 
         input_dict = cast(ParserPredictionInput, {
             "cameras": cameras_dict,
@@ -264,6 +271,7 @@ class AutoE2EDriver(BaseTrajectoryModel):
             "command": command,
             "yaw_rate": yaw_rate,
             "curvature": curvature,
+            "ego_pose": ego_pose,
         })
         
         parsed = self.parser.parse_observation(input_dict)

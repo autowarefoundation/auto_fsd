@@ -32,14 +32,52 @@ class PredictionInput(TypedDict):
     command: int
     yaw_rate: float
     curvature: float
+    ego_pose: tuple[float, float, float] | None
 
 class AlpasimStreamParser:
     """Parses live AlpaSim frames into the exact tensor format produced by pre_extracted.py."""
-    def __init__(self, camera_names: list[str]) -> None:
+    def __init__(self, camera_names: list[str], scene_id: str | None = None) -> None:
         self.camera_names = camera_names
         self._egomotion_buffer: collections.deque[list[float]] = collections.deque(maxlen=_HISTORY_STEPS)
         for _ in range(_HISTORY_STEPS):
             self._egomotion_buffer.append([0.0] * _HISTORY_SIGNALS)
+            
+        self.navigation_map = None
+        self.route = None
+        self.rasterizer = None
+        
+        if scene_id:
+            import os
+            from pathlib import Path
+            kitscenes_root = os.environ.get("KITSCENES_ROOT")
+            if kitscenes_root:
+                scene_path = Path(kitscenes_root) / "data" / "val" / scene_id
+                if not scene_path.exists():
+                    scene_path = Path(kitscenes_root) / "data" / "train" / scene_id
+                
+                if scene_path.exists():
+                    poses_file = scene_path / "poses.txt"
+                    if poses_file.exists():
+                        data = np.loadtxt(poses_file)
+                        timestamps_ns = (data[:, 0] * 1e9).astype(np.int64)
+                        positions_enu_m = data[:, 1:4]
+                        qx, qy, qz, qw = data[:, 4], data[:, 5], data[:, 6], data[:, 7]
+                        yaws_rad = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                        
+                        from navigation.rasterizer import NativeNavigationRasterizer
+                        from data_parsing.kit_scenes.navigation import build_scene_navigation
+                        self.rasterizer = NativeNavigationRasterizer()
+                        nav = build_scene_navigation(
+                            scene_id=scene_id,
+                            scene_path=scene_path,
+                            positions_enu_m=positions_enu_m,
+                            yaws_rad=yaws_rad,
+                            timestamps_ns=timestamps_ns,
+                            source_revision="alpasim",
+                            rasterizer=self.rasterizer,
+                        )
+                        self.navigation_map = nav.navigation_map
+                        self.route = nav.route
             
     def _decode_image(self, data: Any) -> torch.Tensor:
         """Decode and normalize image exactly as the offline loader."""
@@ -56,7 +94,7 @@ class AlpasimStreamParser:
         
         Returns:
             Dict containing:
-                - visual_tiles: ``[1, 7, 3, 256, 256]``
+                - camera_tiles: ``[1, 7, 3, 256, 256]``
                 - egomotion_history: ``[1, 256]``
                 - visual_history: ``[1, 896]``
                 - map_context: ``[1, 3, 256, 256]``
@@ -68,9 +106,8 @@ class AlpasimStreamParser:
         for cam_name in self.camera_names:
             frame_data = observation["cameras"].get(cam_name)
             if frame_data is None:
-                frames.append(torch.zeros(3, 256, 256))
-            else:
-                frames.append(self._decode_image(frame_data))
+                raise ValueError(f"Missing camera frame for {cam_name}")
+            frames.append(self._decode_image(frame_data))
         visual_tiles = torch.stack(frames).unsqueeze(0)
 
         current_ego = [0.0] * _HISTORY_SIGNALS
@@ -89,30 +126,30 @@ class AlpasimStreamParser:
         route_mask = torch.zeros(1, 2, 256, 256, dtype=torch.float32)
         route_valid_flag = False
 
-        cmd_raw = observation.get("command", 3)
-        cmd = int(cmd_raw) if cmd_raw is not None else 3
-        if cmd in (0, 1, 2):  # LEFT=0, STRAIGHT=1, RIGHT=2
-            route_valid_flag = True
-            y, x = torch.meshgrid(torch.arange(256), torch.arange(256), indexing="ij")
+        ego_pose_tuple = observation.get("ego_pose")
+        if self.rasterizer and self.route:
+            if ego_pose_tuple is None:
+                raise ValueError("Ego pose is missing from the observation, cannot render route mask.")
             
-            # Ego is anchored at row 170.0, col 127.5 in the BEV map (facing UP / negative y)
-            dy = 170.0 - y
-            dx = x - 127.5
+            import time
+            from navigation.rasterizer import EgoPose
             
-            # Only illuminate the route in front of the vehicle
-            front_mask = dy > 0
-            
-            if cmd == 0:  # LEFT
-                mask = front_mask & (dx < -0.0025 * (dy ** 2) + 15)
-            elif cmd == 1:  # STRAIGHT
-                mask = front_mask & (dx >= -0.001 * (dy ** 2) - 15) & (dx <= 0.001 * (dy ** 2) + 15)
-            elif cmd == 2:  # RIGHT
-                mask = front_mask & (dx > 0.0025 * (dy ** 2) - 15)
-            
-            # RouteChannel.SELECTED_CORRIDOR is index 0
-            route_mask[0, 0, mask] = 1.0
+            x, y, yaw = ego_pose_tuple
+            live_pose = EgoPose(
+                timestamp_ns=int(time.time() * 1e9),
+                x_enu_m=x,
+                y_enu_m=y,
+                yaw_rad=yaw,
+            )
+            raster = self.rasterizer.render(self.navigation_map, self.route, live_pose)
+            route_mask = torch.from_numpy(raster.route_mask).float().unsqueeze(0)
+            if self.navigation_map:
+                map_context = torch.from_numpy(raster.map_context).float().unsqueeze(0)
+            route_valid_flag = raster.route_valid
+        else:
+            raise ImportError("The rasterizer and/or route are missing, cannot render route mask.")
 
-        map_valid = torch.tensor([False], dtype=torch.bool)
+        map_valid = torch.tensor([self.navigation_map is not None], dtype=torch.bool)
         route_valid = torch.tensor([route_valid_flag], dtype=torch.bool)
 
         matrices = [_KIT_SCENES_PROJECTION_MATRICES[name] for name in self.camera_names]

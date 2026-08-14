@@ -46,3 +46,6 @@ class AutoE2EAlpaSimConfig:
         ]
     )
     """List of 7 logical camera names matching KitScenes topology."""
+
+    scene_id: str | None = None
+    """KITScenes scene ID (e.g., 'c34c778f-...') to load offline map and trajectory masks natively."""

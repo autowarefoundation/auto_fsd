@@ -105,6 +105,7 @@ def valid_prediction_input(
         "speed": 12.5,
         "acceleration": 0.5,
         "command": 1,
+        "ego_pose": (0.0, 0.0, 0.0),
     }
 
 
@@ -126,10 +127,24 @@ def stream_sequence_10hz(
                 "speed": speed,
                 "acceleration": acceleration,
                 "command": 1,
+        "ego_pose": (0.0, 0.0, 0.0),
             }
         )
     return sequence
 
+
+
+def mock_parser_deps(parser):
+    class MockRaster:
+        route_mask = np.zeros((2, 256, 256), dtype=np.float32)
+        map_context = np.zeros((3, 256, 256), dtype=np.float32)
+        route_valid = True
+    class MockRasterizer:
+        def render(self, nav_map, route, live_pose):
+            return MockRaster()
+    parser.rasterizer = MockRasterizer()
+    parser.route = True
+    return parser
 
 class TestAlpasimStreamParserFixturesAndBasicShape:
     """Verify basic shape, dtype, and input decoding of AlpasimStreamParser."""
@@ -140,7 +155,7 @@ class TestAlpasimStreamParserFixturesAndBasicShape:
         """Verify tensor shapes produced by ``parse_observation``.
 
         Expected shapes:
-          - ``visual_tiles``: ``[1, 7, 3, 256, 256]``
+          - ``camera_tiles``: ``[1, 7, 3, 256, 256]``
           - ``egomotion_history``: ``[1, 256]``
           - ``visual_history``: ``[1, 896]``
           - ``map_context``: ``[1, 3, 256, 256]``
@@ -149,6 +164,7 @@ class TestAlpasimStreamParserFixturesAndBasicShape:
           - ``route_valid``: ``[1]``
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         tensors = parser.parse_observation(valid_prediction_input)
 
         assert tensors["camera_tiles"].shape == (1, 7, 3, 256, 256)
@@ -167,6 +183,7 @@ class TestAlpasimStreamParserFixturesAndBasicShape:
         Float Tensors must be ``torch.float32``; validity flags must be ``torch.bool``.
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         tensors = parser.parse_observation(valid_prediction_input)
 
         assert tensors["camera_tiles"].dtype == torch.float32
@@ -185,61 +202,32 @@ class TestAlpasimStreamParserFixturesAndBasicShape:
     ) -> None:
         """Verify ``_decode_image`` supports PIL Image, numpy array, and JPEG bytes."""
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
 
         t1 = parser.parse_observation(
-            {"cameras": sample_rgb_images, "speed": 5.0, "acceleration": 0.0, "command": 0}
+            {"cameras": sample_rgb_images, "speed": 5.0, "acceleration": 0.0, "command": 0, "ego_pose": (0.0, 0.0, 0.0)}
         )["camera_tiles"]
         t2 = parser.parse_observation(
-            {"cameras": sample_numpy_frames, "speed": 5.0, "acceleration": 0.0, "command": 0}
+            {"cameras": sample_numpy_frames, "speed": 5.0, "acceleration": 0.0, "command": 0, "ego_pose": (0.0, 0.0, 0.0)}
         )["camera_tiles"]
         t3 = parser.parse_observation(
-            {"cameras": sample_jpeg_bytes, "speed": 5.0, "acceleration": 0.0, "command": 0}
+            {"cameras": sample_jpeg_bytes, "speed": 5.0, "acceleration": 0.0, "command": 0, "ego_pose": (0.0, 0.0, 0.0)}
         )["camera_tiles"]
 
         assert t1.shape == (1, 7, 3, 256, 256)
         assert t2.shape == (1, 7, 3, 256, 256)
         assert t3.shape == (1, 7, 3, 256, 256)
 
-    def test_route_mask_parabolic_logic(self) -> None:
-        """Verify the route mask logic correctly generates parabolic masks for LEFT, STRAIGHT, RIGHT."""
+    def test_route_mask_rendering(self, sample_rgb_images: Dict[str, Image.Image]) -> None:
+        """Verify the route mask logic interacts correctly with the rasterizer."""
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
-
-        # Test command = 0 (LEFT)
-        tensors_left = parser.parse_observation(
-            {"cameras": {}, "speed": 0.0, "acceleration": 0.0, "command": 0}
-        )
-        mask_left = tensors_left["route_mask"][0, 0]
+        parser = mock_parser_deps(parser)
         
-        # Ego anchored at row 170.0, col 127.5
-        # For a point at y=100 (dy = 70): dx < -0.0025 * (70**2) + 15 = -12.25 + 15 = 2.75
-        # Therefore x < 127.5 + 2.75 = 130.25
-        assert mask_left[100, 120] == 1.0
-        assert mask_left[100, 140] == 0.0
-        # Points behind ego (y >= 170, e.g., y=200) should be 0.0 due to front_mask
-        assert mask_left[200, 120] == 0.0
-
-        # Test command = 1 (STRAIGHT)
-        tensors_straight = parser.parse_observation(
-            {"cameras": {}, "speed": 0.0, "acceleration": 0.0, "command": 1}
+        tensors = parser.parse_observation(
+            {"cameras": sample_rgb_images, "speed": 0.0, "acceleration": 0.0, "command": 0, "ego_pose": (0.0, 0.0, 0.0)}
         )
-        mask_straight = tensors_straight["route_mask"][0, 0]
-        # For y=100 (dy = 70): dx >= -0.001 * (70**2) - 15 = -4.9 - 15 = -19.9
-        #                      dx <= 0.001 * (70**2) + 15 = 4.9 + 15 = 19.9
-        # Therefore 107.6 <= x <= 147.4
-        assert mask_straight[100, 120] == 1.0
-        assert mask_straight[100, 140] == 1.0
-        assert mask_straight[100, 100] == 0.0
-        assert mask_straight[100, 150] == 0.0
-
-        # Test command = 2 (RIGHT)
-        tensors_right = parser.parse_observation(
-            {"cameras": {}, "speed": 0.0, "acceleration": 0.0, "command": 2}
-        )
-        mask_right = tensors_right["route_mask"][0, 0]
-        # For y=100 (dy = 70): dx > 0.0025 * (70**2) - 15 = 12.25 - 15 = -2.75
-        # Therefore x > 124.75
-        assert mask_right[100, 140] == 1.0
-        assert mask_right[100, 120] == 0.0
+        mask = tensors["route_mask"][0, 0]
+        assert mask.shape == (256, 256)
 
 
 class TestOfflineKitScenesParity:
@@ -254,6 +242,7 @@ class TestOfflineKitScenesParity:
         Tolerance: bit-for-bit or ``atol=1e-5`` since floating-point ops are deterministic.
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         cam_key = PARSER_CAMERA_NAMES[0]
         jpeg_data = sample_jpeg_bytes[cam_key]
 
@@ -272,6 +261,7 @@ class TestOfflineKitScenesParity:
         Normalized values for RGB [0, 255] must lie approximately in [-2.12, 2.64].
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         cam_key = PARSER_CAMERA_NAMES[0]
 
         tile = parser._decode_image(sample_rgb_images[cam_key])
@@ -296,6 +286,7 @@ class TestOfflineKitScenesParity:
         The live parser emits ``[1, 256]``.
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         tensors = parser.parse_observation(valid_prediction_input)
         ego_hist = tensors["egomotion_history"]
 
@@ -322,6 +313,7 @@ class TestOfflineKitScenesParity:
         Step 0 (speed 0.0) must be evicted.
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
 
         last_tensors: Dict[str, torch.Tensor] = {}
         for observation in stream_sequence_10hz:
@@ -382,31 +374,26 @@ class TestEdgeCasesAndDiscrepancies:
     ) -> None:
         """Verify behavior when a camera frame is missing from PredictionInput.
 
-        If a camera is missing, parser inserts ``torch.zeros(3, 256, 256)``.
+        If a camera is missing, parser should raise a ValueError.
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         partial_cams = dict(sample_rgb_images)
         missing_cam = "camera_ring_rear_left"
         del partial_cams[missing_cam]
 
-        tensors = parser.parse_observation(
-            {"cameras": partial_cams, "speed": 10.0, "acceleration": 0.0, "command": 1}
-        )
-
-        missing_idx = PARSER_CAMERA_NAMES.index(missing_cam)
-        missing_tile = tensors["camera_tiles"][0, missing_idx]
-
-        assert missing_tile.shape == (3, 256, 256)
-        assert missing_tile.dtype == torch.float32
-        assert (missing_tile == 0.0).all(), (
-            "Missing camera view must produce zero tensor as fallback."
-        )
+        import pytest
+        with pytest.raises(ValueError, match=f"Missing camera frame for {missing_cam}"):
+            parser.parse_observation(
+                {"cameras": partial_cams, "speed": 10.0, "acceleration": 0.0, "command": 1, "ego_pose": (0.0, 0.0, 0.0)}
+            )
 
     def test_edge_case_out_of_range_ego_values(
         self, sample_rgb_images: Dict[str, Image.Image]
     ) -> None:
         """Verify parser handles extreme / negative speed and acceleration values."""
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
 
         tensors = parser.parse_observation(
             {
@@ -414,6 +401,7 @@ class TestEdgeCasesAndDiscrepancies:
                 "speed": -15.0,
                 "acceleration": 250.0,
                 "command": -1,
+                "ego_pose": (0.0, 0.0, 0.0),
             }
         )
 
@@ -426,12 +414,14 @@ class TestEdgeCasesAndDiscrepancies:
     ) -> None:
         """Verify parser behavior when command field is non-integer or unexpected type."""
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
 
         input_data: Dict[str, object] = {
             "cameras": sample_rgb_images,
             "speed": 0.0,
             "acceleration": 0.0,
             "command": None,
+            "ego_pose": (0.0, 0.0, 0.0),
         }
         tensors = parser.parse_observation(input_data)  # type: ignore[arg-type]
         assert tensors["camera_tiles"].shape == (1, 7, 3, 256, 256)
@@ -456,8 +446,9 @@ class TestEdgeCasesAndDiscrepancies:
         }
 
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         tensors = parser.parse_observation(
-            {"cameras": cams_with_config_keys, "speed": 10.0, "acceleration": 0.0, "command": 1}
+            {"cameras": cams_with_config_keys, "speed": 10.0, "acceleration": 0.0, "command": 1, "ego_pose": (0.0, 0.0, 0.0)}
         )
 
         # Frames should not be empty since the camera names match
@@ -474,6 +465,7 @@ class TestEdgeCasesAndDiscrepancies:
         It should provide dummy camera parameters matching the expected shape.
         """
         parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser = mock_parser_deps(parser)
         tensors = parser.parse_observation(valid_prediction_input)
 
         assert "camera_params" in tensors, (
@@ -505,12 +497,16 @@ class TestAlpasimDriverPlugin:
           - ``headings``: numpy array of shape ``(64,)`` and float32.
         """
         driver = AutoE2EDriver(model_checkpoint=dummy_checkpoint, allow_mock=True)
+        mock_parser_deps(driver.parser)
         pred_input = PluginPredictionInput(
             camera_images=sample_rgb_images,
             speed=8.0,
             acceleration=0.1,
             command=1,
-            ego_pose_history=[],
+            ego_pose_history=[
+                type("MockPoseAtTime", (), {"timestamp_us": 0, "pose": type("MockPose", (), {"quat": type("MockQuat", (), {"w":1.0, "x":0.0, "y":0.0, "z":0.0})(), "x":0.0, "y":0.0, "z":0.0})()})(),
+                type("MockPoseAtTime", (), {"timestamp_us": 1, "pose": type("MockPose", (), {"quat": type("MockQuat", (), {"w":1.0, "x":0.0, "y":0.0, "z":0.0})(), "x":0.0, "y":0.0, "z":0.0})()})(),
+            ],
             inference_seed=0,
         )
 
@@ -537,6 +533,7 @@ class TestAlpasimDriverPlugin:
         """Verify the parser and driver work correctly with an arbitrary list of camera names."""
         custom_cameras = ["camera_ring_front_left", "camera_ring_front_right"]
         parser = AlpasimStreamParser(camera_names=custom_cameras)
+        parser = mock_parser_deps(parser)
         
         # Build fake observation
         from PIL import Image
@@ -548,7 +545,8 @@ class TestAlpasimDriverPlugin:
             "cameras": fake_images,
             "speed": 5.0,
             "acceleration": 1.0,
-            "command": 1
+            "command": 1,
+            "ego_pose": (0.0, 0.0, 0.0),
         }
         
         tensors = parser.parse_observation(obs)
@@ -557,9 +555,14 @@ class TestAlpasimDriverPlugin:
         
         # Test driver fallback init with custom cameras
         driver = AutoE2EDriver(model_checkpoint="MOCK", allow_mock=True, camera_ids=custom_cameras)
+        mock_parser_deps(driver.parser)
         assert len(driver.camera_ids) == 2
         # Mock prediction output
-        pred = driver.predict(PluginPredictionInput(camera_images=fake_images, speed=5.0, acceleration=1.0, command=1, ego_pose_history=[], inference_seed=0))
+        fake_history = [
+                type("MockPoseAtTime", (), {"timestamp_us": 0, "pose": type("MockPose", (), {"quat": type("MockQuat", (), {"w":1.0, "x":0.0, "y":0.0, "z":0.0})(), "x":0.0, "y":0.0, "z":0.0})()})(),
+                type("MockPoseAtTime", (), {"timestamp_us": 1, "pose": type("MockPose", (), {"quat": type("MockQuat", (), {"w":1.0, "x":0.0, "y":0.0, "z":0.0})(), "x":0.0, "y":0.0, "z":0.0})()})(),
+        ]
+        pred = driver.predict(PluginPredictionInput(camera_images=fake_images, speed=5.0, acceleration=1.0, command=1, ego_pose_history=fake_history, inference_seed=0))
         assert pred.trajectory_xy.shape == (64, 2)
 
     def test_dynamic_yaw_rate_and_curvature(self, dummy_checkpoint: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -577,6 +580,9 @@ class TestAlpasimDriverPlugin:
         @dataclass
         class MockPose:
             quat: MockQuat
+            x: float = 0.0
+            y: float = 0.0
+            z: float = 0.0
 
         @dataclass
         class MockPoseAtTime:
