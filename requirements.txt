@@ -1,6 +1,7 @@
 boto3==1.43.0
 mypy==2.1.0
 numpy==2.2.6
+opencv-python-headless
 pillow==11.1.0
 pyproj==3.7.2
 pytest==9.0.3

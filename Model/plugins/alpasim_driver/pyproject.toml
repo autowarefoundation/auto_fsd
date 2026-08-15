@@ -12,6 +12,7 @@ dependencies = [
     "alpasim_driver",
     "torch",
     "numpy",
+    "opencv-python-headless",
     "torchvision",
     "Pillow"
 ]
