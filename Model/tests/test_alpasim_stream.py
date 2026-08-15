@@ -134,16 +134,19 @@ def stream_sequence_10hz(
 
 
 
-def mock_parser_deps(parser):
+def mock_parser_deps(parser, navigation_map=None, scene_path=None):
     class MockRaster:
         route_mask = np.zeros((2, 256, 256), dtype=np.float32)
-        map_context = np.zeros((3, 256, 256), dtype=np.float32)
         route_valid = True
     class MockRasterizer:
         def render(self, nav_map, route, live_pose):
             return MockRaster()
     parser.rasterizer = MockRasterizer()
     parser.route = True
+    if navigation_map is not None:
+        parser.navigation_map = navigation_map
+    if scene_path is not None:
+        parser.scene_path = scene_path
     return parser
 
 class TestAlpasimStreamParserFixturesAndBasicShape:
@@ -627,3 +630,202 @@ class TestAlpasimDriverPlugin:
         assert captured_input["yaw_rate"] == pytest.approx(0.1, abs=1e-5)
         # curvature = yaw_rate / max(speed, 0.1) -> 0.1 / 10.0 = 0.01
         assert captured_input["curvature"] == pytest.approx(0.01, abs=1e-5)
+
+
+class TestDynamicBevMapGeneration:
+    """Verify dynamic BEV map tile rasterization and error handling in AlpasimStreamParser."""
+
+    def test_dynamic_bev_map_tile_generation_success(
+        self, valid_prediction_input: PredictionInput, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Verify generate_bev_map_tile is dynamically invoked when scene_path and navigation_map exist."""
+        parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        scene_dir = tmp_path / "mock_val_scene"
+        scene_dir.mkdir()
+        mock_parser_deps(parser, navigation_map=object(), scene_path=scene_dir)
+
+        synthetic_tile = np.zeros((256, 256, 3), dtype=np.uint8)
+        synthetic_tile[10, 20] = [255, 128, 64]
+        captured_kwargs = {}
+
+        def mock_generate_bev_map_tile(**kwargs):
+            captured_kwargs.update(kwargs)
+            return synthetic_tile
+
+        monkeypatch.setattr(
+            "data_parsing.kit_scenes.map.generate_bev_map_tile",
+            mock_generate_bev_map_tile,
+        )
+
+        valid_prediction_input["ego_pose"] = (15.5, -20.25, 1.57)
+        tensors = parser.parse_observation(valid_prediction_input)
+
+        assert captured_kwargs == {
+            "scene_path": scene_dir,
+            "ego_x": 15.5,
+            "ego_y": -20.25,
+            "ego_yaw": 1.57,
+            "canvas_size": 256,
+        }
+        assert tensors["map_context"].shape == (1, 3, 256, 256)
+        assert tensors["map_context"].dtype == torch.float32
+        assert tensors["map_valid"].item() is True
+        # Check channel permutation: uint8 HWC -> float CHW
+        assert torch.allclose(
+            tensors["map_context"][0, :, 10, 20],
+            torch.tensor([255.0, 128.0, 64.0], dtype=torch.float32),
+        )
+
+    def test_dynamic_bev_map_returns_none_raises_runtime_error(
+        self, valid_prediction_input: PredictionInput, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Verify fail-loud RuntimeError is raised when generate_bev_map_tile returns None."""
+        parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        scene_dir = tmp_path / "mock_corrupt_scene"
+        scene_dir.mkdir()
+        mock_parser_deps(parser, navigation_map=object(), scene_path=scene_dir)
+
+        monkeypatch.setattr(
+            "data_parsing.kit_scenes.map.generate_bev_map_tile",
+            lambda **kwargs: None,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="generate_bev_map_tile failed and returned None. Ensure the scene map is valid and Lanelet2 is able to extract vectors.",
+        ):
+            parser.parse_observation(valid_prediction_input)
+
+    def test_map_context_zero_when_no_scene_path_or_navigation_map(
+        self, valid_prediction_input: PredictionInput, tmp_path: Path
+    ) -> None:
+        """Verify map_context defaults to zero tensor and map_valid flag is False when no scene_path."""
+        # Case 1: scene_path=None, navigation_map=None
+        parser1 = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        mock_parser_deps(parser1)
+        assert parser1.scene_path is None
+        assert parser1.navigation_map is None
+
+        tensors1 = parser1.parse_observation(valid_prediction_input)
+        assert tensors1["map_context"].shape == (1, 3, 256, 256)
+        assert torch.count_nonzero(tensors1["map_context"]) == 0
+        assert tensors1["map_valid"].item() is False
+
+        # Case 2: scene_path provided, but navigation_map is None
+        parser2 = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        scene_dir = tmp_path / "scene_without_nav"
+        scene_dir.mkdir()
+        mock_parser_deps(parser2, navigation_map=None, scene_path=scene_dir)
+
+        tensors2 = parser2.parse_observation(valid_prediction_input)
+        assert tensors2["map_context"].shape == (1, 3, 256, 256)
+        assert torch.count_nonzero(tensors2["map_context"]) == 0
+        assert tensors2["map_valid"].item() is False
+
+    def test_missing_ego_pose_raises_value_error(
+        self, valid_prediction_input: PredictionInput
+    ) -> None:
+        """Verify ValueError is raised when ego_pose is missing from observation."""
+        parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        mock_parser_deps(parser)
+        valid_prediction_input["ego_pose"] = None
+
+        with pytest.raises(
+            ValueError,
+            match="Ego pose is missing from the observation, cannot render route mask.",
+        ):
+            parser.parse_observation(valid_prediction_input)
+
+    def test_missing_rasterizer_or_route_raises_import_error(
+        self, valid_prediction_input: PredictionInput
+    ) -> None:
+        """Verify ImportError is raised when rasterizer or route is None."""
+        parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES)
+        parser.rasterizer = None
+        parser.route = None
+
+        with pytest.raises(
+            ImportError,
+            match="The rasterizer and/or route are missing, cannot render route mask.",
+        ):
+            parser.parse_observation(valid_prediction_input)
+
+    def test_parser_init_with_kitscenes_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify parser.__init__ resolves scene_path from KITSCENES_ROOT for val and train splits."""
+        kitscenes_root = tmp_path / "kitscenes"
+        val_scene = kitscenes_root / "data" / "val" / "scene_val_001"
+        val_scene.mkdir(parents=True)
+        poses_file = val_scene / "poses.txt"
+        # Multi-row pose data: timestamp, x, y, z, qx, qy, qz, qw
+        np.savetxt(
+            poses_file,
+            [
+                [0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0],
+                [0.1, 1.1, 2.1, 3.1, 0.0, 0.0, 0.0, 1.0],
+            ],
+        )
+
+        monkeypatch.setenv("KITSCENES_ROOT", str(kitscenes_root))
+
+        mock_nav_called = False
+        class MockNavResult:
+            navigation_map = object()
+            route = object()
+
+        def mock_build_scene_navigation(**kwargs):
+            nonlocal mock_nav_called
+            mock_nav_called = True
+            return MockNavResult()
+
+        monkeypatch.setattr(
+            "navigation.rasterizer.NativeNavigationRasterizer",
+            lambda: object(),
+        )
+        monkeypatch.setattr(
+            "data_parsing.kit_scenes.navigation.build_scene_navigation",
+            mock_build_scene_navigation,
+        )
+
+        parser = AlpasimStreamParser(camera_names=PARSER_CAMERA_NAMES, scene_id="scene_val_001")
+        assert parser.scene_path == val_scene
+        assert mock_nav_called is True
+        assert parser.navigation_map is not None
+        assert parser.route is not None
+
+    def test_driver_predict_with_dynamic_bev_map(
+        self,
+        sample_rgb_images: Dict[str, Image.Image],
+        dummy_checkpoint: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Verify AutoE2EDriver.predict end-to-end when dynamic BEV map tile rasterization is active."""
+        driver = AutoE2EDriver(model_checkpoint=dummy_checkpoint, allow_mock=True)
+        scene_dir = tmp_path / "mock_scene"
+        scene_dir.mkdir()
+        mock_parser_deps(driver.parser, navigation_map=object(), scene_path=scene_dir)
+
+        synthetic_tile = np.full((256, 256, 3), 200, dtype=np.uint8)
+        monkeypatch.setattr(
+            "data_parsing.kit_scenes.map.generate_bev_map_tile",
+            lambda **kwargs: synthetic_tile,
+        )
+
+        pred_input = PluginPredictionInput(
+            camera_images=sample_rgb_images,
+            speed=8.0,
+            acceleration=0.1,
+            command=1,
+            ego_pose_history=[
+                type("MockPoseAtTime", (), {"timestamp_us": 0, "pose": type("MockPose", (), {"quat": type("MockQuat", (), {"w":1.0, "x":0.0, "y":0.0, "z":0.0})(), "x":0.0, "y":0.0, "z":0.0})()})(),
+                type("MockPoseAtTime", (), {"timestamp_us": 1, "pose": type("MockPose", (), {"quat": type("MockQuat", (), {"w":1.0, "x":0.0, "y":0.0, "z":0.0})(), "x":0.0, "y":0.0, "z":0.0})()})(),
+            ],
+            inference_seed=0,
+        )
+
+        result = driver.predict(pred_input)
+        assert isinstance(result, ModelPrediction)
+        assert result.trajectory_xy.shape == (64, 2)
+        assert result.headings.shape == (64,)

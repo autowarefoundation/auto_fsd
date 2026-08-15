@@ -45,6 +45,7 @@ class AlpasimStreamParser:
         self.navigation_map = None
         self.route = None
         self.rasterizer = None
+        self.scene_path = None
         
         if scene_id:
             import os
@@ -56,6 +57,7 @@ class AlpasimStreamParser:
                     scene_path = Path(kitscenes_root) / "data" / "train" / scene_id
                 
                 if scene_path.exists():
+                    self.scene_path = scene_path
                     poses_file = scene_path / "poses.txt"
                     if poses_file.exists():
                         data = np.loadtxt(poses_file)
@@ -143,8 +145,19 @@ class AlpasimStreamParser:
             )
             raster = self.rasterizer.render(self.navigation_map, self.route, live_pose)
             route_mask = torch.from_numpy(raster.route_mask).float().unsqueeze(0)
-            if self.navigation_map:
-                map_context = torch.from_numpy(raster.map_context).float().unsqueeze(0)
+            if self.navigation_map and self.scene_path:
+                from data_parsing.kit_scenes.map import generate_bev_map_tile
+                bev_map = generate_bev_map_tile(
+                    scene_path=self.scene_path,
+                    ego_x=float(x),
+                    ego_y=float(y),
+                    ego_yaw=float(yaw),
+                    canvas_size=256
+                )
+                if bev_map is not None:
+                    map_context = torch.from_numpy(bev_map.copy()).permute(2, 0, 1).float().unsqueeze(0)
+                else:
+                    raise RuntimeError("generate_bev_map_tile failed and returned None. Ensure the scene map is valid and Lanelet2 is able to extract vectors.")
             route_valid_flag = raster.route_valid
         else:
             raise ImportError("The rasterizer and/or route are missing, cannot render route mask.")
