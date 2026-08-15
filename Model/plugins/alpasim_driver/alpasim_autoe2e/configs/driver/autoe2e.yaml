@@ -10,7 +10,14 @@ driver:
   model:
     model_type: autoe2e
     checkpoint_path: ???
+    allow_untrained_model: false
     device: "cuda"
+    rewards:
+      w_safe: 1.0
+      w_prog: 1.0
+      w_comf: 0.1
+      w_reason: 0.5
+      lambda_il: 0.05
 
   host: "0.0.0.0"
   port: ???

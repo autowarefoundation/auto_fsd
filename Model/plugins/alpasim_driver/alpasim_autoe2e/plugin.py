@@ -30,45 +30,23 @@ try:
         BaseTrajectoryModel,
         PredictionInput,
         ModelPrediction,
-        DriveCommand,
     )
 except ImportError:
     IS_MOCK_MODE = True
 
-    class _MockDriveCommand(IntEnum):
-        LEFT = 0
-        STRAIGHT = 1
-        RIGHT = 2
-        UNKNOWN = 3
-
     @dataclass
     class _MockPredictionInput:
         camera_images: Dict[str, Any] = field(default_factory=dict)
-        command: Any = _MockDriveCommand.STRAIGHT
         speed: float = 0.0
         acceleration: float = 0.0
         ego_pose_history: List[Any] | None = None
         inference_seed: int = 0
-        cameras: Dict[str, Any] | None = None
-
-        def __post_init__(self) -> None:
-            if self.cameras is not None and not self.camera_images:
-                self.camera_images = self.cameras
-            elif self.camera_images and self.cameras is None:
-                self.cameras = self.camera_images
 
     @dataclass
     class _MockModelPrediction:
         trajectory_xy: np.ndarray
         headings: np.ndarray
         reasoning_text: str | None = None
-        trajectory_points: np.ndarray | None = None
-
-        def __post_init__(self) -> None:
-            if self.trajectory_points is not None and self.trajectory_xy is None:
-                self.trajectory_xy = self.trajectory_points
-            elif self.trajectory_xy is not None and self.trajectory_points is None:
-                self.trajectory_points = self.trajectory_xy
 
     class _MockBaseTrajectoryModel:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -79,7 +57,6 @@ except ImportError:
     PredictionInput = _MockPredictionInput  # type: ignore
     ModelPrediction = _MockModelPrediction  # type: ignore
     BaseTrajectoryModel = _MockBaseTrajectoryModel  # type: ignore
-    DriveCommand = _MockDriveCommand  # type: ignore
 
 from .parser import AlpasimStreamParser, PredictionInput as ParserPredictionInput  # noqa: E402
 
@@ -95,13 +72,14 @@ class AutoE2EDriver(BaseTrajectoryModel):
         allow_mock: bool = False,
         allow_untrained_model: bool = False,
         camera_ids: List[str] | None = None,
+        rewards: Dict[str, float] | None = None,
         **kwargs: Any
     ) -> None:
         super().__init__()
         self.allow_mock = allow_mock
         self.allow_untrained_model = allow_untrained_model
         
-        # In strict mode, verify AlpaSim integration exists
+        # Verify AlpaSim integration exists
         if not self.allow_mock and IS_MOCK_MODE:
             raise ImportError(
                 "alpasim.models is not available. Please install the alpasim package "
@@ -116,6 +94,10 @@ class AutoE2EDriver(BaseTrajectoryModel):
         if camera_ids is None:
             camera_ids = config.camera_names
         self._camera_ids = camera_ids
+        
+        # Initialize RL Reward Registry
+        from .rewards import RewardRegistry
+        self.reward_registry = RewardRegistry(rewards or {})
         
         self.parser = AlpasimStreamParser(
             camera_names=self._camera_ids,
@@ -176,11 +158,14 @@ class AutoE2EDriver(BaseTrajectoryModel):
         if checkpoint_path == "UNTRAINED":
             allow_untrained_cfg = True
             
+        rewards_cfg = getattr(model_cfg, "rewards", {})
+            
         driver = cls(
             model_checkpoint=checkpoint_path,
             allow_mock=allow_mock_cfg,
             allow_untrained_model=allow_untrained_cfg,
             camera_ids=camera_ids,
+            rewards=rewards_cfg,
         )
         driver.device = device
         return driver
@@ -196,13 +181,6 @@ class AutoE2EDriver(BaseTrajectoryModel):
     @property
     def output_frequency_hz(self) -> int:
         return 10
-
-    def _encode_command(self, command: Any) -> int:
-        if isinstance(command, int):
-            return command
-        elif hasattr(command, "value"):
-            return int(command.value)
-        return 1
 
     def predict(self, input_data: Any) -> ModelPrediction:
         """Process real-time PredictionInput to ModelPrediction.
@@ -237,8 +215,6 @@ class AutoE2EDriver(BaseTrajectoryModel):
 
         speed = float(getattr(input_data, "speed", 0.0))
         acceleration = float(getattr(input_data, "acceleration", 0.0))
-        raw_cmd = getattr(input_data, "command", 1)
-        command = self._encode_command(raw_cmd)
         
         yaw_rate = 0.0
         curvature = 0.0
