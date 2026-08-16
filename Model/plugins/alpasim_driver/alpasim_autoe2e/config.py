@@ -6,7 +6,7 @@ Defines model checkpoints, camera topology settings, and trajectory planning hor
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 
 @dataclass
@@ -21,14 +21,16 @@ class AutoE2EAlpaSimConfig:
 
     allow_mock: bool = False
     """Whether to allow mock fallback mode when running without AlpaSim."""
-
     allow_untrained_model: bool = False
-    """Whether to initialize an untrained AutoE2E model if model checkpoint is missing."""
+    """Whether to initialize the model randomly if weights are missing (useful for dry runs)."""
+
+    rewards: Dict[str, float] = field(default_factory=dict)
+    """Dictionary mapping reward component names to their scalar weights."""
 
     image_size: Tuple[int, int] = (256, 256)
     """Target camera resolution ``(H, W)`` expected by perception backbone."""
 
-    planning_horizon_s: float = 3.0
+    planning_horizon_s: float = 6.4
     """Total future trajectory planning horizon in seconds."""
 
     planning_steps: int = 64
@@ -45,4 +47,7 @@ class AutoE2EAlpaSimConfig:
             "camera_ring_rear_right",
         ]
     )
-    """List of 7 logical camera names matching KitScenes topology."""
+    """List of 7 camera names matching KitScenes topology."""
+
+    scene_id: str | None = None
+    """KITScenes scene ID (e.g., 'c34c778f-...') to load offline map and trajectory masks natively."""
