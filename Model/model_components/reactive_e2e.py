@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .backbone import Backbone
 from .feature_fusion import FeatureFusion
+from .fused_feature_pooling import FusedFeaturePooling
 from .trajectory_planning import build_planner
 from .map_encoder import build_map_encoder, build_map_bev_fusion
 from .temporal_memory import build_temporal_memory
@@ -12,13 +13,14 @@ class ReactiveE2E(nn.Module):
     def __init__(self, backbone="swin_v2_tiny", num_views=7, embed_dim=256,
                  is_pretrained=True,
                  image_feature_size=8, view_fusion_kwargs=None,
-                 num_timesteps=64, num_signals=2, egomotion_dim=256,
+                 num_timesteps=64, num_signals=2, 
+                 egomotion_dim=256,
                  visual_history_dim=896,
                  map_type="rasterized", map_context_channels=3,
                  route_channels=2, enable_route_conditioning=True,
                  map_fusion_mode="residual", map_fusion_kwargs=None,
                  temporal_memory_mode="no_memory", temporal_memory_kwargs=None,
-                 planner_mode="gru", planner_kwargs=None,
+                 planner_mode="bezier", planner_kwargs=None,
                  enable_reasoning=False, reasoning_mode="none",
                  reasoning_kwargs=None):
         super(ReactiveE2E, self).__init__()
@@ -35,6 +37,12 @@ class ReactiveE2E(nn.Module):
             fusion_mode="bev",
             image_feature_size=image_feature_size,
             view_fusion_kwargs=view_fusion_kwargs,
+        )
+
+        # Pooling and reduction of the fused image/map BEV features to a unified
+        # feature vector which can be consumed by the trajectory planner
+        self.FusedFeaturePooling = FusedFeaturePooling(
+            embed_dim=embed_dim
         )
 
         # For BEV fusion mode the spatial size is bev_h × bev_w (potentially non-square).
@@ -219,6 +227,9 @@ class ReactiveE2E(nn.Module):
         # --- Fuse image BEV + navigation BEV ---
         fused_features = self.MapBEVFusion(image_bev, navigation_bev)
 
+        # --- Reduce fused image/map BEV features into a single feature vector ---
+        feature_vector = self.FusedFeaturePooling(fused_features)
+
         # --- Temporal Memory ---
         visual_ctx, ego_ctx = self.TemporalMemory(visual_history, egomotion_history)
 
@@ -238,7 +249,7 @@ class ReactiveE2E(nn.Module):
 
         # --- Trajectory Prediction ---
         trajectory = self.TrajectoryPlanner(
-            fused_features, visual_ctx, ego_ctx,
+            feature_vector, visual_ctx, ego_ctx,
             reasoning_latent=reasoning_latent,
             reasoning_horizon_tokens=reasoning_horizon_tokens,
             **kwargs,
