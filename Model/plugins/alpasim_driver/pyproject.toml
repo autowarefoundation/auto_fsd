@@ -14,7 +14,8 @@ dependencies = [
     "numpy",
     "opencv-python-headless",
     "torchvision",
-    "Pillow"
+    "Pillow",
+    "shapely"
 ]
 
 [project.entry-points."alpasim.models"]

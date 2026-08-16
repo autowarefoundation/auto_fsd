@@ -6,7 +6,6 @@ import numpy as np
 import logging
 import math
 from dataclasses import dataclass, field
-from enum import IntEnum
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -182,6 +181,12 @@ class AutoE2EDriver(BaseTrajectoryModel):
     def output_frequency_hz(self) -> int:
         return 10
 
+    def _encode_command(self, command: Any) -> int:
+        """Convert canonical DriveCommand to model integer encoding."""
+        if isinstance(command, int):
+            return int(command)
+        return int(getattr(command, "value", 0))
+
     def predict(self, input_data: Any) -> ModelPrediction:
         """Process real-time PredictionInput to ModelPrediction.
         
@@ -215,6 +220,8 @@ class AutoE2EDriver(BaseTrajectoryModel):
 
         speed = float(getattr(input_data, "speed", 0.0))
         acceleration = float(getattr(input_data, "acceleration", 0.0))
+        raw_cmd = getattr(input_data, "command", 0)
+        command = self._encode_command(raw_cmd)
         
         yaw_rate = 0.0
         curvature = 0.0
