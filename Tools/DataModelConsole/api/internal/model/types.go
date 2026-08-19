@@ -206,6 +206,48 @@ type SemanticOccupancyDescriptor struct {
 	ByteSize        int64  `json:"byte_size"`
 }
 
+// SemanticOccupancyModelSource records the immutable source of one published
+// occupancy model. The weight digest is also the model artifact ID.
+type SemanticOccupancyModelSource struct {
+	Config             string `json:"config"`
+	LicenseSPDX        string `json:"license_spdx"`
+	Repository         string `json:"repository"`
+	RepositoryRevision string `json:"repository_revision"`
+	WeightSHA256       string `json:"weight_sha256"`
+}
+
+// SemanticOccupancyModel is one independently published occupancy model that
+// contains a body for the requested dataset shard.
+type SemanticOccupancyModel struct {
+	ModelArtifactID       string                       `json:"model_artifact_id"`
+	DisplayName           string                       `json:"display_name"`
+	ModelFamily           string                       `json:"model_family"`
+	ArtifactKind          string                       `json:"artifact_kind"`
+	ArtifactSchema        string                       `json:"artifact_schema"`
+	CreatedAt             string                       `json:"created_at"`
+	DatasetManifestSHA256 string                       `json:"dataset_manifest_sha256"`
+	GeometryID            string                       `json:"geometry_id"`
+	TaxonomyVersion       string                       `json:"taxonomy_version"`
+	HeadVersion           string                       `json:"head_version"`
+	InputContract         string                       `json:"input_contract"`
+	SupportedClasses      []string                     `json:"supported_classes"`
+	TeacherAvailable      bool                         `json:"teacher_available"`
+	Limitations           []string                     `json:"limitations"`
+	ModelSource           SemanticOccupancyModelSource `json:"model_source"`
+	SampleCount           int                          `json:"sample_count"`
+	ShardCount            int                          `json:"shard_count"`
+	ShardSampleCount      int                          `json:"shard_sample_count"`
+}
+
+// SemanticOccupancyModelsResponse lists occupancy publications independently
+// from trajectory overlay model records.
+type SemanticOccupancyModelsResponse struct {
+	Dataset string                   `json:"dataset"`
+	Version string                   `json:"version"`
+	Shard   string                   `json:"shard"`
+	Models  []SemanticOccupancyModel `json:"models"`
+}
+
 // GeoStatsResponse is the privacy-filtered dataset-level ODD geography.
 // Summary is kept as JSON because its per-region dimensions may evolve without
 // changing the serving envelope.
