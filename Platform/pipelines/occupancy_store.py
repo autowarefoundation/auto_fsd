@@ -8,8 +8,8 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-OCCUPANCY_SET_SCHEMA = "semantic_occupancy_set_v1"
-OCCUPANCY_SET_PREFIX = "semantic-occupancy-sets/schema=v1"
+OCCUPANCY_SET_SCHEMA = "semantic_occupancy_set_v2"
+OCCUPANCY_SET_PREFIX = "semantic-occupancy-sets/schema=v2"
 OCCUPANCY_ARTIFACT_KINDS = frozenset({
     "native-semantic-occupancy",
     "detection-derived-occupancy",
@@ -35,15 +35,21 @@ def occupancy_set_s3_key(
     dataset: str,
     dataset_version: str,
     model_artifact_id: str,
+    dataset_manifest_sha256: str,
 ) -> str:
     """Return the dataset-first discovery key written last by a producer."""
     dataset = _segment(dataset, "dataset")
     if not _VERSION_RE.fullmatch(dataset_version):
         raise ValueError("dataset_version must match v<major>.<minor>")
     model_artifact_id = _sha256(model_artifact_id, "model_artifact_id")
+    dataset_manifest_sha256 = _sha256(
+        dataset_manifest_sha256,
+        "dataset_manifest_sha256",
+    )
     return (
         f"{OCCUPANCY_SET_PREFIX}/dataset={dataset}/"
-        f"version={dataset_version}/model={model_artifact_id}/manifest.json"
+        f"version={dataset_version}/model={model_artifact_id}/"
+        f"manifest={dataset_manifest_sha256}/manifest.json"
     )
 
 
@@ -63,6 +69,104 @@ def _string_list(
     return output
 
 
+def _model_source(model_source: Mapping[str, Any]) -> dict[str, str]:
+    source = {
+        str(key): value
+        for key, value in model_source.items()
+    }
+    required_source = {
+        "code_license_spdx",
+        "config",
+        "license_spdx",
+        "repository",
+        "repository_revision",
+        "training_data_license_spdx",
+        "weight_sha256",
+        "weight_source_url",
+    }
+    if set(source) != required_source:
+        raise ValueError(
+            "model_source must contain exactly "
+            + ", ".join(sorted(required_source))
+        )
+    if any(
+        not isinstance(source[key], str)
+        or not source[key]
+        or source[key].strip() != source[key]
+        for key in required_source
+    ):
+        raise ValueError("model_source values must be non-empty strings")
+    _sha256(source["weight_sha256"], "model_source.weight_sha256")
+    return source
+
+
+def _producer_config(producer_config: Mapping[str, Any]) -> dict[str, Any]:
+    if not producer_config or any(
+        not isinstance(key, str)
+        or not key
+        or key.strip() != key
+        for key in producer_config
+    ):
+        raise ValueError(
+            "producer_config must have non-empty trimmed string keys"
+        )
+    try:
+        payload = json.dumps(
+            producer_config,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("producer_config must be canonical JSON") from error
+    normalized = json.loads(payload)
+    if not isinstance(normalized, dict):
+        raise ValueError("producer_config must be a JSON object")
+    return normalized
+
+
+def occupancy_model_artifact_id(
+    *,
+    artifact_kind: str,
+    artifact_schema: str,
+    geometry_id: str,
+    head_version: str,
+    input_contract: str,
+    model_source: Mapping[str, Any],
+    producer_config: Mapping[str, Any],
+    taxonomy_version: str,
+) -> str:
+    """Hash every dataset-independent input that determines an ASOC body."""
+    if artifact_kind not in OCCUPANCY_ARTIFACT_KINDS:
+        raise ValueError(f"unsupported artifact_kind {artifact_kind!r}")
+    for label, value in (
+        ("artifact_schema", artifact_schema),
+        ("geometry_id", geometry_id),
+        ("head_version", head_version),
+        ("input_contract", input_contract),
+        ("taxonomy_version", taxonomy_version),
+    ):
+        if not value or value.strip() != value:
+            raise ValueError(f"{label} must be a non-empty trimmed string")
+    identity = {
+        "artifact_kind": artifact_kind,
+        "artifact_schema": artifact_schema,
+        "geometry_id": geometry_id,
+        "head_version": head_version,
+        "input_contract": input_contract,
+        "model_source": _model_source(model_source),
+        "producer_config": _producer_config(producer_config),
+        "taxonomy_version": taxonomy_version,
+    }
+    payload = json.dumps(
+        identity,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def occupancy_set_manifest(
     *,
     artifact_kind: str,
@@ -79,6 +183,7 @@ def occupancy_set_manifest(
     model_artifact_id: str,
     model_family: str,
     model_source: Mapping[str, Any],
+    producer_config: Mapping[str, Any],
     shards: Sequence[Mapping[str, Any]],
     supported_classes: Sequence[str],
     taxonomy_version: str,
@@ -92,7 +197,12 @@ def occupancy_set_manifest(
         dataset_manifest_sha256,
         "dataset_manifest_sha256",
     )
-    occupancy_set_s3_key(dataset, dataset_version, model_artifact_id)
+    occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        model_artifact_id,
+        dataset_manifest_sha256,
+    )
     for label, value in (
         ("artifact_schema", artifact_schema),
         ("created_at", created_at),
@@ -106,32 +216,22 @@ def occupancy_set_manifest(
         if not value or value.strip() != value:
             raise ValueError(f"{label} must be a non-empty trimmed string")
 
-    source = {
-        str(key): value
-        for key, value in model_source.items()
-    }
-    required_source = {
-        "config",
-        "license_spdx",
-        "repository",
-        "repository_revision",
-        "weight_sha256",
-    }
-    if set(source) != required_source:
+    source = _model_source(model_source)
+    normalized_producer_config = _producer_config(producer_config)
+    expected_artifact_id = occupancy_model_artifact_id(
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        geometry_id=geometry_id,
+        head_version=head_version,
+        input_contract=input_contract,
+        model_source=source,
+        producer_config=normalized_producer_config,
+        taxonomy_version=taxonomy_version,
+    )
+    if model_artifact_id != expected_artifact_id:
         raise ValueError(
-            "model_source must contain exactly "
-            + ", ".join(sorted(required_source))
+            "model_artifact_id does not identify the complete producer recipe"
         )
-    _sha256(str(source["weight_sha256"]), "model_source.weight_sha256")
-    if source["weight_sha256"] != model_artifact_id:
-        raise ValueError("model artifact ID must equal the weight digest")
-    if any(
-        not isinstance(source[key], str)
-        or not source[key]
-        or source[key].strip() != source[key]
-        for key in required_source
-    ):
-        raise ValueError("model_source values must be non-empty strings")
 
     supported = _string_list(
         supported_classes,
@@ -213,6 +313,7 @@ def occupancy_set_manifest(
         "model_artifact_id": model_artifact_id,
         "model_family": model_family,
         "model_source": source,
+        "producer_config": normalized_producer_config,
         "sample_count": total_samples,
         "shard_count": len(entries),
         "shards": entries,
