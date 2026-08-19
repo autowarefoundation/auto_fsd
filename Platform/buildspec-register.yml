@@ -10,6 +10,7 @@ env:
     DATA_PREP_IMAGE_TAG: ""
     EVAL_IMAGE_TAG: ""
     OFFLINE_RL_IMAGE_TAG: ""
+    BEVFORMER_V2_IMAGE_TAG: ""
 
 phases:
   install:
@@ -31,6 +32,7 @@ phases:
         DATA_PREP_IMAGE_TAG="${DATA_PREP_IMAGE_TAG:-${IMAGE_TAG}}"
         EVAL_IMAGE_TAG="${EVAL_IMAGE_TAG:-${IMAGE_TAG}}"
         OFFLINE_RL_IMAGE_TAG="${OFFLINE_RL_IMAGE_TAG:-${IMAGE_TAG}}"
+        BEVFORMER_V2_IMAGE_TAG="${BEVFORMER_V2_IMAGE_TAG:-${IMAGE_TAG}}"
         image_ref() {
           REPOSITORY="$1"
           TAG="$2"
@@ -57,8 +59,12 @@ phases:
         AUTO_E2E_DATA_PREP_IMAGE="$(
           image_ref data-prep "${DATA_PREP_IMAGE_TAG}"
         )" || exit 1
+        AUTO_E2E_BEVFORMER_V2_IMAGE="$(
+          image_ref bevformer-v2 "${BEVFORMER_V2_IMAGE_TAG}"
+        )" || exit 1
         export AUTO_E2E_TRAINING_IMAGE AUTO_E2E_EVAL_IMAGE
         export AUTO_E2E_OFFLINE_RL_IMAGE AUTO_E2E_DATA_PREP_IMAGE
+        export AUTO_E2E_BEVFORMER_V2_IMAGE
       - |
         cat > /tmp/flyte.yaml << EOF
         admin:
