@@ -7,6 +7,8 @@ import numpy as np
 from evaluation.navigation_robustness import (
     DEFAULT_MODES,
     apply_navigation_perturbation,
+    build_corridor_scenes,
+    route_follow_predict,
     run_navigation_robustness,
 )
 
@@ -49,3 +51,16 @@ def test_robustness_report_deltas():
     assert by_mode["blank"].ade_m > by_mode["map_route"].ade_m
     assert by_mode["blank"].ade_delta_m > 0
     assert set(DEFAULT_MODES)  # sanity: modes exported
+
+
+def test_corridor_scenes_blank_hurts_ade():
+    m, r, gt = build_corridor_scenes(batch=3, timesteps=16, hw=32)
+    report = run_navigation_robustness(
+        m, r, gt,
+        lambda mm, rr: route_follow_predict(mm, rr, gt),
+        modes=("map_route", "blank", "map_only", "route_only"),
+    )
+    by_mode = {c.mode: c for c in report.conditions}
+    assert by_mode["map_route"].ade_m < by_mode["blank"].ade_m
+    assert by_mode["blank"].ade_delta_m > 0
+    assert by_mode["map_only"].ade_m > by_mode["map_route"].ade_m

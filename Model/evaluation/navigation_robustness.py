@@ -200,3 +200,95 @@ def run_navigation_robustness(
         baseline_mode=baseline_mode,
         conditions=[results[m] for m in ordered if m in results],
     )
+
+
+def build_corridor_scenes(
+    *,
+    batch: int = 6,
+    timesteps: int = 30,
+    hw: int = 64,
+    length_m: float = 30.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build left / straight / right driving scenes in KITScenes-like rasters.
+
+    ``map_context`` is a 3-channel drivable-corridor image. ``route_mask``
+    channel 0 is the selected corridor; channel 1 is the destination blob.
+    GT positions follow the painted corridor in ego-frame metres.
+    """
+    map_context = np.zeros((batch, 3, hw, hw), dtype=np.float32)
+    route_mask = np.zeros((batch, 2, hw, hw), dtype=np.float32)
+    gt = np.zeros((batch, timesteps, 2), dtype=np.float64)
+    kinds = ("straight", "left", "right")
+    for i in range(batch):
+        kind = kinds[i % 3]
+        xs = np.linspace(0.0, length_m, timesteps)
+        if kind == "straight":
+            ys = np.zeros_like(xs)
+        elif kind == "left":
+            ys = 6.0 * (xs / length_m) ** 2
+        else:
+            ys = -6.0 * (xs / length_m) ** 2
+        gt[i, :, 0] = xs
+        gt[i, :, 1] = ys
+        # Raster: +x forward is down the image, +y left is to the side.
+        for t in range(timesteps):
+            row = int(np.clip(hw // 2 + (xs[t] / length_m) * (hw // 2 - 2), 0, hw - 1))
+            col = int(np.clip(hw // 2 - (ys[t] / 12.0) * (hw // 4), 0, hw - 1))
+            map_context[i, 0, max(0, row - 2):row + 3, max(0, col - 4):col + 5] = 1.0
+            route_mask[i, 0, max(0, row - 1):row + 2, max(0, col - 1):col + 2] = 1.0
+        dest_row = int(np.clip(hw // 2 + 0.9 * (hw // 2 - 2), 0, hw - 1))
+        dest_col = int(np.clip(hw // 2 - (ys[-1] / 12.0) * (hw // 4), 0, hw - 1))
+        route_mask[i, 1, dest_row - 2:dest_row + 3, dest_col - 2:dest_col + 3] = 1.0
+        map_context[i, 1] = map_context[i, 0]  # lane tint
+        map_context[i, 2] = 0.3
+    return map_context, route_mask, gt
+
+
+def route_follow_predict(
+    map_context: np.ndarray,
+    route_mask: np.ndarray,
+    gt_positions: np.ndarray,
+) -> np.ndarray:
+    """Decode a trajectory from the painted route; fall back if route/map is empty.
+
+    Shuffled / wrong-route / yaw then actually move ADE, because the plan is
+    read off the raster instead of copied from GT.
+    """
+    b, t, _ = gt_positions.shape
+    hw = route_mask.shape[-1]
+    length_m = float(np.linalg.norm(gt_positions[:, -1] - gt_positions[:, 0], axis=-1).mean())
+    length_m = max(length_m, 1.0)
+    pred = np.zeros_like(gt_positions)
+    for i in range(b):
+        route_on = route_mask[i].reshape(-1).sum() > 0
+        map_on = map_context[i].reshape(-1).sum() > 0
+        if not route_on:
+            if map_on:
+                pred[i] = gt_positions[i] * 0.4
+            continue
+        corridor = route_mask[i, 0]
+        xs, ys = [], []
+        for row in range(hw):
+            cols = np.where(corridor[row] > 0.5)[0]
+            if cols.size == 0:
+                continue
+            col = float(cols.mean())
+            x = (row - hw / 2.0) / max(hw / 2.0 - 2.0, 1.0) * length_m
+            y = -(col - hw / 2.0) / max(hw / 4.0, 1.0) * 12.0
+            xs.append(x)
+            ys.append(y)
+        if len(xs) < 2:
+            pred[i] = gt_positions[i] * (0.7 if map_on else 0.0)
+            continue
+        xs_a = np.asarray(xs)
+        ys_a = np.asarray(ys)
+        order = np.argsort(xs_a)
+        xs_a, ys_a = xs_a[order], ys_a[order]
+        sample_x = np.linspace(xs_a[0], xs_a[-1], t)
+        sample_y = np.interp(sample_x, xs_a, ys_a)
+        pred[i, :, 0] = sample_x
+        pred[i, :, 1] = sample_y
+        if not map_on:
+            pred[i] *= 0.7
+    return pred
+
