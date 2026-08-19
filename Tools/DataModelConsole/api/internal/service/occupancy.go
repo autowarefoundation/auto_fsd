@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	occupancySetSchema           = "semantic_occupancy_set_v1"
-	occupancySetPrefix           = "semantic-occupancy-sets/schema=v1"
+	occupancySetSchema           = "semantic_occupancy_set_v2"
+	occupancySetPrefix           = "semantic-occupancy-sets/schema=v2"
 	maxOccupancySetManifestBytes = 8 << 20
 	maxOccupancyModels           = 128
 )
@@ -38,11 +38,14 @@ var occupancyClassNames = map[string]struct{}{
 }
 
 type occupancySetModelSource struct {
-	Config             string `json:"config"`
-	LicenseSPDX        string `json:"license_spdx"`
-	Repository         string `json:"repository"`
-	RepositoryRevision string `json:"repository_revision"`
-	WeightSHA256       string `json:"weight_sha256"`
+	CodeLicenseSPDX         string `json:"code_license_spdx"`
+	Config                  string `json:"config"`
+	LicenseSPDX             string `json:"license_spdx"`
+	Repository              string `json:"repository"`
+	RepositoryRevision      string `json:"repository_revision"`
+	TrainingDataLicenseSPDX string `json:"training_data_license_spdx"`
+	WeightSHA256            string `json:"weight_sha256"`
+	WeightSourceURL         string `json:"weight_source_url"`
 }
 
 type occupancySetShard struct {
@@ -70,6 +73,7 @@ type occupancySetManifest struct {
 	ModelArtifactID       string                  `json:"model_artifact_id"`
 	ModelFamily           string                  `json:"model_family"`
 	ModelSource           occupancySetModelSource `json:"model_source"`
+	ProducerConfig        map[string]any          `json:"producer_config"`
 	SampleCount           int                     `json:"sample_count"`
 	ShardCount            int                     `json:"shard_count"`
 	Shards                []occupancySetShard     `json:"shards"`
@@ -91,12 +95,13 @@ func occupancySetDiscoveryPrefix(dataset, version string) string {
 }
 
 func occupancySetManifestKey(
-	dataset, version, modelArtifactID string,
+	dataset, version, modelArtifactID, datasetManifestSHA256 string,
 ) string {
 	return fmt.Sprintf(
-		"%smodel=%s/manifest.json",
+		"%smodel=%s/manifest=%s/manifest.json",
 		occupancySetDiscoveryPrefix(dataset, version),
 		modelArtifactID,
+		datasetManifestSHA256,
 	)
 }
 
@@ -173,11 +178,12 @@ func decodeOccupancySetManifest(
 		return nil, fmt.Errorf("occupancy set dataset publication differs")
 	}
 	if !isLowerHexDigest(manifest.ModelArtifactID) ||
-		manifest.ModelSource.WeightSHA256 != manifest.ModelArtifactID ||
+		!isLowerHexDigest(manifest.ModelSource.WeightSHA256) ||
 		key != occupancySetManifestKey(
 			dataset,
 			version,
 			manifest.ModelArtifactID,
+			datasetManifestSHA256,
 		) {
 		return nil, fmt.Errorf("occupancy set model identity is invalid")
 	}
@@ -192,12 +198,15 @@ func decodeOccupancySetManifest(
 		return nil, fmt.Errorf("occupancy set created_at is invalid: %w", err)
 	}
 	for label, value := range map[string]string{
-		"display_name":              manifest.DisplayName,
-		"model_family":              manifest.ModelFamily,
-		"model_source.config":       manifest.ModelSource.Config,
-		"model_source.license_spdx": manifest.ModelSource.LicenseSPDX,
-		"model_source.repository":   manifest.ModelSource.Repository,
-		"model_source.revision":     manifest.ModelSource.RepositoryRevision,
+		"display_name":                            manifest.DisplayName,
+		"model_family":                            manifest.ModelFamily,
+		"model_source.code_license_spdx":          manifest.ModelSource.CodeLicenseSPDX,
+		"model_source.config":                     manifest.ModelSource.Config,
+		"model_source.license_spdx":               manifest.ModelSource.LicenseSPDX,
+		"model_source.repository":                 manifest.ModelSource.Repository,
+		"model_source.revision":                   manifest.ModelSource.RepositoryRevision,
+		"model_source.training_data_license_spdx": manifest.ModelSource.TrainingDataLicenseSPDX,
+		"model_source.weight_source_url":          manifest.ModelSource.WeightSourceURL,
 	} {
 		if value == "" || strings.TrimSpace(value) != value {
 			return nil, fmt.Errorf("%s must be a non-empty trimmed string", label)
@@ -206,6 +215,26 @@ func decodeOccupancySetManifest(
 	repository, err := url.Parse(manifest.ModelSource.Repository)
 	if err != nil || repository.Scheme != "https" || repository.Host == "" {
 		return nil, fmt.Errorf("occupancy set repository must be an HTTPS URL")
+	}
+	weightSource, err := url.Parse(manifest.ModelSource.WeightSourceURL)
+	if err != nil ||
+		(weightSource.Scheme != "https" || weightSource.Host == "") &&
+			(weightSource.Scheme != "urn" ||
+				weightSource.Opaque !=
+					"sha256:"+manifest.ModelSource.WeightSHA256) {
+		return nil, fmt.Errorf(
+			"occupancy set weight source must be HTTPS or its SHA-256 URN",
+		)
+	}
+	if len(manifest.ProducerConfig) == 0 {
+		return nil, fmt.Errorf("occupancy set producer_config must not be empty")
+	}
+	for key := range manifest.ProducerConfig {
+		if key == "" || strings.TrimSpace(key) != key {
+			return nil, fmt.Errorf(
+				"occupancy set producer_config has an invalid key",
+			)
+		}
 	}
 	if err := validateTrimmedStrings(
 		manifest.SupportedClasses,
@@ -345,6 +374,10 @@ func occupancyModelForShard(
 	if !ok {
 		return model.SemanticOccupancyModel{}, false
 	}
+	producerConfig := make(map[string]any, len(manifest.ProducerConfig))
+	for key, value := range manifest.ProducerConfig {
+		producerConfig[key] = value
+	}
 	return model.SemanticOccupancyModel{
 		ModelArtifactID:       manifest.ModelArtifactID,
 		DisplayName:           manifest.DisplayName,
@@ -361,12 +394,16 @@ func occupancyModelForShard(
 		TeacherAvailable:      manifest.TeacherAvailable,
 		Limitations:           append([]string(nil), manifest.Limitations...),
 		ModelSource: model.SemanticOccupancyModelSource{
-			Config:             manifest.ModelSource.Config,
-			LicenseSPDX:        manifest.ModelSource.LicenseSPDX,
-			Repository:         manifest.ModelSource.Repository,
-			RepositoryRevision: manifest.ModelSource.RepositoryRevision,
-			WeightSHA256:       manifest.ModelSource.WeightSHA256,
+			CodeLicenseSPDX:         manifest.ModelSource.CodeLicenseSPDX,
+			Config:                  manifest.ModelSource.Config,
+			LicenseSPDX:             manifest.ModelSource.LicenseSPDX,
+			Repository:              manifest.ModelSource.Repository,
+			RepositoryRevision:      manifest.ModelSource.RepositoryRevision,
+			TrainingDataLicenseSPDX: manifest.ModelSource.TrainingDataLicenseSPDX,
+			WeightSHA256:            manifest.ModelSource.WeightSHA256,
+			WeightSourceURL:         manifest.ModelSource.WeightSourceURL,
 		},
+		ProducerConfig:   producerConfig,
 		SampleCount:      manifest.SampleCount,
 		ShardCount:       manifest.ShardCount,
 		ShardSampleCount: entry.SampleCount,
@@ -411,7 +448,10 @@ func (s *S3Service) ListSemanticOccupancyModels(
 		}
 		for _, object := range page.Contents {
 			key := aws.ToString(object.Key)
-			if !strings.HasSuffix(key, "/manifest.json") {
+			if !strings.HasSuffix(
+				key,
+				"/manifest="+publication.SHA256+"/manifest.json",
+			) {
 				continue
 			}
 			keys = append(keys, key)
@@ -474,7 +514,12 @@ func (s *S3Service) GetPublishedSemanticOccupancyBody(
 	}
 	manifest, err := s.loadOccupancySetManifest(
 		ctx,
-		occupancySetManifestKey(dataset, version, modelArtifactID),
+		occupancySetManifestKey(
+			dataset,
+			version,
+			modelArtifactID,
+			publication.SHA256,
+		),
 		dataset,
 		version,
 		publication.SHA256,
