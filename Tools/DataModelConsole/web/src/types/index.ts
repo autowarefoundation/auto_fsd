@@ -173,11 +173,14 @@ export interface OverlayModelsResponse {
 }
 
 export interface SemanticOccupancyModelSource {
+  code_license_spdx: string;
   config: string;
   license_spdx: string;
   repository: string;
   repository_revision: string;
+  training_data_license_spdx: string;
   weight_sha256: string;
+  weight_source_url: string;
 }
 
 export interface SemanticOccupancyModel {
@@ -198,6 +201,7 @@ export interface SemanticOccupancyModel {
   teacher_available: boolean;
   limitations: string[];
   model_source: SemanticOccupancyModelSource;
+  producer_config: Record<string, unknown>;
   sample_count: number;
   shard_count: number;
   shard_sample_count: number;
