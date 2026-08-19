@@ -1,9 +1,23 @@
 from typing import Any, Dict, Optional
 
+import torch
 import torch.nn as nn
 
 from .reactive_e2e import ReactiveE2E
 from .world_action_model import RollingHistoryBuffer, WorldActionModel
+
+# Egomotion history is 64 timesteps x [speed, acceleration, yaw_rate, curvature]
+# (see data_parsing/*/egomotion.py — the layout is identical for KITScenes, L2D
+# and PhysicalAI). 
+_EGOMOTION_SIGNALS = 4
+_SPEED_INDEX = 0
+_ACCELERATION_INDEX = 1
+
+# Raw speed in m/s divided by 33, corresponding to a max speed of 74 mph.
+_SPEED_SCALE = 33.0
+# Raw acceleration in m/s^2 divided by 8, since that equates to a harsh
+# emergency braking manoeuvre.
+_ACCELERATION_SCALE = 8.0
 
 # Geometry arguments from the pre-#77/#107 forward signature. They are no longer
 # parameters, so **kwargs would absorb them and forward on to the planner, which
@@ -15,6 +29,40 @@ _REMOVED_GEOMETRY_KWARGS = (
     "camera_params", "camera_matrices", "calib", "calibration",
     "intrinsics", "extrinsics", "projection_matrix",
 )
+
+
+def normalize_egomotion(egomotion_history):
+    """Scale the speed and acceleration signals of an egomotion history.
+
+    Args:
+        egomotion_history: ``[..., T * 4]`` history, last dim laid out as
+            ``T`` repeats of ``[speed, acceleration, yaw_rate, curvature]``.
+
+    Returns:
+        A tensor of the same shape, dtype and device with the speed and
+        acceleration columns scaled and the angular signals untouched.
+    """
+    width = egomotion_history.shape[-1]
+    if width % _EGOMOTION_SIGNALS != 0:
+        raise ValueError(
+            f"egomotion history width {width} is not a multiple of "
+            f"{_EGOMOTION_SIGNALS} signals per timestep"
+        )
+
+    # One broadcast multiply over the whole history. 
+    scales = torch.ones(
+        _EGOMOTION_SIGNALS,
+        dtype=egomotion_history.dtype,
+        device=egomotion_history.device,
+    )
+    scales[_SPEED_INDEX] = 1.0 / _SPEED_SCALE
+    scales[_ACCELERATION_INDEX] = 1.0 / _ACCELERATION_SCALE
+
+    timesteps = width // _EGOMOTION_SIGNALS
+    scaled = egomotion_history.reshape(
+        *egomotion_history.shape[:-1], timesteps, _EGOMOTION_SIGNALS
+    ) * scales
+    return scaled.reshape(egomotion_history.shape)
 
 
 class AutoE2E(nn.Module):
@@ -33,23 +81,6 @@ class AutoE2E(nn.Module):
                  enable_reasoning=False, reasoning_mode="none",
                  reasoning_kwargs: Optional[Dict[str, Any]] = None):
         super(AutoE2E, self).__init__()
-
-        # Normalization of the egomotion history vector
-      
-        def normalize_egomotion(egomotion_history):
-            for b in range(0, len(egomotion_history)):
-                for i in range(0, len(egomotion_history[b]), 4):
-                    # speed normalized equals raw speed in m/s divided by 33
-                    # corresponding to a max speed of 74 mph
-                    egomotion_history[b][i] = egomotion_history[b][i]/33
-        
-                    # acceleration normalized equals raw acceleration in 
-                    # ms/2 divided by 8, since that equates to harsh
-                    # emergency braking maneouvre
-                    egomotion_history[b][i+1] = egomotion_history[b][i+1]/8
-
-        self.normalize_egomotion = normalize_egomotion
-
 
         # Reactive model which runs at 10Hz and processes multi-camera inputs
         # a rendered map image and egomotion history to predict a driving trajectory
@@ -118,6 +149,10 @@ class AutoE2E(nn.Module):
             )
             self.visual_history_buffer = RollingHistoryBuffer(history_len=history_len)
 
+    # Bound as a staticmethod rather than an instance attribute so the module
+    # stays deep-copyable and picklable — a closure stored on self is neither.
+    normalize_egomotion = staticmethod(normalize_egomotion)
+
     def reset_visual_history(self):
         """Clear the World Model's rolling buffer (call between sequences)."""
         if self.visual_history_buffer is not None:
@@ -184,11 +219,10 @@ class AutoE2E(nn.Module):
                 f"geometry_type='pseudo' — a learned spatial prior, not your calibration."
             )
 
-        # Normalization function for egomotion_history
-        # scales the raw speed and acceleration values to a sensible range
-        # for the model
-        self.normalize_egomotion(egomotion_history)
-
+        # Scale the raw speed and acceleration values into a sensible range for
+        # the model. Rebinds rather than mutating: the caller's batch is not
+        # ours to write to (see normalize_egomotion).
+        egomotion_history = self.normalize_egomotion(egomotion_history)
 
         # World Action Model (1 Hz): produce the Encoded Visual History fed to the
         # reactive planner + reasoning branch, and (in training) the predicted
