@@ -19,6 +19,7 @@ phases:
       - echo "=== Pre-pulling previous latests for layer cache ==="
       - (docker pull ${ECR_URL}/auto-e2e/training:latest || true) &
       - (docker pull ${ECR_URL}/auto-e2e/data-prep:latest || true) &
+      - (docker pull ${ECR_URL}/auto-e2e/bevformer-v2:latest || true) &
       - wait
   build:
     commands:
@@ -47,6 +48,15 @@ phases:
           -t ${ECR_URL}/auto-e2e/data-prep:${IMAGE_TAG}
           -f Platform/docker/data-prep/Dockerfile .
 
+      # ── BEVFormer V2 ── pinned legacy CUDA/OpenMMLab runtime used only by
+      # occupancy publication. Keep it separate from the shared training image.
+      - echo "=== Building BEVFormer V2 occupancy image ==="
+      - DOCKER_BUILDKIT=1 docker build
+          --cache-from ${ECR_URL}/auto-e2e/bevformer-v2:latest
+          --build-arg BUILDKIT_INLINE_CACHE=1
+          -t ${ECR_URL}/auto-e2e/bevformer-v2:${IMAGE_TAG}
+          -f Platform/docker/bevformer-v2/Dockerfile .
+
       # ── Push ALL images in parallel now that every image is built. ECR dedups
       # blobs so the training/eval/offline-rl push is paid once, and data-prep
       # ships in parallel — much faster than the old sequential push.
@@ -60,12 +70,15 @@ phases:
         PID_O=$!
         docker push ${ECR_URL}/auto-e2e/data-prep:${IMAGE_TAG} &
         PID_D=$!
+        docker push ${ECR_URL}/auto-e2e/bevformer-v2:${IMAGE_TAG} &
+        PID_B=$!
         # wait -n was returning early on some CodeBuild agents; wait on each PID
         # explicitly so a push failure is surfaced.
         wait $PID_T && echo "training pushed" || exit 1
         wait $PID_E && echo "eval pushed" || exit 1
         wait $PID_O && echo "offline-rl pushed" || exit 1
         wait $PID_D && echo "data-prep pushed" || exit 1
+        wait $PID_B && echo "bevformer-v2 pushed" || exit 1
 
 cache:
   paths:
