@@ -23,6 +23,7 @@ import type {
   SampleDetail,
   SampleListResponse,
   SceneSearchResult,
+  SemanticOccupancyModelsResponse,
   ShardIndex,
   ShardListResponse,
   RigProjectionDocument,
@@ -387,6 +388,30 @@ export async function getShardSemanticOccupancy(
     "application/vnd.auto-e2e.semantic-occupancy",
   );
   return response.arrayBuffer();
+}
+
+export async function listShardSemanticOccupancyModels(
+  dataset: string,
+  shard: string,
+  version?: string,
+): Promise<SemanticOccupancyModelsResponse> {
+  const response = await apiFetch<SemanticOccupancyModelsResponse>(
+    `/api/v1/datasets/${encodeURIComponent(dataset)}/shards/${encodeURIComponent(shard)}/semantic-occupancy-models${versionParam(version, "?")}`,
+  );
+  if (
+    response.dataset !== dataset ||
+    response.shard !== shard ||
+    !response.version ||
+    (version && response.version !== version)
+  ) {
+    throw new Error(
+      "semantic occupancy catalog returned invalid coordinates",
+    );
+  }
+  return {
+    ...response,
+    models: response.models ?? [],
+  };
 }
 
 export function getSampleNavigationMapURL(
