@@ -3108,6 +3108,11 @@ def train_il(
     # until the reasoning branch is actually learnable.
     reasoning_loss_weight: float = 0.05,
     enable_world_model: bool = False,
+    # Opt-in Delta-JEPA: WorldActionModel.action_dim = flattened (a, κ) plan
+    # (64*2=128). AutoE2E teacher-forces JEPA with trajectory_target. Default
+    # off so Combined runs stay history-only (zero-init residual is a no-op
+    # until this flag actually builds the projection).
+    action_conditioned_jepa: bool = False,
     jepa_loss_weight: float = 1.0,
     # Held-out split: train on the (1 - val_fraction) majority of scene groups, so the
     # separate eval task can score the disjoint val split and measure
@@ -3150,7 +3155,9 @@ def train_il(
     path (encode_history → aggregate → predict_future), and jepa_loss compares
     the prediction against the frozen target on the real future frames. The WM
     also supplies the Encoded Visual History to the planner and reasoning branch
-    (otherwise visual_history is zeros).
+    (otherwise visual_history is zeros). ``action_conditioned_jepa`` builds the
+    WM with ``action_dim`` equal to the flattened plan and AutoE2E passes
+    ``trajectory_target`` into ``predict_future`` (teacher-forced Delta-JEPA).
 
     KITScenes requires the hash-bound output of
     ``audit_kitscenes_navigation_quality``. The frozen validation inventory is
@@ -3913,6 +3920,14 @@ def train_il(
 
     # Route is fused only through the Reactive navigation encoder. Reasoning
     # receives no route-derived argument.
+    if action_conditioned_jepa and not enable_world_model:
+        raise ValueError(
+            "action_conditioned_jepa=True requires enable_world_model=True"
+        )
+    world_model_kwargs = (
+        {"action_dim": AUTO_E2E_TIMESTEPS * 2}
+        if action_conditioned_jepa else None
+    )
     model = AutoE2E(
         backbone=bb, num_views=num_views, embed_dim=256,
         is_pretrained=True,
@@ -3923,10 +3938,12 @@ def train_il(
         map_fusion_mode=mfm,
         enable_reasoning=enable_reasoning, reasoning_mode=reasoning_mode,
         enable_world_model=enable_world_model,
+        world_model_kwargs=world_model_kwargs,
     ).to(device)
     print(f"Reasoning: {'on' if enable_reasoning else 'off'}"
           + (f" (mode={reasoning_mode})" if enable_reasoning else ""))
-    print(f"World Model: {'on' if enable_world_model else 'off'}")
+    print(f"World Model: {'on' if enable_world_model else 'off'}"
+          + (" (action-conditioned JEPA)" if action_conditioned_jepa else ""))
 
     # Optimizer + scheduler + loss.
     optimizer = torch.optim.AdamW(
@@ -4056,6 +4073,11 @@ def train_il(
         "enable_reasoning": enable_reasoning,
         "reasoning_mode": reasoning_mode,
         "enable_world_model": enable_world_model,
+        "world_model_kwargs": (
+            {"action_dim": AUTO_E2E_TIMESTEPS * 2}
+            if action_conditioned_jepa else {}
+        ),
+        "action_conditioned_jepa": action_conditioned_jepa,
         "optimizer": "AdamW",
         "lr": lr,
         "training_seed": training_seed,
@@ -4409,6 +4431,9 @@ def train_il(
                 "model/backbone": bb,
                 "model/fusion_mode": fm,
                 "model/map_fusion_mode": mfm,
+                "model/action_conditioned_jepa": (
+                    action_conditioned_jepa
+                ),
                 "model/num_views": num_views,
                 "model/navigation_geometry_id": (
                     navigation_geometry_id or "legacy"
@@ -8721,6 +8746,7 @@ def wf_train_il(
     enable_reasoning: bool = False,
     reasoning_mode: str = "pooled_latent",
     enable_world_model: bool = False,
+    action_conditioned_jepa: bool = False,
     val_fraction: float = 0.1,
     validation_scope: str = "full",
     num_workers: int = 0,
@@ -8758,7 +8784,9 @@ def wf_train_il(
                    reconstruction_audit_decision=reconstruction_audit_decision,
                    reconstruction_audit_rationale=reconstruction_audit_rationale,
                    enable_reasoning=enable_reasoning, reasoning_mode=reasoning_mode,
-                   enable_world_model=enable_world_model, val_fraction=val_fraction,
+                   enable_world_model=enable_world_model,
+                   action_conditioned_jepa=action_conditioned_jepa,
+                   val_fraction=val_fraction,
                    validation_scope=validation_scope,
                    num_workers=num_workers, resume_from=resume_from,
                    early_stopping_patience=early_stopping_patience,

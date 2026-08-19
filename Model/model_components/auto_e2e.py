@@ -167,6 +167,11 @@ class AutoE2E(nn.Module):
                 f"geometry_type='pseudo' — a learned spatial prior, not your calibration."
             )
 
+        # Optional Delta-JEPA action vector. Popped here so it never leaks into
+        # ReactiveE2E **kwargs. Teacher-force with trajectory_target when the WM
+        # was built with action_dim (train_il sets this via action_conditioned_jepa).
+        actions = kwargs.pop("actions", None)
+
         # World Action Model (1 Hz): produce the Encoded Visual History fed to the
         # reactive planner + reasoning branch, and (in training) the predicted
         # future feature maps for the JEPA loss. Two mutually exclusive paths:
@@ -184,6 +189,9 @@ class AutoE2E(nn.Module):
         future_state_pred = None
         if self.World_Action_Model_E2E is not None:
             wam = self.World_Action_Model_E2E
+            jepa_actions = None
+            if getattr(wam, "action_dim", None) is not None:
+                jepa_actions = actions if actions is not None else trajectory_target
             if history_frames is not None:
                 # A. Windowed, differentiable path. history_frames: [B, T, V, 3, H, W]
                 # (or [B, T, 3, H, W]) oldest→newest, current frame last.
@@ -199,7 +207,8 @@ class AutoE2E(nn.Module):
                 # JEPA trains the WM through the NON-detached visual_history
                 # (predict_future must see gradients into the aggregator/encoder).
                 if mode == "train":
-                    future_state_pred = wam.predict_future(visual_history)
+                    future_state_pred = wam.predict_future(
+                        visual_history, actions=jepa_actions)
                 # The planner reads a STOP-GRADIENT world-model representation:
                 # detach so the trajectory loss does not create a second,
                 # non-stationary gradient path into the WM (the WM is shaped by
@@ -221,7 +230,8 @@ class AutoE2E(nn.Module):
                 if egomotion_history.ndim == 3:
                     egomotion_history = egomotion_history[:, -1]
                 if mode == "train":
-                    future_state_pred = wam.predict_future(visual_history)
+                    future_state_pred = wam.predict_future(
+                        visual_history, actions=jepa_actions)
 
         # The reasoning branch runs INSIDE ReactiveE2E (after TemporalMemory).
         # In train mode with reasoning on, ReactiveE2E returns

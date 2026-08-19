@@ -1,0 +1,22 @@
+{
+  "train_steps": 12,
+  "source": "mock_batch",
+  "history": {
+    "jepa": 0.07252124696969986,
+    "loss_first": 0.501481831073761,
+    "loss_last": 0.6022467613220215
+  },
+  "action": {
+    "jepa": 0.06883622705936432,
+    "jepa_shuffled_actions": 0.06883696466684341,
+    "jepa_init_matched": 0.09822632372379303,
+    "jepa_init_shuffled": 0.09822632372379303,
+    "loss_first": 0.5015864968299866,
+    "loss_last": 0.4974386692047119,
+    "action_proj_l2": 2.4030466079711914,
+    "pred_l1_init_matched_vs_shuffled": 0.0,
+    "pred_l1_trained_matched_vs_shuffled": 0.0103407958522439
+  },
+  "jepa_delta_action_minus_history": -0.0036850199103355408,
+  "jepa_delta_shuffled_minus_matched": 7.37607479095459e-07
+}
