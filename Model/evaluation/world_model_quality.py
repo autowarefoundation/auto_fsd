@@ -252,3 +252,132 @@ def summarize_world_model_quality(
     if open_loop:
         out.update({f"ol_{k}": float(v) for k, v in open_loop.items()})
     return out
+
+
+def _jepa_targets_from_frames(
+    wam: torch.nn.Module, future_frames: torch.Tensor
+) -> list[torch.Tensor]:
+    future_obs = [future_frames[:, k] for k in range(wam.num_future_steps)]
+    return wam.target(future_obs)
+
+
+def measure_jepa_on_batch(
+    model: torch.nn.Module,
+    camera_tiles: torch.Tensor,
+    map_context: torch.Tensor,
+    visual_history: torch.Tensor,
+    egomotion_history: torch.Tensor,
+    history_frames: torch.Tensor,
+    future_frames: torch.Tensor,
+    trajectory_target: torch.Tensor,
+) -> dict[str, float]:
+    """JEPA recon + Reactive/Combined ADE on one batch (model in eval)."""
+    wam = getattr(model, "World_Action_Model_E2E", None)
+    if wam is None:
+        raise ValueError("measure_jepa_on_batch requires enable_world_model=True")
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            out = model(
+                camera_tiles, map_context, visual_history, egomotion_history,
+                mode="train",
+                trajectory_target=trajectory_target,
+                history_frames=history_frames,
+                future_frames=future_frames,
+            )
+            _traj_pred, aux = out
+            pred_maps = aux["future_state_pred"]
+            target_maps = _jepa_targets_from_frames(wam, future_frames)
+            jepa = jepa_reconstruction_metrics(pred_maps, target_maps)
+            null = null_predictor_metrics(target_maps)
+            rel = relative_jepa_improvement(jepa, null)
+
+            impact = world_model_trajectory_impact(
+                model, camera_tiles, map_context, visual_history, egomotion_history,
+            )
+
+            speed = np.full(_traj_pred.shape[0], 5.0)
+            gt_a, gt_c = _split_controls(trajectory_target.detach())
+            wam_mod = model.World_Action_Model_E2E
+            buf = model.visual_history_buffer
+            combined_infer = _traj(model(
+                camera_tiles, map_context, visual_history, egomotion_history,
+                mode="infer",
+            ))
+            model.World_Action_Model_E2E = None
+            model.visual_history_buffer = None
+            try:
+                reactive_infer = _traj(model(
+                    camera_tiles, map_context, visual_history, egomotion_history,
+                    mode="infer",
+                ))
+            finally:
+                model.World_Action_Model_E2E = wam_mod
+                model.visual_history_buffer = buf
+            open_loop = open_loop_pair_metrics(
+                reactive_infer, combined_infer, gt_a, gt_c, speed,
+            )
+    finally:
+        if was_training:
+            model.train()
+
+    return summarize_world_model_quality(
+        jepa={**jepa, **null, **rel},
+        impact=impact,
+        open_loop=open_loop,
+    )
+
+
+def train_world_model_quality(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    *,
+    steps: int = 20,
+    lr: float = 1e-3,
+) -> dict[str, float]:
+    """Train Combined (IL + JEPA) for ``steps``, then measure held-in-batch quality.
+
+    This is the review-facing experiment: numbers come from a *trained* model,
+    not random init. Pass packed-shard tensors the same way ``gpu_verify_train``
+    does when a real ``--shard-dir`` is available.
+    """
+    wam = getattr(model, "World_Action_Model_E2E", None)
+    if wam is None:
+        raise ValueError("train_world_model_quality requires enable_world_model=True")
+
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    traj_loss_fn = torch.nn.SmoothL1Loss()
+    history: list[float] = []
+
+    for _ in range(int(steps)):
+        opt.zero_grad(set_to_none=True)
+        out = model(
+            batch["camera_tiles"], batch["map_context"],
+            batch["visual_history"], batch["egomotion_history"],
+            mode="train",
+            trajectory_target=batch["trajectory_target"],
+            history_frames=batch["history_frames"],
+            future_frames=batch["future_frames"],
+        )
+        trajectory, aux = out
+        loss = traj_loss_fn(trajectory, batch["trajectory_target"])
+        jepa = wam.jepa_loss(aux["future_state_pred"], aux["future_frames"])
+        total = loss + jepa
+        total.backward()
+        opt.step()
+        history.append(float(total.detach()))
+
+    metrics = measure_jepa_on_batch(
+        model,
+        batch["camera_tiles"], batch["map_context"],
+        batch["visual_history"], batch["egomotion_history"],
+        batch["history_frames"], batch["future_frames"],
+        batch["trajectory_target"],
+    )
+    metrics["train_loss_first"] = history[0]
+    metrics["train_loss_last"] = history[-1]
+    metrics["train_steps"] = float(steps)
+    return metrics

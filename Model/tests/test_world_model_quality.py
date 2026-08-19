@@ -16,6 +16,7 @@ from evaluation.world_model_quality import (
     open_loop_pair_metrics,
     relative_jepa_improvement,
     summarize_world_model_quality,
+    train_world_model_quality,
     trajectory_impact_metrics,
     world_model_trajectory_impact,
 )
@@ -129,3 +130,27 @@ def test_world_model_impact_runs(build_mock_model, device):
     m = world_model_trajectory_impact(model, *inputs)
     assert "trajectory_l2" in m
     assert np.isfinite(m["trajectory_l2"])
+
+
+def test_trained_quality_reports_ade_and_jepa(build_mock_model, device):
+    torch.manual_seed(0)
+    views = 6
+    model = build_mock_model(
+        num_views=views, device=device, enable_world_model=True,
+    )
+    b = 2
+    batch = {
+        "camera_tiles": torch.randn(b, views, 3, 256, 256, device=device),
+        "map_context": torch.randn(b, 3, 256, 256, device=device),
+        "visual_history": torch.zeros(b, 896, device=device),
+        "egomotion_history": torch.randn(b, 256, device=device),
+        "trajectory_target": torch.randn(b, 128, device=device),
+        "history_frames": torch.randn(b, 4, views, 3, 256, 256, device=device),
+        "future_frames": torch.randn(b, 4, views, 3, 256, 256, device=device),
+    }
+    metrics = train_world_model_quality(model, batch, steps=6, lr=1e-3)
+    assert metrics["train_loss_last"] < metrics["train_loss_first"]
+    assert np.isfinite(metrics["jepa_l1"])
+    assert np.isfinite(metrics["ol_combined_ADE@3s"])
+    assert np.isfinite(metrics["ol_reactive_ADE@3s"])
+    assert "ol_ade3s_delta_combined_minus_reactive" in metrics
