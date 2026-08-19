@@ -36,6 +36,9 @@ from Platform.pipelines.bevformer_v2_occupancy import (
 )
 
 BEVFORMER_V2_CAMERA_COUNT = 6
+# KITScenes stores front-left before front-right. The official nuScenes info
+# converter and learned camera embeddings use front-right before front-left.
+BEVFORMER_V2_CAMERA_ORDER = (0, 2, 1, 3, 4, 5)
 BEVFORMER_V2_IMAGE_HEIGHT = 256
 BEVFORMER_V2_IMAGE_WIDTH = 640
 BEVFORMER_V2_IMAGE_MEAN_BGR = (103.53, 116.28, 123.675)
@@ -125,6 +128,7 @@ def _sample_from_members(
         projection_spec.get("matrix"),
         dtype=np.float64,
     )
+    projection = projection[np.asarray(BEVFORMER_V2_CAMERA_ORDER)]
     return PackedBEVFormerFrame(
         sample_uid=sample_uid,
         episode_id=episode_id,
@@ -132,7 +136,7 @@ def _sample_from_members(
         timestamp_ns=timestamp_ns,
         image_payloads=tuple(
             members[f"cam_{camera}.jpg"]
-            for camera in range(BEVFORMER_V2_CAMERA_COUNT)
+            for camera in BEVFORMER_V2_CAMERA_ORDER
         ),
         projection_ref_to_camera=projection,
         pose=pose,
@@ -208,6 +212,14 @@ def _world_pose(
     )
 
 
+def _packed_image_size(payload: bytes) -> tuple[int, int]:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(payload)) as source:
+        source.verify()
+        return source.size
+
+
 def bevformer_metadata_for(
     frames: Mapping[int, PackedBEVFormerFrame],
     *,
@@ -233,6 +245,15 @@ def bevformer_metadata_for(
         )
         projections = []
         frame_to_current: np.ndarray | None = None
+        packed_sizes = tuple(
+            _packed_image_size(payload)
+            for payload in frame.image_payloads
+        )
+        if len(set(packed_sizes)) != 1:
+            raise ValueError(
+                "BEVFormer V2 requires equal packed camera dimensions"
+            )
+        packed_width, packed_height = packed_sizes[0]
         for packed_projection in frame.projection_ref_to_camera:
             if offset == 0:
                 aligned = packed_projection
@@ -244,7 +265,11 @@ def bevformer_metadata_for(
                         current_to_world=current_to_world,
                     )
                 )
-            scaled = scale_packed_projection(aligned)
+            scaled = scale_packed_projection(
+                aligned,
+                packed_width=packed_width,
+                packed_height=packed_height,
+            )
             homogeneous = np.eye(4, dtype=np.float32)
             homogeneous[:3, :] = scaled.astype(np.float32)
             projections.append(homogeneous)
@@ -273,11 +298,16 @@ def bevformer_metadata_for(
             "pad_shape": [image_shape] * BEVFORMER_V2_CAMERA_COUNT,
             "sample_idx": frame.sample_uid,
             "scale_factor": np.asarray(
-                [2.5, 1.0, 2.5, 1.0],
+                [
+                    BEVFORMER_V2_IMAGE_WIDTH / packed_width,
+                    BEVFORMER_V2_IMAGE_HEIGHT / packed_height,
+                    BEVFORMER_V2_IMAGE_WIDTH / packed_width,
+                    BEVFORMER_V2_IMAGE_HEIGHT / packed_height,
+                ],
                 dtype=np.float32,
             ),
             "scene_token": frame.episode_id,
-            "timestamp": frame.timestamp_ns / 1_000_000.0,
+            "timestamp": frame.timestamp_ns / 1_000_000_000.0,
         }
     return output
 
@@ -484,6 +514,11 @@ def load_official_bevformer_v2(
             "CLASSES",
             BEVFORMER_V2_CLASS_NAMES,
         )
+        if tuple(model.CLASSES) != BEVFORMER_V2_CLASS_NAMES:
+            raise ValueError(
+                "BEVFormer checkpoint class order differs from the pinned "
+                "detector contract"
+            )
         model.to(device)
         model.eval()
         return model, LiDARInstance3DBoxes
