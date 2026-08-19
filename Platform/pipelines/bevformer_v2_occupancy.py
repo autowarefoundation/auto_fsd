@@ -24,6 +24,12 @@ BEVFORMER_V2_CONFIG_NAME = "bevformerv2-r50-t8-24ep.py"
 BEVFORMER_V2_WEIGHT_SHA256 = (
     "5585bc4d3ff8b396928cb92d91f773a2c57a81258f83cab0c668ebb2eb9d3307"
 )
+BEVFORMER_V2_WEIGHT_SOURCE_URL = (
+    "https://drive.google.com/drive/folders/1Ml_usx5BNx43CFH1Di2OTazuzSyAlBto"
+)
+BEVFORMER_V2_CODE_LICENSE_SPDX = "Apache-2.0"
+BEVFORMER_V2_WEIGHT_LICENSE_SPDX = "NOASSERTION"
+BEVFORMER_V2_TRAINING_DATA_LICENSE_SPDX = "CC-BY-NC-SA-4.0"
 BEVFORMER_V2_HEAD_VERSION = "bevformer-v2-r50-t8-box-raster-v1"
 BEVFORMER_V2_ARTIFACT_KIND = "detection-derived-occupancy"
 BEVFORMER_V2_FRAMES = (-7, -6, -5, -4, -3, -2, -1, 0)
@@ -288,8 +294,10 @@ def rasterize_detection_boxes(
         sin_yaw = math.sin(detection.yaw_rad)
         delta_x = x_grid - detection.center_x_m
         delta_y = y_grid - detection.center_y_m
-        box_forward = delta_x * cos_yaw + delta_y * sin_yaw
-        box_left = -delta_x * sin_yaw + delta_y * cos_yaw
+        # Match mmdet3d v0.17.1 LiDARInstance3DBoxes.corners. Its row-vector
+        # local-to-LiDAR rotation is clockwise, so this is the inverse map.
+        box_forward = delta_x * cos_yaw - delta_y * sin_yaw
+        box_left = delta_x * sin_yaw + delta_y * cos_yaw
         occupied = (
             (np.abs(box_forward) <= detection.length_m * 0.5)
             & (np.abs(box_left) <= detection.width_m * 0.5)
@@ -310,6 +318,12 @@ def provenance() -> Mapping[str, object]:
         "repository": BEVFORMER_V2_REPOSITORY,
         "repository_revision": BEVFORMER_V2_REVISION,
         "weight_sha256": BEVFORMER_V2_WEIGHT_SHA256,
+        "weight_source_url": BEVFORMER_V2_WEIGHT_SOURCE_URL,
+        "code_license_spdx": BEVFORMER_V2_CODE_LICENSE_SPDX,
+        "weight_license_spdx": BEVFORMER_V2_WEIGHT_LICENSE_SPDX,
+        "training_data_license_spdx": (
+            BEVFORMER_V2_TRAINING_DATA_LICENSE_SPDX
+        ),
         "supported_semantic_classes": list(
             BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES
         ),
@@ -318,7 +332,16 @@ def provenance() -> Mapping[str, object]:
             "Official BEVFormer V2 publishes 3-D detection, not BEV segmentation.",
             "Object occupancy is derived only from predicted box footprints.",
             "Road and map classes are unsupported and remain empty.",
-            "KITScenes packed 256x256 images differ from nuScenes training data.",
+            (
+                "KITScenes packed square images are stretched to the official "
+                "2.5:1 input aspect; this changes the source-camera aspect "
+                "ratio and uses 2.5x lower linear resolution than official "
+                "nuScenes evaluation."
+            ),
             "Teacher and Error views are unavailable without perception labels.",
+            (
+                "The public weight has no separately stated license; its "
+                "nuScenes training data is CC-BY-NC-SA-4.0."
+            ),
         ],
     }
