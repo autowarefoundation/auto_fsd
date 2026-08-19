@@ -126,6 +126,10 @@ func main() {
 				overlayH.Body,
 			)
 			r.Get(
+				"/datasets/{name}/shards/{shard}/semantic-occupancy-models",
+				overlayH.OccupancyModels,
+			)
+			r.Get(
 				"/datasets/{name}/shards/{shard}/semantic-occupancy/{model_id}",
 				overlayH.SemanticOccupancy,
 			)
