@@ -11,6 +11,7 @@ Synthetic tensors, no GPU / network. Covers, for both Bezier and Flow-matching:
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -193,6 +194,19 @@ def test_confidence_scales_residual_and_preserves_zero_init():
     pooled = pool_reasoning_confidence(torch.tensor([[0.2, 0.4, 0.6, 0.8, 1.0]]))
     assert pooled.shape == (1,)
     assert float(pooled) == pytest.approx(0.6)
+
+
+def test_confidence_coupling_ab_reports_ade(build_mock_model, device):
+    from evaluation.confidence_coupling_ab import run_confidence_coupling_ab
+
+    report = run_confidence_coupling_ab(
+        build_mock_model, device=device, steps=6, seed=0,
+    )
+    assert report["scaled"]["loss_last"] < report["scaled"]["loss_first"]
+    assert np.isfinite(report["scaled"]["ADE@3s"])
+    assert np.isfinite(report["unscaled"]["ADE@3s"])
+    assert np.isfinite(report["scaled_conf0"]["ADE@3s"])
+    assert np.isfinite(report["scaled_conf1"]["ADE@3s"])
 
 
 def test_expected_calibration_error_perfect_and_bad():
