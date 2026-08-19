@@ -99,6 +99,30 @@ def test_detection_yaw_rotates_the_footprint_and_overlap_uses_max_score():
     assert np.count_nonzero(np.isclose(raster[5], 0.9)) == 4
 
 
+def test_detection_yaw_matches_mmdet_clockwise_lidar_corners():
+    geometry = _geometry()
+    raster = rasterize_detection_boxes(
+        [
+            DetectionBox(
+                "car",
+                0.8,
+                0.0,
+                0.0,
+                4.0,
+                1.0,
+                math.pi / 4,
+            )
+        ],
+        geometry=geometry,
+    )
+    x_grid, y_grid = geometry.pixel_center_grids()
+    clockwise = np.isclose(x_grid, 0.5) & np.isclose(y_grid, -0.5)
+    mirrored = np.isclose(x_grid, 0.5) & np.isclose(y_grid, 0.5)
+
+    assert raster[5][clockwise].item() == pytest.approx(0.8)
+    assert raster[5][mirrored].item() == pytest.approx(0.0)
+
+
 def test_temporal_selection_matches_nuscenes_two_hz_history():
     assert temporal_frame_indices(100) == {
         -7: 65,
@@ -185,3 +209,7 @@ def test_provenance_discloses_detection_boundary_and_missing_teacher():
         "not BEV segmentation" in limitation
         for limitation in metadata["limitations"]
     )
+    assert metadata["code_license_spdx"] == "Apache-2.0"
+    assert metadata["weight_license_spdx"] == "NOASSERTION"
+    assert metadata["training_data_license_spdx"] == "CC-BY-NC-SA-4.0"
+    assert metadata["weight_source_url"].startswith("https://drive.google.com/")
