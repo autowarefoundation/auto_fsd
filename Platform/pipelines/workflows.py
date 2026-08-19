@@ -7912,8 +7912,11 @@ def precompute_semantic_occupancy_artifacts(
     checkpoint: FlyteFile,
     shard_dirs: List[FlyteDirectory],
     dataset: str,
+    dataset_version: str,
     dataset_manifest_sha256: str,
     artifacts_bucket: str,
+    publication_timestamp: str,
+    repository_revision: str,
     aws_region: str = "us-west-2",
     batch_size: int = 2,
     num_workers: int = 0,
@@ -7930,7 +7933,13 @@ def precompute_semantic_occupancy_artifacts(
     from data_parsing.pre_extracted import make_pre_extracted_loader
     from Platform.pipelines.inference import load_policy
     from Platform.pipelines.overlay_tasks import _put_s3_immutable
+    from Platform.pipelines.occupancy_store import (
+        encode_occupancy_set_manifest,
+        occupancy_set_manifest,
+        occupancy_set_s3_key,
+    )
     from Platform.pipelines.semantic_occupancy import (
+        SEMANTIC_OCCUPANCY_CLASS_NAMES,
         SEMANTIC_OCCUPANCY_GEOMETRY_ID,
         SEMANTIC_OCCUPANCY_HEAD_VERSION,
         SEMANTIC_OCCUPANCY_SCHEMA,
@@ -7946,7 +7955,10 @@ def precompute_semantic_occupancy_artifacts(
         )
     for name, value in (
         ("dataset", dataset),
+        ("dataset_version", dataset_version),
         ("artifacts_bucket", artifacts_bucket),
+        ("publication_timestamp", publication_timestamp),
+        ("repository_revision", repository_revision),
         ("aws_region", aws_region),
     ):
         if not value:
@@ -7971,6 +7983,11 @@ def precompute_semantic_occupancy_artifacts(
     model, config, checkpoint_sha256 = load_policy(
         checkpoint_path,
         device,
+    )
+    manifest_key = occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        checkpoint_sha256,
     )
     if not config.get("enable_bev_segmentation", False):
         raise ValueError("checkpoint has no BEV segmentation head")
@@ -8058,33 +8075,60 @@ def precompute_semantic_occupancy_artifacts(
     entries.sort(key=lambda entry: entry["shard"])
     if len({entry["shard"] for entry in entries}) != len(entries):
         raise ValueError("semantic occupancy shard names are not unique")
-    manifest = {
-        "schema_version": "semantic_occupancy_manifest_v1",
-        "artifact_schema": SEMANTIC_OCCUPANCY_SCHEMA,
-        "checkpoint_sha256": checkpoint_sha256,
-        "dataset": dataset,
-        "dataset_manifest_sha256": dataset_manifest_sha256,
-        "geometry_id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
-        "head_version": SEMANTIC_OCCUPANCY_HEAD_VERSION,
-        "taxonomy_version": SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
-        "sample_count": total_samples,
-        "shards": entries,
-    }
-    manifest_payload = (
-        json.dumps(
-            manifest,
-            allow_nan=False,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
+    teacher_available = all(
+        entry["teacher_present"]
+        for entry in entries
+    )
+    config_payload = json.dumps(
+        config,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
     ).encode("ascii")
-    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
-    manifest_key = (
-        "semantic-occupancy-manifest/schema=v1/"
-        f"model={checkpoint_sha256}/"
-        f"manifest={dataset_manifest_sha256}/dataset={dataset}/"
-        "manifest.json"
+    limitations = [
+        (
+            "Predictions use the checkpoint's native BEV segmentation head "
+            "without viewer-side geometry correction."
+        ),
+    ]
+    if not teacher_available:
+        limitations.append(
+            "Teacher and Error views are unavailable because KITScenes "
+            "packed shards do not contain perception ground truth."
+        )
+    manifest = occupancy_set_manifest(
+        artifact_kind="native-semantic-occupancy",
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        created_at=publication_timestamp,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        display_name="AutoE2E Reactive BEV segmentation",
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=SEMANTIC_OCCUPANCY_HEAD_VERSION,
+        input_contract="autoe2e-packed-calibrated-camera-v1",
+        limitations=limitations,
+        model_artifact_id=checkpoint_sha256,
+        model_family="AutoE2E Reactive",
+        model_source={
+            "config": (
+                "embedded-checkpoint-config-sha256:"
+                f"{hashlib.sha256(config_payload).hexdigest()}"
+            ),
+            "license_spdx": "Apache-2.0",
+            "repository": (
+                "https://github.com/autowarefoundation/auto_e2e"
+            ),
+            "repository_revision": repository_revision,
+            "weight_sha256": checkpoint_sha256,
+        },
+        shards=entries,
+        supported_classes=SEMANTIC_OCCUPANCY_CLASS_NAMES,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        teacher_available=teacher_available,
+    )
+    manifest_payload, manifest_sha256 = encode_occupancy_set_manifest(
+        manifest
     )
     _put_s3_immutable(
         s3,
@@ -8096,7 +8140,7 @@ def precompute_semantic_occupancy_artifacts(
             "dataset-manifest-sha256": dataset_manifest_sha256,
             "manifest-sha256": manifest_sha256,
             "sample-count": str(total_samples),
-            "schema": "semantic_occupancy_manifest_v1",
+            "schema": manifest["schema_version"],
         },
         content_type="application/json",
     )
@@ -10663,8 +10707,11 @@ def wf_precompute_semantic_occupancy(
     checkpoint: FlyteFile,
     shard_dirs: List[FlyteDirectory],
     dataset: str,
+    dataset_version: str,
     dataset_manifest_sha256: str,
     artifacts_bucket: str,
+    publication_timestamp: str,
+    repository_revision: str,
     aws_region: str = "us-west-2",
     batch_size: int = 2,
     num_workers: int = 0,
@@ -10674,8 +10721,11 @@ def wf_precompute_semantic_occupancy(
         checkpoint=checkpoint,
         shard_dirs=shard_dirs,
         dataset=dataset,
+        dataset_version=dataset_version,
         dataset_manifest_sha256=dataset_manifest_sha256,
         artifacts_bucket=artifacts_bucket,
+        publication_timestamp=publication_timestamp,
+        repository_revision=repository_revision,
         aws_region=aws_region,
         batch_size=batch_size,
         num_workers=num_workers,
