@@ -492,6 +492,16 @@ async function openOccupancy(
   return { canvas, errors, region };
 }
 
+async function prepareFullPageScreenshot(page: Page) {
+  await page.addStyleTag({
+    content: `
+      header.sticky { position: static !important; }
+      nextjs-portal { display: none !important; }
+    `,
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+}
+
 test("uses the shared 3D renderer for real occupancy selections", async ({
   page,
 }, testInfo) => {
@@ -545,7 +555,7 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
       document.documentElement.clientWidth,
   }));
   expect(layout.horizontalOverflow).toBe(0);
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await prepareFullPageScreenshot(page);
   await page.screenshot({
     fullPage: true,
     path: testInfo.outputPath("occupancy-dashboard-desktop.png"),
@@ -601,7 +611,7 @@ test("keeps the occupancy workflow usable on mobile", async ({
     horizontalOverflow: 0,
     regionInside: true,
   });
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await prepareFullPageScreenshot(page);
   await page.screenshot({
     fullPage: true,
     path: testInfo.outputPath("occupancy-dashboard-mobile.png"),
