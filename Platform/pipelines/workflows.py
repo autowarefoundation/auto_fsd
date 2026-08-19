@@ -7928,6 +7928,7 @@ def precompute_semantic_occupancy_artifacts(
     """Precompute immutable 2D semantic occupancy bodies per packed tar."""
     import hashlib
     import json
+    import os
     import re
     from pathlib import Path
 
@@ -7939,6 +7940,7 @@ def precompute_semantic_occupancy_artifacts(
     from Platform.pipelines.overlay_tasks import _put_s3_immutable
     from Platform.pipelines.occupancy_store import (
         encode_occupancy_set_manifest,
+        occupancy_model_artifact_id,
         occupancy_set_manifest,
         occupancy_set_s3_key,
     )
@@ -7974,10 +7976,34 @@ def precompute_semantic_occupancy_artifacts(
     if batch_size <= 0 or num_workers < 0:
         raise ValueError("invalid semantic occupancy loader settings")
 
+    packed_shards = []
+    seen_shards = set()
+    for shard_directory in shard_dirs:
+        local_directory = Path(shard_directory.download())
+        if not (local_directory / "manifest.json").is_file():
+            raise FileNotFoundError(
+                f"packed manifest missing: {local_directory}"
+            )
+        for tar_path in sorted(local_directory.glob("*.tar")):
+            if tar_path.name in seen_shards:
+                raise ValueError(
+                    "semantic occupancy shard names are not unique: "
+                    f"{tar_path.name}"
+                )
+            seen_shards.add(tar_path.name)
+            packed_shards.append((local_directory, tar_path))
+    if not packed_shards:
+        raise ValueError("packed directories contain no tar shards")
+    packed_shards.sort(key=lambda item: item[1].name)
+
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     torch.use_deterministic_algorithms(True)
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
     if num_workers:
         torch.multiprocessing.set_sharing_strategy("file_system")
     device = torch.device(
@@ -7988,10 +8014,50 @@ def precompute_semantic_occupancy_artifacts(
         checkpoint_path,
         device,
     )
+    config_payload = json.dumps(
+        config,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    model_source = {
+        "code_license_spdx": "Apache-2.0",
+        "config": (
+            "embedded-checkpoint-config-sha256:"
+            f"{hashlib.sha256(config_payload).hexdigest()}"
+        ),
+        "license_spdx": "NOASSERTION",
+        "repository": (
+            "https://github.com/autowarefoundation/auto_e2e"
+        ),
+        "repository_revision": repository_revision,
+        "training_data_license_spdx": "NOASSERTION",
+        "weight_sha256": checkpoint_sha256,
+        "weight_source_url": f"urn:sha256:{checkpoint_sha256}",
+    }
+    producer_config = {
+        "batch_size": batch_size,
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+        "deterministic_algorithms": True,
+        "num_workers": num_workers,
+        "probability_encoding": "uint8-rint-gzip-level-6-v1",
+        "random_seed": 0,
+    }
+    model_artifact_id = occupancy_model_artifact_id(
+        artifact_kind="native-semantic-occupancy",
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=SEMANTIC_OCCUPANCY_HEAD_VERSION,
+        input_contract="autoe2e-packed-calibrated-camera-v1",
+        model_source=model_source,
+        producer_config=producer_config,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+    )
     manifest_key = occupancy_set_s3_key(
         dataset,
         dataset_version,
-        checkpoint_sha256,
+        model_artifact_id,
+        dataset_manifest_sha256,
     )
     if not config.get("enable_bev_segmentation", False):
         raise ValueError("checkpoint has no BEV segmentation head")
@@ -7999,96 +8065,81 @@ def precompute_semantic_occupancy_artifacts(
     s3 = boto3.client("s3", region_name=aws_region)
     entries = []
     total_samples = 0
-    for shard_directory in shard_dirs:
-        local_directory = Path(shard_directory.download())
-        if not (local_directory / "manifest.json").is_file():
-            raise FileNotFoundError(
-                f"packed manifest missing: {local_directory}"
-            )
-        for tar_path in sorted(local_directory.glob("*.tar")):
-            loader = make_pre_extracted_loader(
-                str(local_directory),
-                batch_size=batch_size,
-                num_workers=num_workers,
-                split="all",
-                val_fraction=0.0,
-                shuffle=0,
-                pin_memory=(device.type == "cuda"),
-                prefetch_factor=1,
-                shard_files=[tar_path],
-                decode_future_frames=False,
-            )
-            (
-                sample_uids,
-                probability,
-                teacher,
-                valid_mask,
-            ) = infer_semantic_occupancy(
-                model,
-                loader,
-                device=device,
-            )
-            payload = encode_semantic_occupancy(
-                sample_uids,
-                probability,
-                teacher=teacher,
-                valid_mask=valid_mask,
-            )
-            payload_sha256 = hashlib.sha256(payload).hexdigest()
-            key = semantic_occupancy_s3_key(
-                checkpoint_sha256,
-                dataset_manifest_sha256,
-                dataset,
-                tar_path.name,
-            )
-            _put_s3_immutable(
-                s3,
-                bucket=artifacts_bucket,
-                key=key,
-                payload=payload,
-                metadata={
-                    "checkpoint-sha256": checkpoint_sha256,
-                    "dataset-manifest-sha256": (
-                        dataset_manifest_sha256
-                    ),
-                    "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
-                    "head-version": SEMANTIC_OCCUPANCY_HEAD_VERSION,
-                    "payload-sha256": payload_sha256,
-                    "sample-count": str(len(sample_uids)),
-                    "schema": SEMANTIC_OCCUPANCY_SCHEMA,
-                    "taxonomy-version": (
-                        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
-                    ),
-                },
-                content_type=(
-                    "application/vnd.auto-e2e.semantic-occupancy"
+    for local_directory, tar_path in packed_shards:
+        loader = make_pre_extracted_loader(
+            str(local_directory),
+            batch_size=batch_size,
+            num_workers=num_workers,
+            split="all",
+            val_fraction=0.0,
+            shuffle=0,
+            pin_memory=(device.type == "cuda"),
+            prefetch_factor=1,
+            shard_files=[tar_path],
+            decode_future_frames=False,
+        )
+        (
+            sample_uids,
+            probability,
+            teacher,
+            valid_mask,
+        ) = infer_semantic_occupancy(
+            model,
+            loader,
+            device=device,
+        )
+        payload = encode_semantic_occupancy(
+            sample_uids,
+            probability,
+            teacher=teacher,
+            valid_mask=valid_mask,
+        )
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        key = semantic_occupancy_s3_key(
+            model_artifact_id,
+            dataset_manifest_sha256,
+            dataset,
+            tar_path.name,
+        )
+        _put_s3_immutable(
+            s3,
+            bucket=artifacts_bucket,
+            key=key,
+            payload=payload,
+            metadata={
+                "checkpoint-sha256": checkpoint_sha256,
+                "dataset-manifest-sha256": (
+                    dataset_manifest_sha256
                 ),
-                content_encoding="gzip",
-            )
-            entries.append({
-                "byte_size": len(payload),
-                "sample_count": len(sample_uids),
-                "s3_key": key,
-                "sha256": payload_sha256,
-                "shard": tar_path.name,
-                "teacher_present": teacher is not None,
-            })
-            total_samples += len(sample_uids)
-    if not entries:
-        raise ValueError("packed directories contain no tar shards")
+                "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+                "head-version": SEMANTIC_OCCUPANCY_HEAD_VERSION,
+                "model-artifact-id": model_artifact_id,
+                "payload-sha256": payload_sha256,
+                "sample-count": str(len(sample_uids)),
+                "schema": SEMANTIC_OCCUPANCY_SCHEMA,
+                "taxonomy-version": (
+                    SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
+                ),
+            },
+            content_type=(
+                "application/vnd.auto-e2e.semantic-occupancy"
+            ),
+            content_encoding="gzip",
+        )
+        entries.append({
+            "byte_size": len(payload),
+            "sample_count": len(sample_uids),
+            "s3_key": key,
+            "sha256": payload_sha256,
+            "shard": tar_path.name,
+            "teacher_present": teacher is not None,
+        })
+        total_samples += len(sample_uids)
     entries.sort(key=lambda entry: entry["shard"])
-    if len({entry["shard"] for entry in entries}) != len(entries):
-        raise ValueError("semantic occupancy shard names are not unique")
     teacher_available = all(
         entry["teacher_present"]
         for entry in entries
     )
-    config_payload = json.dumps(
-        config,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
     limitations = [
         (
             "Predictions use the checkpoint's native BEV segmentation head "
@@ -8112,20 +8163,10 @@ def precompute_semantic_occupancy_artifacts(
         head_version=SEMANTIC_OCCUPANCY_HEAD_VERSION,
         input_contract="autoe2e-packed-calibrated-camera-v1",
         limitations=limitations,
-        model_artifact_id=checkpoint_sha256,
+        model_artifact_id=model_artifact_id,
         model_family="AutoE2E Reactive",
-        model_source={
-            "config": (
-                "embedded-checkpoint-config-sha256:"
-                f"{hashlib.sha256(config_payload).hexdigest()}"
-            ),
-            "license_spdx": "Apache-2.0",
-            "repository": (
-                "https://github.com/autowarefoundation/auto_e2e"
-            ),
-            "repository_revision": repository_revision,
-            "weight_sha256": checkpoint_sha256,
-        },
+        model_source=model_source,
+        producer_config=producer_config,
         shards=entries,
         supported_classes=SEMANTIC_OCCUPANCY_CLASS_NAMES,
         taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
@@ -8143,6 +8184,7 @@ def precompute_semantic_occupancy_artifacts(
             "checkpoint-sha256": checkpoint_sha256,
             "dataset-manifest-sha256": dataset_manifest_sha256,
             "manifest-sha256": manifest_sha256,
+            "model-artifact-id": model_artifact_id,
             "sample-count": str(total_samples),
             "schema": manifest["schema_version"],
         },
@@ -8178,6 +8220,7 @@ def precompute_bevformer_v2_occupancy_artifacts(
     """Publish detection-derived KITScenes occupancy from official V2 weights."""
     import hashlib
     import json
+    import os
     import re
     from pathlib import Path
 
@@ -8187,22 +8230,31 @@ def precompute_bevformer_v2_occupancy_artifacts(
 
     from Platform.pipelines.bevformer_v2_occupancy import (
         BEVFORMER_V2_ARTIFACT_KIND,
+        BEVFORMER_V2_CODE_LICENSE_SPDX,
         BEVFORMER_V2_CONFIG_NAME,
+        BEVFORMER_V2_FRAMES,
         BEVFORMER_V2_HEAD_VERSION,
         BEVFORMER_V2_REPOSITORY,
         BEVFORMER_V2_REVISION,
         BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES,
+        BEVFORMER_V2_TRAINING_DATA_LICENSE_SPDX,
+        BEVFORMER_V2_WEIGHT_LICENSE_SPDX,
         BEVFORMER_V2_WEIGHT_SHA256,
+        BEVFORMER_V2_WEIGHT_SOURCE_URL,
         provenance,
     )
     from Platform.pipelines.bevformer_v2_runtime import (
+        BEVFORMER_V2_IMAGE_HEIGHT,
+        BEVFORMER_V2_IMAGE_WIDTH,
         infer_bevformer_frame,
         iter_packed_bevformer_frames,
         load_official_bevformer_v2,
         remember_history_frame,
+        temporal_frames_for,
     )
     from Platform.pipelines.occupancy_store import (
         encode_occupancy_set_manifest,
+        occupancy_model_artifact_id,
         occupancy_set_manifest,
         occupancy_set_s3_key,
     )
@@ -8212,6 +8264,7 @@ def precompute_bevformer_v2_occupancy_artifacts(
         SEMANTIC_OCCUPANCY_SCHEMA,
         SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
         encode_semantic_occupancy,
+        quantize_semantic_occupancy,
         semantic_occupancy_s3_key,
     )
 
@@ -8236,22 +8289,8 @@ def precompute_bevformer_v2_occupancy_artifacts(
     if not 0.0 <= score_threshold <= 1.0:
         raise ValueError("score_threshold must be in [0,1]")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_path = str(checkpoint.download())
-    model, box_type_3d = load_official_bevformer_v2(
-        repository_path=repository_path,
-        checkpoint_path=checkpoint_path,
-        device=device,
-    )
-    model_artifact_id = BEVFORMER_V2_WEIGHT_SHA256
-    manifest_key = occupancy_set_s3_key(
-        dataset,
-        dataset_version,
-        model_artifact_id,
-    )
-    s3 = boto3.client("s3", region_name=aws_region)
-    entries = []
-    total_samples = 0
+    packed_shards = []
+    seen_shards = set()
     for shard_directory in shard_dirs:
         local_directory = Path(shard_directory.download())
         packed_manifest_path = local_directory / "manifest.json"
@@ -8273,83 +8312,186 @@ def precompute_bevformer_v2_occupancy_artifacts(
                 "packed KITScenes manifest differs from the BEVFormer input "
                 f"contract: {packed_manifest_path}"
             )
-        history = {}
-        active_episode = None
         for tar_path in sorted(local_directory.glob("*.tar")):
-            sample_uids = []
-            probabilities = []
-            for frame in iter_packed_bevformer_frames(tar_path):
-                if active_episode != frame.episode_id:
-                    history.clear()
-                    active_episode = frame.episode_id
-                probabilities.append(
-                    infer_bevformer_frame(
-                        model,
-                        frame,
-                        history,
-                        box_type_3d=box_type_3d,
-                        device=device,
-                        score_threshold=score_threshold,
-                    )
+            if tar_path.name in seen_shards:
+                raise ValueError(
+                    "semantic occupancy shard names are not unique: "
+                    f"{tar_path.name}"
                 )
-                sample_uids.append(frame.sample_uid)
-                remember_history_frame(history, frame)
-            if not sample_uids:
-                raise ValueError(f"packed shard is empty: {tar_path}")
-            payload = encode_semantic_occupancy(
-                sample_uids,
-                np.stack(probabilities),
-            )
-            payload_sha256 = hashlib.sha256(payload).hexdigest()
-            key = semantic_occupancy_s3_key(
-                model_artifact_id,
-                dataset_manifest_sha256,
-                dataset,
-                tar_path.name,
-                head_version=BEVFORMER_V2_HEAD_VERSION,
-            )
-            _put_s3_immutable(
-                s3,
-                bucket=artifacts_bucket,
-                key=key,
-                payload=payload,
-                metadata={
-                    "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
-                    "dataset-manifest-sha256": (
-                        dataset_manifest_sha256
-                    ),
-                    "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
-                    "head-version": BEVFORMER_V2_HEAD_VERSION,
-                    "payload-sha256": payload_sha256,
-                    "sample-count": str(len(sample_uids)),
-                    "schema": SEMANTIC_OCCUPANCY_SCHEMA,
-                    "taxonomy-version": (
-                        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
-                    ),
-                    "weight-sha256": model_artifact_id,
-                },
-                content_type=(
-                    "application/vnd.auto-e2e.semantic-occupancy"
-                ),
-                content_encoding="gzip",
-            )
-            entries.append({
-                "byte_size": len(payload),
-                "sample_count": len(sample_uids),
-                "s3_key": key,
-                "sha256": payload_sha256,
-                "shard": tar_path.name,
-                "teacher_present": False,
-            })
-            total_samples += len(sample_uids)
-    if not entries:
+            seen_shards.add(tar_path.name)
+            packed_shards.append(tar_path)
+    if not packed_shards:
         raise ValueError("packed directories contain no tar shards")
+    packed_shards.sort(key=lambda path: path.name)
+
+    model_source = {
+        "code_license_spdx": BEVFORMER_V2_CODE_LICENSE_SPDX,
+        "config": BEVFORMER_V2_CONFIG_NAME,
+        "license_spdx": BEVFORMER_V2_WEIGHT_LICENSE_SPDX,
+        "repository": BEVFORMER_V2_REPOSITORY,
+        "repository_revision": BEVFORMER_V2_REVISION,
+        "training_data_license_spdx": (
+            BEVFORMER_V2_TRAINING_DATA_LICENSE_SPDX
+        ),
+        "weight_sha256": BEVFORMER_V2_WEIGHT_SHA256,
+        "weight_source_url": BEVFORMER_V2_WEIGHT_SOURCE_URL,
+    }
+    producer_config = {
+        "cublas_workspace_config": ":4096:8",
+        "deterministic_algorithms": True,
+        "image_height": BEVFORMER_V2_IMAGE_HEIGHT,
+        "image_width": BEVFORMER_V2_IMAGE_WIDTH,
+        "max_detections": 300,
+        "probability_encoding": "uint8-rint-gzip-level-6-v1",
+        "random_seed": 0,
+        "score_threshold": score_threshold,
+        "temporal_frame_offsets": list(BEVFORMER_V2_FRAMES),
+    }
+    model_artifact_id = occupancy_model_artifact_id(
+        artifact_kind=BEVFORMER_V2_ARTIFACT_KIND,
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=BEVFORMER_V2_HEAD_VERSION,
+        input_contract=(
+            "kitscenes-packed-256-square-six-camera-to-"
+            "bevformer-640x256-v1"
+        ),
+        model_source=model_source,
+        producer_config=producer_config,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+    )
+    manifest_key = occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        model_artifact_id,
+        dataset_manifest_sha256,
+    )
+
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = (
+        producer_config["cublas_workspace_config"]
+    )
+    torch.use_deterministic_algorithms(True)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = str(checkpoint.download())
+    model, box_type_3d = load_official_bevformer_v2(
+        repository_path=repository_path,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    s3 = boto3.client("s3", region_name=aws_region)
+    entries = []
+    total_samples = 0
+    incomplete_history_frames = 0
+    missing_history_slots = 0
+    history = {}
+    active_episode = None
+    last_frame_index = None
+    for tar_path in packed_shards:
+        sample_uids = []
+        probabilities = []
+        for frame in iter_packed_bevformer_frames(tar_path):
+            if active_episode != frame.episode_id:
+                history.clear()
+                active_episode = frame.episode_id
+                last_frame_index = None
+            if (
+                last_frame_index is not None
+                and frame.frame_index <= last_frame_index
+            ):
+                raise ValueError(
+                    "packed KITScenes frames are not strictly increasing "
+                    f"within episode {frame.episode_id!r}"
+                )
+            available_history = temporal_frames_for(frame, history)
+            missing_slots = (
+                len(BEVFORMER_V2_FRAMES) - len(available_history)
+            )
+            if missing_slots:
+                incomplete_history_frames += 1
+                missing_history_slots += missing_slots
+            probability = infer_bevformer_frame(
+                model,
+                frame,
+                history,
+                box_type_3d=box_type_3d,
+                device=device,
+                score_threshold=score_threshold,
+            )
+            probabilities.append(
+                quantize_semantic_occupancy(probability)
+            )
+            sample_uids.append(frame.sample_uid)
+            remember_history_frame(history, frame)
+            last_frame_index = frame.frame_index
+        if not sample_uids:
+            raise ValueError(f"packed shard is empty: {tar_path}")
+        payload = encode_semantic_occupancy(
+            sample_uids,
+            np.stack(probabilities),
+        )
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        key = semantic_occupancy_s3_key(
+            model_artifact_id,
+            dataset_manifest_sha256,
+            dataset,
+            tar_path.name,
+            head_version=BEVFORMER_V2_HEAD_VERSION,
+        )
+        _put_s3_immutable(
+            s3,
+            bucket=artifacts_bucket,
+            key=key,
+            payload=payload,
+            metadata={
+                "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
+                "dataset-manifest-sha256": (
+                    dataset_manifest_sha256
+                ),
+                "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+                "head-version": BEVFORMER_V2_HEAD_VERSION,
+                "model-artifact-id": model_artifact_id,
+                "payload-sha256": payload_sha256,
+                "sample-count": str(len(sample_uids)),
+                "schema": SEMANTIC_OCCUPANCY_SCHEMA,
+                "taxonomy-version": (
+                    SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
+                ),
+                "weight-sha256": BEVFORMER_V2_WEIGHT_SHA256,
+            },
+            content_type=(
+                "application/vnd.auto-e2e.semantic-occupancy"
+            ),
+            content_encoding="gzip",
+        )
+        entries.append({
+            "byte_size": len(payload),
+            "sample_count": len(sample_uids),
+            "s3_key": key,
+            "sha256": payload_sha256,
+            "shard": tar_path.name,
+            "teacher_present": False,
+        })
+        total_samples += len(sample_uids)
     metadata = provenance()
     limitations = list(metadata["limitations"])
     limitations.append(
         "The official weight is supplied at execution time and is not "
         "redistributed in the AutoE2E container image."
     )
+    if incomplete_history_frames:
+        limitations.append(
+            f"{incomplete_history_frames} of {total_samples} frames had "
+            f"{missing_history_slots} unavailable exact t8 history slots at "
+            "scene or packed-sequence boundaries; unavailable inputs were "
+            "omitted without substituting adjacent KITScenes frames."
+        )
     manifest = occupancy_set_manifest(
         artifact_kind=BEVFORMER_V2_ARTIFACT_KIND,
         artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
@@ -8367,13 +8509,8 @@ def precompute_bevformer_v2_occupancy_artifacts(
         limitations=limitations,
         model_artifact_id=model_artifact_id,
         model_family="BEVFormer V2",
-        model_source={
-            "config": BEVFORMER_V2_CONFIG_NAME,
-            "license_spdx": "Apache-2.0",
-            "repository": BEVFORMER_V2_REPOSITORY,
-            "repository_revision": BEVFORMER_V2_REVISION,
-            "weight_sha256": model_artifact_id,
-        },
+        model_source=model_source,
+        producer_config=producer_config,
         shards=entries,
         supported_classes=(
             BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES
@@ -8393,16 +8530,17 @@ def precompute_bevformer_v2_occupancy_artifacts(
             "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
             "dataset-manifest-sha256": dataset_manifest_sha256,
             "manifest-sha256": manifest_sha256,
+            "model-artifact-id": model_artifact_id,
             "sample-count": str(total_samples),
             "schema": manifest["schema_version"],
-            "weight-sha256": model_artifact_id,
+            "weight-sha256": BEVFORMER_V2_WEIGHT_SHA256,
         },
         content_type="application/json",
     )
     return SemanticOccupancyPrecomputeOutput(
         manifest_key=manifest_key,
         manifest_sha256=manifest_sha256,
-        checkpoint_sha256=model_artifact_id,
+        checkpoint_sha256=BEVFORMER_V2_WEIGHT_SHA256,
         shard_count=len(entries),
         sample_count=total_samples,
     )
