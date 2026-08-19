@@ -32,6 +32,7 @@ func validOccupancySetFixture(
 ) (occupancySetManifest, string, []byte) {
 	t.Helper()
 	payloadDigest := sha256.Sum256(payload)
+	weightSHA256 := strings.Repeat("f", 64)
 	bodyKey := "semantic-occupancy/schema=v1/model=" + modelArtifactID +
 		"/manifest=" + datasetManifestSHA256 +
 		"/geometry=autoe2e-bev-450x300-0p4m-v1" +
@@ -57,11 +58,18 @@ func validOccupancySetFixture(
 		ModelArtifactID: modelArtifactID,
 		ModelFamily:     "AutoE2E Reactive",
 		ModelSource: occupancySetModelSource{
-			Config:             "embedded-checkpoint-config",
-			LicenseSPDX:        "Apache-2.0",
-			Repository:         "https://github.com/autowarefoundation/auto_e2e",
-			RepositoryRevision: strings.Repeat("c", 40),
-			WeightSHA256:       modelArtifactID,
+			CodeLicenseSPDX:         "Apache-2.0",
+			Config:                  "embedded-checkpoint-config",
+			LicenseSPDX:             "NOASSERTION",
+			Repository:              "https://github.com/autowarefoundation/auto_e2e",
+			RepositoryRevision:      strings.Repeat("c", 40),
+			TrainingDataLicenseSPDX: "NOASSERTION",
+			WeightSHA256:            weightSHA256,
+			WeightSourceURL:         "urn:sha256:" + weightSHA256,
+		},
+		ProducerConfig: map[string]any{
+			"deterministic_algorithms": true,
+			"probability_encoding":     "uint8-rint-gzip-level-6-v1",
 		},
 		SampleCount: 3,
 		ShardCount:  1,
@@ -90,6 +98,7 @@ func validOccupancySetFixture(
 		manifest.Dataset,
 		manifest.DatasetVersion,
 		modelArtifactID,
+		datasetManifestSHA256,
 	)
 	body, err := json.Marshal(manifest)
 	if err != nil {
@@ -296,6 +305,10 @@ func TestSemanticOccupancyCatalogIsIndependentFromTrajectoryStore(t *testing.T) 
 	}
 	if models[0].ModelArtifactID != firstModel ||
 		models[0].ArtifactKind != "native-semantic-occupancy" ||
+		models[0].ModelSource.WeightSHA256 != strings.Repeat("f", 64) ||
+		models[0].ModelSource.CodeLicenseSPDX != "Apache-2.0" ||
+		models[0].ModelSource.LicenseSPDX != "NOASSERTION" ||
+		models[0].ProducerConfig["deterministic_algorithms"] != true ||
 		models[0].ShardSampleCount != 3 ||
 		models[0].TeacherAvailable {
 		t.Fatalf("catalog model = %+v", models[0])
@@ -343,7 +356,20 @@ func TestOccupancySetManifestObjectMetadataIsVerified(t *testing.T) {
 		modelID,
 		"scene-a-train-000000.tar",
 	)
-	key := occupancySetManifestKey("kitscenes", "v2.1", modelID)
+	publication, err := service.loadPublicationManifest(
+		context.Background(),
+		"kitscenes",
+		"v2.1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := occupancySetManifestKey(
+		"kitscenes",
+		"v2.1",
+		modelID,
+		publication.SHA256,
+	)
 	object := client.objects[key]
 	object.metadata["manifest-sha256"] = strings.Repeat("0", 64)
 	client.objects[key] = object
