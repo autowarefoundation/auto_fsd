@@ -14,7 +14,7 @@ from training.losses.fidelity_aware_reward import (
 
 
 def test_version_pin() -> None:
-    assert FIDELITY_AWARE_REWARD_VERSION == "wm_fidelity_gate_v1"
+    assert FIDELITY_AWARE_REWARD_VERSION == "v1_safety_comfort_progress_gated_wm"
 
 
 def test_perfect_wm_fidelity_is_one() -> None:
@@ -31,9 +31,9 @@ def test_error_lowers_fidelity() -> None:
     assert torch.all(fid > 0.0)
 
 
-def test_fidelity_gates_base_reward() -> None:
+def test_fidelity_does_not_zero_handcrafted_base() -> None:
+    """#123: a broken WM must not wipe safety/comfort/progress."""
     base = torch.tensor([1.0, 1.0])
-    # Sample 0: perfect WM; sample 1: large error → low fidelity.
     wm_pred = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
     wm_tgt = torch.tensor([[0.0, 0.0], [10.0, 10.0]])
     out = fidelity_aware_reward(
@@ -42,9 +42,9 @@ def test_fidelity_gates_base_reward() -> None:
         wm_target=wm_tgt,
         fidelity_temperature=1.0,
     )
-    assert out.reward[0].item() == 1.0
-    assert out.reward[1].item() < out.reward[0].item()
-    assert out.metadata["reward_mean"] < 1.0
+    assert torch.allclose(out.reward, base)
+    assert out.fidelity[0].item() == 1.0
+    assert out.fidelity[1].item() < out.fidelity[0].item()
 
 
 def test_consequence_term_requires_external_preference() -> None:
@@ -76,3 +76,14 @@ def test_soft_advantage_zero_mean_without_baseline() -> None:
     reward = torch.tensor([1.0, 3.0])
     adv = soft_advantage_from_reward(reward)
     assert abs(adv.mean().item()) < 1e-6
+
+
+def test_expert_outranks_jerky_on_v1_base() -> None:
+    from evaluation.fidelity_reward_experiment import run_fidelity_reward_experiment
+
+    report = run_fidelity_reward_experiment()
+    assert report["base"]["expert_minus_jerky"] > 0
+    assert report["noise_wm"]["ranking_matches_base"] is True
+    assert report["noise_wm"]["fidelity_mean"] < 0.05
+    assert report["faithful_wm"]["fidelity_mean"] > 0.99
+

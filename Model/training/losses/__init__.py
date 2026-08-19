@@ -17,9 +17,11 @@ from .route_consistency_loss import (
 from .fidelity_aware_reward import (
     FIDELITY_AWARE_REWARD_VERSION,
     FidelityAwareRewardResult,
+    V1_WEIGHTS,
     consequence_alignment_reward,
     fidelity_aware_reward,
     soft_advantage_from_reward,
+    v1_handcrafted_reward,
     world_model_fidelity,
 )
 
@@ -32,10 +34,12 @@ __all__ = [
     "RouteConsistencyLoss",
     "RouteConsistencyWeights",
     "RolloutAlignedLoss",
+    "V1_WEIGHTS",
     "consequence_alignment_reward",
     "ego_points_to_grid",
     "fidelity_aware_reward",
     "integrate_controls_torch",
     "soft_advantage_from_reward",
+    "v1_handcrafted_reward",
     "world_model_fidelity",
 ]

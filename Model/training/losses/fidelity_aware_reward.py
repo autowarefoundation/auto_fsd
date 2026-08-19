@@ -1,19 +1,19 @@
-"""Fidelity-aware reward prototype for stage-3 closed-loop RL (issue #123).
+"""Fidelity-aware reward for stage-3 closed-loop RL (issue #123).
 
-Design rule from the issue: every reward term must add information the
-reactive policy cannot already infer from its own inputs. A reward built
-only from the reasoning band (a re-encoding of planner inputs) is redundant
-for the same DPI reason that drove ``reasoning_coupling.alpha → 0``.
+v1 (the issue's concrete formula, minus an imitation KL term)::
 
-This module therefore shapes rewards with **world-model fidelity** — how
-well the WM predicts consequences of the rolled-out action — and optionally
-scores those predicted consequences against an external preference signal.
-Both are information the camera-only reactive policy does not observe at
-decision time.
+    R = w_safe R_safety + w_prog R_progress + w_comf R_comfort
+      + g * R_wm
 
-This is deliberately a pure function / small helper, not a training-loop
-integration. Wire it behind ``compute_planner_loss`` (#115) when that hook
-lands; until then it is safe to unit-test and prototype against.
+``R_safety / R_progress / R_comfort`` come from the same tensors
+``RolloutAlignedLoss`` already uses (unicycle rollout + comfort excess).
+``g = exp(-mse / T)`` is world-model fidelity. It gates **only** the WM
+consequence term — a broken WM must not zero collision/comfort.
+
+This is the tensor #177 (AlpaSim closed-loop) should call later. It does
+not import that PR.
+
+The reasoning-band is intentionally absent: #123's DPI trap.
 """
 
 from __future__ import annotations
@@ -22,8 +22,17 @@ from dataclasses import dataclass
 
 import torch
 
+from training.losses.control_rollout import integrate_controls_torch
+from training.losses.rollout_aligned_loss import comfort_excess_per_sample
 
-FIDELITY_AWARE_REWARD_VERSION = "wm_fidelity_gate_v1"
+
+FIDELITY_AWARE_REWARD_VERSION = "v1_safety_comfort_progress_gated_wm"
+
+V1_WEIGHTS = {
+    "safety": 1.0,
+    "progress": 1.0,
+    "comfort": 0.5,
+}
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,43 @@ def consequence_alignment_reward(
     return -scale * mse
 
 
+def v1_handcrafted_reward(
+    controls: torch.Tensor,
+    expert_controls: torch.Tensor,
+    initial_speed: torch.Tensor,
+    *,
+    dt: float = 0.1,
+    lane_half_width_m: float = 1.75,
+) -> dict[str, torch.Tensor]:
+    """#123 handcrafted terms from the existing rollout/comfort helpers.
+
+    Returns per-sample ``safety``, ``progress``, ``comfort``, and ``base``
+    (weighted sum). Higher is better. ``expert_controls`` is the logged plan
+    used as the progress target and the comfort reference.
+    """
+    pos, _, speeds = integrate_controls_torch(controls, initial_speed, dt=dt)
+    exp_pos, _, exp_speeds = integrate_controls_torch(
+        expert_controls, initial_speed, dt=dt,
+    )
+    r_progress = -(pos - exp_pos).pow(2).sum(dim=-1).sqrt().mean(dim=1)
+    comfort, _, _ = comfort_excess_per_sample(
+        controls, expert_controls, speeds, exp_speeds, dt=dt,
+    )
+    r_comfort = -comfort
+    r_safety = -torch.relu(pos[..., 1].abs() - lane_half_width_m).mean(dim=1)
+    base = (
+        V1_WEIGHTS["safety"] * r_safety
+        + V1_WEIGHTS["progress"] * r_progress
+        + V1_WEIGHTS["comfort"] * r_comfort
+    )
+    return {
+        "safety": r_safety,
+        "progress": r_progress,
+        "comfort": r_comfort,
+        "base": base,
+    }
+
+
 def fidelity_aware_reward(
     base_reward: torch.Tensor,
     *,
@@ -117,15 +163,7 @@ def fidelity_aware_reward(
     consequence_weight: float = 1.0,
     min_fidelity: float = 0.0,
 ) -> FidelityAwareRewardResult:
-    """Gate ``base_reward`` (and optional consequence term) by WM fidelity.
-
-    Final reward::
-
-        r = fidelity * (base_reward + consequence_weight * consequence)
-
-    where ``fidelity`` is clipped below by ``min_fidelity`` so a broken WM
-    cannot zero the entire objective if a floor is desired.
-    """
+    """#123 v1: ``R = base + g * R_wm``. ``g`` does not multiply safety/comfort."""
     if base_reward.ndim > 1:
         raise ValueError(
             f"base_reward must be scalar or (B,), got shape {tuple(base_reward.shape)}"
@@ -169,9 +207,9 @@ def fidelity_aware_reward(
                 "consequence/base_reward shape mismatch: "
                 f"{tuple(consequence.shape)} vs {tuple(total.shape)}"
             )
-        total = total + float(consequence_weight) * consequence
+        total = total + float(consequence_weight) * fidelity * consequence
 
-    reward = fidelity * total
+    reward = total
     metadata = {
         "fidelity_mean": float(fidelity.detach().mean().cpu()),
         "base_reward_mean": float(base_reward.detach().float().mean().cpu()),

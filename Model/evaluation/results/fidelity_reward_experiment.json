@@ -1,0 +1,29 @@
+{
+  "version": "v1_safety_comfort_progress_gated_wm",
+  "source": "constructed_expert_vs_jerky",
+  "base": {
+    "expert": -0.0,
+    "jerky": -0.3004057705402374,
+    "expert_minus_jerky": 0.3004057705402374,
+    "winner": "expert",
+    "safety_expert": -0.0,
+    "safety_jerky": -0.0,
+    "progress_expert": -0.0,
+    "progress_jerky": -0.29754963517189026,
+    "comfort_expert": -0.0,
+    "comfort_jerky": -0.005712286103516817
+  },
+  "faithful_wm": {
+    "expert": -4.0,
+    "jerky": -0.3004057705402374,
+    "winner": "jerky",
+    "fidelity_mean": 1.0
+  },
+  "noise_wm": {
+    "expert": -2.3237379309648531e-07,
+    "jerky": -0.3004057705402374,
+    "winner": "expert",
+    "fidelity_mean": 2.9046724137060664e-08,
+    "ranking_matches_base": true
+  }
+}
