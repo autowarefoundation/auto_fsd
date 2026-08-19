@@ -8301,9 +8301,13 @@ def precompute_bevformer_v2_occupancy_artifacts(
         packed_manifest = json.loads(
             packed_manifest_path.read_text(encoding="utf-8")
         )
+        packed_dataset_version = packed_manifest.get(
+            "dataset_version",
+            packed_manifest.get("version"),
+        )
         if (
             packed_manifest.get("dataset") != dataset
-            or packed_manifest.get("dataset_version") != dataset_version
+            or packed_dataset_version != dataset_version
             or int(packed_manifest.get("num_views", 0))
             != 6
             or not packed_manifest.get("has_gps", False)
