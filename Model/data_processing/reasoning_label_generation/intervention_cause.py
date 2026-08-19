@@ -7,12 +7,12 @@ implementation of (2).
 
 Given per-candidate trajectory L2 deltas (from any intervention experiment —
 horizon token ablations, object-token masks, etc.), it keeps the causes that
-actually moved the plan and emits ``ReasoningHorizonLabel`` entries with
-``provenance="counterfactual_gt"``.
+actually moved the plan and emits ``ReasoningHorizonLabel`` entries.
 
-This does **not** claim the labels are ground truth. #122 explicitly says keep
-``cause`` conservative in v1; treat these as a research / weak-supervision path
-you can score against teacher labels later.
+Default provenance is ``counterfactual_weak``, not ``counterfactual_gt``.
+#122's circularity objection: labels from the model's own sensitivity are not
+ground truth until they are scored against an external anchor (geometric
+conflict / KIT LiDAR). See ``evaluation.cause_label_validation``.
 """
 
 from __future__ import annotations
@@ -74,12 +74,17 @@ def horizon_labels_from_intervention_deltas(
     top_k: Optional[int] = 3,
     relative_to_max: Optional[float] = 0.5,
     confidence_scale: float = 1.0,
+    provenance: str = "counterfactual_weak",
 ) -> List[ReasoningHorizonLabel]:
     """Build five (or fewer) horizon labels with counterfactual causes.
 
     Horizons missing from ``per_horizon`` get an empty cause list and low
     confidence. ``confidence`` is a simple monotone of the top delta
     (clamped to ``[0, 1]``) times ``confidence_scale``.
+
+    Provenance defaults to ``counterfactual_weak``. Pass
+    ``provenance="counterfactual_gt"`` only after external-truth validation
+    (#122) justifies treating the labeller as ground truth.
     """
     labels: List[ReasoningHorizonLabel] = []
     for h in HORIZON_SECONDS:
@@ -94,7 +99,7 @@ def horizon_labels_from_intervention_deltas(
                 horizon_sec=h,
                 cause=causes,
                 confidence=conf,
-                provenance="counterfactual_gt",
+                provenance=provenance,
                 evidence=(
                     f"intervention deltas: "
                     + ", ".join(f"{c.name}={c.trajectory_l2:.4f}" for c in sorted(
