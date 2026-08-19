@@ -1,6 +1,7 @@
 import io
 import json
 import tarfile
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -28,9 +29,9 @@ def _projection() -> np.ndarray:
     return matrix
 
 
-def _image_bytes(color=(10, 20, 30)) -> bytes:
+def _image_bytes(color=(10, 20, 30), size=(256, 256)) -> bytes:
     output = io.BytesIO()
-    Image.new("RGB", (4, 4), color).save(output, format="PNG")
+    Image.new("RGB", size, color).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -117,9 +118,13 @@ def test_packed_tar_reader_preserves_six_camera_and_pose_contract(tmp_path):
     assert frames[0].episode_id == "scene-a"
     assert frames[1].timestamp_ns == 6_500_000_000
     assert len(frames[0].image_payloads) == 6
+    assert [
+        Image.open(io.BytesIO(payload)).getpixel((0, 0))[0]
+        for payload in frames[0].image_payloads
+    ] == [0, 2, 1, 3, 4, 5]
     np.testing.assert_allclose(
         frames[0].projection_ref_to_camera,
-        _projection(),
+        _projection()[[0, 2, 1, 3, 4, 5]],
     )
 
 
@@ -163,6 +168,39 @@ def test_metadata_scales_intrinsics_and_aligns_history_to_current():
     assert current_projection[1, 2] == pytest.approx(128.0)
     assert metadata[-1]["lidaradj2lidarcurr"] is not None
     assert metadata[0]["lidaradj2lidarcurr"] is None
+    assert metadata[0]["timestamp"] == pytest.approx(10.0)
+
+
+def test_metadata_uses_decoded_packed_image_dimensions():
+    frame = replace(
+        _frame(10),
+        image_payloads=(_image_bytes(size=(8, 4)),) * 6,
+    )
+
+    metadata = bevformer_metadata_for(
+        {0: frame},
+        box_type_3d=object,
+    )[0]
+
+    assert metadata["lidar2img"][0][0, 0] == pytest.approx(80.0)
+    assert metadata["lidar2img"][0][1, 1] == pytest.approx(64.0)
+    np.testing.assert_allclose(
+        metadata["scale_factor"],
+        [80.0, 64.0, 80.0, 64.0],
+    )
+
+
+def test_metadata_rejects_mixed_camera_dimensions():
+    frame = replace(
+        _frame(10),
+        image_payloads=(
+            _image_bytes(size=(8, 4)),
+            *(_image_bytes(size=(4, 4)) for _ in range(5)),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="equal packed camera dimensions"):
+        bevformer_metadata_for({0: frame}, box_type_3d=object)
 
 
 def test_preprocessing_is_bgr_mean_subtracted_at_official_shape():
