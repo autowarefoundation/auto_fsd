@@ -57,6 +57,10 @@ DATA_PREP_IMAGE = _os.environ.get(
     "AUTO_E2E_DATA_PREP_IMAGE",
     f"{ECR_PREFIX}/auto-e2e/data-prep:latest",
 )
+BEVFORMER_V2_IMAGE = _os.environ.get(
+    "AUTO_E2E_BEVFORMER_V2_IMAGE",
+    f"{ECR_PREFIX}/auto-e2e/bevformer-v2:latest",
+)
 
 MLFLOW_URI = "http://mlflow.mlflow.svc.cluster.local:5000"
 DATASET_PACK_VERSION = "v2.2"
@@ -8153,6 +8157,257 @@ def precompute_semantic_occupancy_artifacts(
     )
 
 
+@task(
+    container_image=BEVFORMER_V2_IMAGE,
+    requests=Resources(cpu="4", mem="32Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="32Gi", gpu="1"),
+    pod_template=_large_shm_pod_template(),
+)
+def precompute_bevformer_v2_occupancy_artifacts(
+    checkpoint: FlyteFile,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    aws_region: str = "us-west-2",
+    repository_path: str = "/opt/BEVFormer",
+    score_threshold: float = 0.2,
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish detection-derived KITScenes occupancy from official V2 weights."""
+    import hashlib
+    import json
+    import re
+    from pathlib import Path
+
+    import boto3
+    import numpy as np
+    import torch
+
+    from Platform.pipelines.bevformer_v2_occupancy import (
+        BEVFORMER_V2_ARTIFACT_KIND,
+        BEVFORMER_V2_CONFIG_NAME,
+        BEVFORMER_V2_HEAD_VERSION,
+        BEVFORMER_V2_REPOSITORY,
+        BEVFORMER_V2_REVISION,
+        BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES,
+        BEVFORMER_V2_WEIGHT_SHA256,
+        provenance,
+    )
+    from Platform.pipelines.bevformer_v2_runtime import (
+        infer_bevformer_frame,
+        iter_packed_bevformer_frames,
+        load_official_bevformer_v2,
+        remember_history_frame,
+    )
+    from Platform.pipelines.occupancy_store import (
+        encode_occupancy_set_manifest,
+        occupancy_set_manifest,
+        occupancy_set_s3_key,
+    )
+    from Platform.pipelines.overlay_tasks import _put_s3_immutable
+    from Platform.pipelines.semantic_occupancy import (
+        SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        SEMANTIC_OCCUPANCY_SCHEMA,
+        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        encode_semantic_occupancy,
+        semantic_occupancy_s3_key,
+    )
+
+    if dataset != "kitscenes":
+        raise ValueError("BEVFormer V2 occupancy supports only KITScenes")
+    if not re.fullmatch(r"v[1-9][0-9]*\.[0-9]+", dataset_version):
+        raise ValueError("dataset_version must match v<major>.<minor>")
+    if not re.fullmatch(r"[0-9a-f]{64}", dataset_manifest_sha256):
+        raise ValueError(
+            "dataset_manifest_sha256 must be a lowercase SHA-256"
+        )
+    for name, value in (
+        ("artifacts_bucket", artifacts_bucket),
+        ("publication_timestamp", publication_timestamp),
+        ("aws_region", aws_region),
+        ("repository_path", repository_path),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+    if not shard_dirs:
+        raise ValueError("shard_dirs must not be empty")
+    if not 0.0 <= score_threshold <= 1.0:
+        raise ValueError("score_threshold must be in [0,1]")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = str(checkpoint.download())
+    model, box_type_3d = load_official_bevformer_v2(
+        repository_path=repository_path,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    model_artifact_id = BEVFORMER_V2_WEIGHT_SHA256
+    manifest_key = occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        model_artifact_id,
+    )
+    s3 = boto3.client("s3", region_name=aws_region)
+    entries = []
+    total_samples = 0
+    for shard_directory in shard_dirs:
+        local_directory = Path(shard_directory.download())
+        packed_manifest_path = local_directory / "manifest.json"
+        if not packed_manifest_path.is_file():
+            raise FileNotFoundError(
+                f"packed manifest missing: {local_directory}"
+            )
+        packed_manifest = json.loads(
+            packed_manifest_path.read_text(encoding="utf-8")
+        )
+        if (
+            packed_manifest.get("dataset") != dataset
+            or packed_manifest.get("dataset_version") != dataset_version
+            or int(packed_manifest.get("num_views", 0))
+            != 6
+            or not packed_manifest.get("has_gps", False)
+        ):
+            raise ValueError(
+                "packed KITScenes manifest differs from the BEVFormer input "
+                f"contract: {packed_manifest_path}"
+            )
+        history = {}
+        active_episode = None
+        for tar_path in sorted(local_directory.glob("*.tar")):
+            sample_uids = []
+            probabilities = []
+            for frame in iter_packed_bevformer_frames(tar_path):
+                if active_episode != frame.episode_id:
+                    history.clear()
+                    active_episode = frame.episode_id
+                probabilities.append(
+                    infer_bevformer_frame(
+                        model,
+                        frame,
+                        history,
+                        box_type_3d=box_type_3d,
+                        device=device,
+                        score_threshold=score_threshold,
+                    )
+                )
+                sample_uids.append(frame.sample_uid)
+                remember_history_frame(history, frame)
+            if not sample_uids:
+                raise ValueError(f"packed shard is empty: {tar_path}")
+            payload = encode_semantic_occupancy(
+                sample_uids,
+                np.stack(probabilities),
+            )
+            payload_sha256 = hashlib.sha256(payload).hexdigest()
+            key = semantic_occupancy_s3_key(
+                model_artifact_id,
+                dataset_manifest_sha256,
+                dataset,
+                tar_path.name,
+                head_version=BEVFORMER_V2_HEAD_VERSION,
+            )
+            _put_s3_immutable(
+                s3,
+                bucket=artifacts_bucket,
+                key=key,
+                payload=payload,
+                metadata={
+                    "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
+                    "dataset-manifest-sha256": (
+                        dataset_manifest_sha256
+                    ),
+                    "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+                    "head-version": BEVFORMER_V2_HEAD_VERSION,
+                    "payload-sha256": payload_sha256,
+                    "sample-count": str(len(sample_uids)),
+                    "schema": SEMANTIC_OCCUPANCY_SCHEMA,
+                    "taxonomy-version": (
+                        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
+                    ),
+                    "weight-sha256": model_artifact_id,
+                },
+                content_type=(
+                    "application/vnd.auto-e2e.semantic-occupancy"
+                ),
+                content_encoding="gzip",
+            )
+            entries.append({
+                "byte_size": len(payload),
+                "sample_count": len(sample_uids),
+                "s3_key": key,
+                "sha256": payload_sha256,
+                "shard": tar_path.name,
+                "teacher_present": False,
+            })
+            total_samples += len(sample_uids)
+    if not entries:
+        raise ValueError("packed directories contain no tar shards")
+    metadata = provenance()
+    limitations = list(metadata["limitations"])
+    limitations.append(
+        "The official weight is supplied at execution time and is not "
+        "redistributed in the AutoE2E container image."
+    )
+    manifest = occupancy_set_manifest(
+        artifact_kind=BEVFORMER_V2_ARTIFACT_KIND,
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        created_at=publication_timestamp,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        display_name="BEVFormer V2 R50 t8 detection footprints",
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=BEVFORMER_V2_HEAD_VERSION,
+        input_contract=(
+            "kitscenes-packed-256-square-six-camera-to-"
+            "bevformer-640x256-v1"
+        ),
+        limitations=limitations,
+        model_artifact_id=model_artifact_id,
+        model_family="BEVFormer V2",
+        model_source={
+            "config": BEVFORMER_V2_CONFIG_NAME,
+            "license_spdx": "Apache-2.0",
+            "repository": BEVFORMER_V2_REPOSITORY,
+            "repository_revision": BEVFORMER_V2_REVISION,
+            "weight_sha256": model_artifact_id,
+        },
+        shards=entries,
+        supported_classes=(
+            BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES
+        ),
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        teacher_available=False,
+    )
+    manifest_payload, manifest_sha256 = encode_occupancy_set_manifest(
+        manifest
+    )
+    _put_s3_immutable(
+        s3,
+        bucket=artifacts_bucket,
+        key=manifest_key,
+        payload=manifest_payload,
+        metadata={
+            "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
+            "dataset-manifest-sha256": dataset_manifest_sha256,
+            "manifest-sha256": manifest_sha256,
+            "sample-count": str(total_samples),
+            "schema": manifest["schema_version"],
+            "weight-sha256": model_artifact_id,
+        },
+        content_type="application/json",
+    )
+    return SemanticOccupancyPrecomputeOutput(
+        manifest_key=manifest_key,
+        manifest_sha256=manifest_sha256,
+        checkpoint_sha256=model_artifact_id,
+        shard_count=len(entries),
+        sample_count=total_samples,
+    )
+
+
 # ============================================================
 # Task: Offline RL
 # ============================================================
@@ -10729,6 +10984,32 @@ def wf_precompute_semantic_occupancy(
         aws_region=aws_region,
         batch_size=batch_size,
         num_workers=num_workers,
+    )
+
+
+@workflow
+def wf_precompute_bevformer_v2_occupancy(
+    checkpoint: FlyteFile,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    aws_region: str = "us-west-2",
+    score_threshold: float = 0.2,
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish official V2 detection footprints for the Occupancy Dashboard."""
+    return precompute_bevformer_v2_occupancy_artifacts(
+        checkpoint=checkpoint,
+        shard_dirs=shard_dirs,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        artifacts_bucket=artifacts_bucket,
+        publication_timestamp=publication_timestamp,
+        aws_region=aws_region,
+        score_threshold=score_threshold,
     )
 
 
