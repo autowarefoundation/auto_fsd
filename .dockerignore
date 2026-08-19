@@ -1,0 +1,9 @@
+.git
+**/.next
+**/.pytest_cache
+**/__pycache__
+**/node_modules
+**/test-results
+**/*.ckpt
+**/*.pt
+**/*.pth
