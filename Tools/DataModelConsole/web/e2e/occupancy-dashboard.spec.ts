@@ -12,10 +12,14 @@ import {
 const DATASET = "kitscenes";
 const VERSION = "v3.3";
 const SHARD = "scene-a-train-000000.tar";
-const AUTOE2E_MODEL =
+const AUTOE2E_WEIGHT =
   "e41978b037986bc874ec9eec0aebf732c096ae5bfa64cee9c5fb3a4168e87a01";
-const BEVFORMER_MODEL =
+const AUTOE2E_MODEL =
+  "0db1fed95d588e17c6589ef543fe4724ff130cddbe369c36e2c4615920fa375e";
+const BEVFORMER_WEIGHT =
   "5585bc4d3ff8b396928cb92d91f773a2c57a81258f83cab0c668ebb2eb9d3307";
+const BEVFORMER_MODEL =
+  "31d54e3e882c65e0a58036b4bd3f1c1868d9eef09a78ee2f2c9ffecb022cc20d";
 const SAMPLE_UIDS = [
   "kitscenes-v1-scene-a-f000000",
   "kitscenes-v1-scene-a-f000001",
@@ -193,11 +197,18 @@ function model(
       "Predictions use the native head without viewer-side correction.",
     ],
     model_source: {
+      code_license_spdx: "Apache-2.0",
       config: "embedded-checkpoint-config",
-      license_spdx: "Apache-2.0",
+      license_spdx: "NOASSERTION",
       repository: "https://github.com/autowarefoundation/auto_e2e",
       repository_revision: "c".repeat(40),
-      weight_sha256: modelArtifactID,
+      training_data_license_spdx: "NOASSERTION",
+      weight_sha256: AUTOE2E_WEIGHT,
+      weight_source_url: `urn:sha256:${AUTOE2E_WEIGHT}`,
+    },
+    producer_config: {
+      deterministic_algorithms: true,
+      probability_encoding: "uint8-rint-gzip-level-6-v1",
     },
     sample_count: 2,
     shard_count: 1,
@@ -256,12 +267,20 @@ async function installOccupancyMocks(page: Page) {
         "External weight license is not separately stated; redistribution is disabled.",
       ],
       model_source: {
+        code_license_spdx: "Apache-2.0",
         config: "bevformerv2-r50-t8-24ep.py",
         license_spdx: "NOASSERTION",
         repository: "https://github.com/fundamentalvision/BEVFormer",
         repository_revision:
           "66b65f3a1f58caf0507cb2a971b9c0e7f842376c",
-        weight_sha256: BEVFORMER_MODEL,
+        training_data_license_spdx: "CC-BY-NC-SA-4.0",
+        weight_sha256: BEVFORMER_WEIGHT,
+        weight_source_url:
+          "https://drive.google.com/drive/folders/1Ml_usx5BNx43CFH1Di2OTazuzSyAlBto",
+      },
+      producer_config: {
+        deterministic_algorithms: true,
+        score_threshold: 0.2,
       },
     }),
   ];
@@ -543,6 +562,14 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
       "Official BEVFormer V2 publishes 3-D detection, not BEV segmentation.",
     ),
   ).toBeVisible();
+  await expect(page.getByText("CC-BY-NC-SA-4.0")).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "source" }),
+  ).toHaveAttribute(
+    "href",
+    "https://drive.google.com/drive/folders/1Ml_usx5BNx43CFH1Di2OTazuzSyAlBto",
+  );
+  await expect(page.getByText(/"score_threshold":0.2/)).toBeVisible();
   await expect
     .poll(async () => (await webGLPaintState(canvas)).hash, {
       timeout: 20_000,
