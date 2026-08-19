@@ -149,7 +149,7 @@ func (h *OverlayHandler) SemanticOccupancy(
 		)
 		return
 	}
-	body, _, err := h.s3.GetSemanticOccupancyBody(
+	body, _, err := h.s3.GetPublishedSemanticOccupancyBody(
 		r.Context(),
 		dataset,
 		version,
