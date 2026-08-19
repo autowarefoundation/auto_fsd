@@ -207,13 +207,16 @@ type SemanticOccupancyDescriptor struct {
 }
 
 // SemanticOccupancyModelSource records the immutable source of one published
-// occupancy model. The weight digest is also the model artifact ID.
+// occupancy model. Weight and generated occupancy identities are independent.
 type SemanticOccupancyModelSource struct {
-	Config             string `json:"config"`
-	LicenseSPDX        string `json:"license_spdx"`
-	Repository         string `json:"repository"`
-	RepositoryRevision string `json:"repository_revision"`
-	WeightSHA256       string `json:"weight_sha256"`
+	CodeLicenseSPDX         string `json:"code_license_spdx"`
+	Config                  string `json:"config"`
+	LicenseSPDX             string `json:"license_spdx"`
+	Repository              string `json:"repository"`
+	RepositoryRevision      string `json:"repository_revision"`
+	TrainingDataLicenseSPDX string `json:"training_data_license_spdx"`
+	WeightSHA256            string `json:"weight_sha256"`
+	WeightSourceURL         string `json:"weight_source_url"`
 }
 
 // SemanticOccupancyModel is one independently published occupancy model that
@@ -234,6 +237,7 @@ type SemanticOccupancyModel struct {
 	TeacherAvailable      bool                         `json:"teacher_available"`
 	Limitations           []string                     `json:"limitations"`
 	ModelSource           SemanticOccupancyModelSource `json:"model_source"`
+	ProducerConfig        map[string]any               `json:"producer_config"`
 	SampleCount           int                          `json:"sample_count"`
 	ShardCount            int                          `json:"shard_count"`
 	ShardSampleCount      int                          `json:"shard_sample_count"`
