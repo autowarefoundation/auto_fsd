@@ -98,14 +98,24 @@ def semantic_occupancy_s3_key(
     )
 
 
-def _quantize_probability(
+def quantize_semantic_occupancy(
     probability: np.ndarray,
 ) -> np.ndarray:
+    """Return canonical uint8 cells for one frame or a frame batch."""
     values = np.asarray(probability)
-    if values.ndim != 4 or values.shape[1] != len(
-        SEMANTIC_OCCUPANCY_CLASS_NAMES
-    ):
-        raise ValueError("probability must have shape [N,8,H,W]")
+    if values.ndim == 3:
+        class_count = values.shape[0]
+        expected_shape = "[8,H,W]"
+    elif values.ndim == 4:
+        class_count = values.shape[1]
+        expected_shape = "[N,8,H,W]"
+    else:
+        class_count = -1
+        expected_shape = "[8,H,W] or [N,8,H,W]"
+    if class_count != len(SEMANTIC_OCCUPANCY_CLASS_NAMES):
+        raise ValueError(f"probability must have shape {expected_shape}")
+    if values.dtype == np.uint8:
+        return np.ascontiguousarray(values)
     if (
         not np.issubdtype(values.dtype, np.floating)
         or not np.isfinite(values).all()
@@ -129,7 +139,9 @@ def encode_semantic_occupancy(
     sample_uids = tuple(sample_uids)
     if not sample_uids or len(set(sample_uids)) != len(sample_uids):
         raise ValueError("sample UIDs must be non-empty and unique")
-    probability_u8 = _quantize_probability(probability)
+    probability_u8 = quantize_semantic_occupancy(probability)
+    if probability_u8.ndim != 4:
+        raise ValueError("probability must have shape [N,8,H,W]")
     sample_count, class_count, height, width = probability_u8.shape
     if sample_count != len(sample_uids):
         raise ValueError("sample UID count differs from probability rows")
@@ -142,7 +154,7 @@ def encode_semantic_occupancy(
     if (teacher is None) != (valid_mask is None):
         raise ValueError("teacher and valid_mask must be present together")
     if teacher is not None and valid_mask is not None:
-        teacher_u8 = _quantize_probability(teacher)
+        teacher_u8 = quantize_semantic_occupancy(teacher)
         valid = np.asarray(valid_mask, dtype=np.bool_)
         if teacher_u8.shape != probability_u8.shape or valid.shape != (
             probability_u8.shape
