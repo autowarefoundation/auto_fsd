@@ -466,6 +466,10 @@ export default function OccupancyPage() {
               </span>
             </div>
             <dl className="grid min-w-0 gap-x-4 gap-y-1 font-mono text-[10px] sm:grid-cols-2">
+              <dt className="text-slate-500">Artifact</dt>
+              <dd className="min-w-0 truncate text-slate-300">
+                {shortDigest(selectedModel.model_artifact_id)}
+              </dd>
               <dt className="text-slate-500">Weight</dt>
               <dd className="min-w-0 truncate text-slate-300">
                 {shortDigest(selectedModel.model_source.weight_sha256)}
@@ -478,9 +482,34 @@ export default function OccupancyPage() {
               <dd className="min-w-0 break-all text-slate-300">
                 {selectedModel.input_contract}
               </dd>
-              <dt className="text-slate-500">License</dt>
+              <dt className="text-slate-500">Code license</dt>
+              <dd className="text-slate-300">
+                {selectedModel.model_source.code_license_spdx}
+              </dd>
+              <dt className="text-slate-500">Weight license</dt>
               <dd className="text-slate-300">
                 {selectedModel.model_source.license_spdx}
+              </dd>
+              <dt className="text-slate-500">Training data license</dt>
+              <dd className="text-slate-300">
+                {selectedModel.model_source.training_data_license_spdx}
+              </dd>
+              <dt className="text-slate-500">Weight source</dt>
+              <dd className="min-w-0 break-all text-slate-300">
+                {selectedModel.model_source.weight_source_url.startsWith(
+                  "https://",
+                ) ? (
+                  <a
+                    className="text-cyan-400 hover:text-cyan-300"
+                    href={selectedModel.model_source.weight_source_url}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    source
+                  </a>
+                ) : (
+                  selectedModel.model_source.weight_source_url
+                )}
               </dd>
               <dt className="text-slate-500">Repository</dt>
               <dd className="min-w-0 truncate">
@@ -492,6 +521,14 @@ export default function OccupancyPage() {
                 >
                   {selectedModel.model_family}
                 </a>
+              </dd>
+              <dt className="text-slate-500">Config</dt>
+              <dd className="min-w-0 break-all text-slate-300">
+                {selectedModel.model_source.config}
+              </dd>
+              <dt className="text-slate-500">Producer</dt>
+              <dd className="min-w-0 break-all text-slate-300">
+                {JSON.stringify(selectedModel.producer_config)}
               </dd>
               <dt className="text-slate-500">Teacher / Error</dt>
               <dd className="text-slate-300">
