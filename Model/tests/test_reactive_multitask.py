@@ -558,6 +558,28 @@ def test_packed_reactive_targets_round_trip():
     assert np.array_equal(decoded_bev_valid, valid)
 
 
+def test_semantic_artifact_accepts_prequantized_frames():
+    from Platform.pipelines.semantic_occupancy import (
+        encode_semantic_occupancy,
+        quantize_semantic_occupancy,
+    )
+
+    probability = np.linspace(
+        0.0,
+        1.0,
+        num=8 * 5 * 4,
+        dtype=np.float32,
+    ).reshape(1, 8, 5, 4)
+    quantized = quantize_semantic_occupancy(probability[0])
+
+    assert quantized.dtype == np.uint8
+    assert quantized.shape == (8, 5, 4)
+    assert encode_semantic_occupancy(
+        ["sample-a"],
+        np.stack([quantized]),
+    ) == encode_semantic_occupancy(["sample-a"], probability)
+
+
 def test_stage_a_to_stage_b_to_semantic_artifact_smoke(
     build_mock_model,
     device,
