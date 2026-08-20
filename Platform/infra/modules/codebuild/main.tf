@@ -71,6 +71,11 @@ resource "aws_iam_role_policy" "codebuild" {
           "arn:aws:s3:::${var.cluster_name}-datasets-${local.account_id}/*",
         ]
       },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = ["arn:aws:s3:::${var.cluster_name}-datasets-${local.account_id}/*/odd/configs/*"]
+      },
     ]
   })
 }
