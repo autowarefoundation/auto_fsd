@@ -11,8 +11,8 @@ import re
 import urllib.parse
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from collections.abc import Sequence
+from typing import Any, Callable, Mapping, Protocol
 
 import numpy as np
 

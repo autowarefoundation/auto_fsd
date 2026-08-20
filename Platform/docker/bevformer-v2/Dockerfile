@@ -113,9 +113,11 @@ ENV PYTHONPATH=/opt/BEVFormer:/workspace/Model:/workspace
 RUN python3.8 -m pip check \
     && python3.8 -c \
     "import cv2, importlib, mmcv, mmdet, mmseg, mmdet3d, torch; \
-from Platform.pipelines import workflows; \
+from Platform.pipelines import bevformer_v2_occupancy, bevformer_v2_runtime, workflows; \
 from mmcv import Config; \
 from mmdet3d.models import build_model; \
+assert bevformer_v2_occupancy.BEVFORMER_V2_WEIGHT_SHA256; \
+assert bevformer_v2_runtime.BEVFORMER_V2_IMAGE_WIDTH == 640; \
 assert workflows.precompute_bevformer_v2_occupancy_artifacts.name; \
 assert torch.__version__.startswith('1.9.1'); \
 assert cv2.__version__ == '4.5.5'; \
