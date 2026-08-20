@@ -8,6 +8,8 @@ Architecture:
 MLflow: Training logs epoch metrics; evaluation logs final metrics and registry
 entries. Two experiments: imitation-learning and offline-rl.
 """
+from __future__ import annotations
+
 import enum
 import functools
 from pathlib import Path
@@ -16,7 +18,12 @@ from flytekit import (
 )
 from flytekit.types.file import FlyteFile
 from flytekit.types.directory import FlyteDirectory
-from typing import Annotated, NamedTuple, List, Optional
+from typing import NamedTuple, List, Optional
+
+try:
+    from typing import Annotated
+except ImportError:  # Python 3.8 in the pinned BEVFormer V2 runtime.
+    from typing_extensions import Annotated
 
 from data_processing.contract_versions import (
     GEOMETRY_VERSION as _GEOM_V,
@@ -8076,6 +8083,7 @@ def precompute_semantic_occupancy_artifacts(
             pin_memory=(device.type == "cuda"),
             prefetch_factor=1,
             shard_files=[tar_path],
+            decode_history_frames=False,
             decode_future_frames=False,
         )
         (
@@ -8201,8 +8209,8 @@ def precompute_semantic_occupancy_artifacts(
 
 @task(
     container_image=BEVFORMER_V2_IMAGE,
-    requests=Resources(cpu="4", mem="32Gi", gpu="1"),
-    limits=Resources(cpu="4", mem="32Gi", gpu="1"),
+    requests=Resources(cpu="4", mem="28Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="28Gi", gpu="1"),
     pod_template=_large_shm_pod_template(),
 )
 def precompute_bevformer_v2_occupancy_artifacts(

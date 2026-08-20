@@ -342,6 +342,7 @@ def _decode_sample(
     sample: dict,
     pool=None,
     *,
+    decode_history_frames: bool = True,
     decode_future_frames: bool = True,
 ) -> dict:
     """Decode a WebDataset sample into training tensors (geometry-free).
@@ -739,11 +740,13 @@ def _decode_sample(
     windows = _decode_windows_from_pool(
         sample,
         pool,
+        decode_history_frames=decode_history_frames,
         decode_future_frames=decode_future_frames,
     )
     if windows is not None:
         history_frames, future_frames = windows
-        out["history_frames"] = history_frames
+        if history_frames is not None:
+            out["history_frames"] = history_frames
         if future_frames is not None:
             out["future_frames"] = future_frames
 
@@ -812,6 +815,7 @@ def _decode_windows_from_pool(
     sample: dict,
     pool,
     *,
+    decode_history_frames: bool = True,
     decode_future_frames: bool = True,
 ):
     """Rebuild (history_frames, future_frames) from window_index.json + the pool.
@@ -821,10 +825,13 @@ def _decode_windows_from_pool(
     frame pool (so old shards still train). Requires a pool accessor when a
     window_index.json is present.
     """
+    if not decode_history_frames and not decode_future_frames:
+        return None
     idx_blob = sample.get("window_index.json")
     if idx_blob is None:
         return _decode_windows_legacy(
             sample,
+            decode_history_frames=decode_history_frames,
             decode_future_frames=decode_future_frames,
         )
     if pool is None:
@@ -832,7 +839,11 @@ def _decode_windows_from_pool(
             "sample has window_index.json but the loader has no frame pool accessor; "
             "the sibling pool/ dir must exist next to the shards (#121 §3.4d).")
     index = json.loads(idx_blob.decode() if isinstance(idx_blob, (bytes, bytearray)) else idx_blob)
-    hist = _decode_window_from_index(index["history"], pool)
+    hist = (
+        _decode_window_from_index(index["history"], pool)
+        if decode_history_frames
+        else None
+    )
     fut = (
         _decode_window_from_index(index["future"], pool)
         if decode_future_frames
@@ -844,6 +855,7 @@ def _decode_windows_from_pool(
 def _decode_windows_legacy(
     sample: dict,
     *,
+    decode_history_frames: bool = True,
     decode_future_frames: bool = True,
 ):
     """Legacy path: decode hist_<t>_cam_<v>.jpg / fut_<f>_cam_<v>.jpg members
@@ -862,9 +874,14 @@ def _decode_windows_legacy(
             ]
             frame_steps.append(torch.stack(view_frames))
         return torch.stack(frame_steps)
-    hist = _one(_HIST_KEY_RE)
+    if not decode_history_frames and not decode_future_frames:
+        return None
+    hist = _one(_HIST_KEY_RE) if decode_history_frames else None
     fut = _one(_FUT_KEY_RE) if decode_future_frames else None
-    if hist is None or (decode_future_frames and fut is None):
+    if (
+        (decode_history_frames and hist is None)
+        or (decode_future_frames and fut is None)
+    ):
         return None
     return hist, fut
 
@@ -1216,6 +1233,7 @@ def make_pre_extracted_loader(
     shard_files: Sequence[str | Path] | None = None,
     sample_uids: Sequence[str] | None = None,
     validation_group_uids: Sequence[str] | None = None,
+    decode_history_frames: bool = True,
     decode_future_frames: bool = True,
     navigation_repeat_policy: NavigationRepeatPolicy | None = None,
     nodesplitter=None,
@@ -1249,6 +1267,9 @@ def make_pre_extracted_loader(
         validation_group_uids: optional frozen group-level validation manifest.
             When supplied with ``split="train"`` or ``"val"``, membership in
             this exact set replaces approximate hash bucketing.
+        decode_history_frames: decode World-Model history images. Inference
+            paths that use only the current camera frame disable this to avoid
+            requiring the sibling frame pool.
         decode_future_frames: decode World-Model target images. Benchmark
             inference disables this so future camera frames cannot enter its
             input batch; training keeps the default because JEPA needs them.
@@ -1332,6 +1353,7 @@ def make_pre_extracted_loader(
     dataset = dataset.map(functools.partial(
         _decode_sample,
         pool=pool,
+        decode_history_frames=decode_history_frames,
         decode_future_frames=decode_future_frames,
     ))
 
@@ -1500,6 +1522,7 @@ def make_multi_dataset_loader(
     max_active_loaders: int | None = None,
     sample_uids: Sequence[str] | None = None,
     validation_group_uids: Sequence[str] | None = None,
+    decode_history_frames: bool = True,
     decode_future_frames: bool = True,
     navigation_repeat_policy: NavigationRepeatPolicy | None = None,
     nodesplitter=None,
@@ -1548,6 +1571,7 @@ def make_multi_dataset_loader(
             prefetch_factor=prefetch_factor,
             sample_uids=sample_uids,
             validation_group_uids=validation_group_uids,
+            decode_history_frames=decode_history_frames,
             decode_future_frames=decode_future_frames,
             navigation_repeat_policy=navigation_repeat_policy,
             nodesplitter=nodesplitter,

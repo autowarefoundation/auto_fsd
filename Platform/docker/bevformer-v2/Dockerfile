@@ -66,6 +66,7 @@ RUN python3.8 -m pip install --no-cache-dir \
         fvcore==0.1.5.post20221221 \
         hydra-core==1.1.2 \
         iopath==0.1.9 \
+        kubernetes==28.1.0 \
         lyft-dataset-sdk==0.0.8 \
         matplotlib==3.5.2 \
         networkx==2.2 \
@@ -109,10 +110,13 @@ COPY Platform/pipelines/ /workspace/Platform/pipelines/
 
 ENV PYTHONPATH=/opt/BEVFormer:/workspace/Model:/workspace
 
-RUN python3.8 -c \
+RUN python3.8 -m pip check \
+    && python3.8 -c \
     "import cv2, importlib, mmcv, mmdet, mmseg, mmdet3d, torch; \
+from Platform.pipelines import workflows; \
 from mmcv import Config; \
 from mmdet3d.models import build_model; \
+assert workflows.precompute_bevformer_v2_occupancy_artifacts.name; \
 assert torch.__version__.startswith('1.9.1'); \
 assert cv2.__version__ == '4.5.5'; \
 assert mmcv.__version__ == '1.4.0'; \
