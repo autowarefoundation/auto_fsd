@@ -55,9 +55,9 @@ RUN git clone https://github.com/facebookresearch/detectron2.git /opt/detectron2
 # mmdetection3d and Detectron2 are source-installed with --no-deps above.
 # Keep their runtime requirements explicit alongside Flyte's S3 dependency set.
 RUN python3.8 -m pip install --no-cache-dir \
-        aiobotocore==2.13.3 \
+        aiobotocore==2.17.0 \
         black==21.4b2 \
-        boto3==1.34.162 \
+        boto3==1.35.93 \
         cloudpickle==2.2.1 \
         einops==0.6.1 \
         flytekit==1.13.15 \
@@ -113,6 +113,7 @@ ENV PYTHONPATH=/opt/BEVFormer:/workspace/Model:/workspace
 RUN python3.8 -m pip check \
     && python3.8 -c \
     "import cv2, importlib, mmcv, mmdet, mmseg, mmdet3d, torch; \
+from botocore.session import Session; \
 from Platform.pipelines import bevformer_v2_occupancy, bevformer_v2_runtime, workflows; \
 from mmcv import Config; \
 from mmdet3d.models import build_model; \
@@ -124,6 +125,7 @@ assert cv2.__version__ == '4.5.5'; \
 assert mmcv.__version__ == '1.4.0'; \
 assert mmdet.__version__ == '2.14.0'; \
 assert mmseg.__version__ == '0.14.1'; \
+assert 'IfNoneMatch' in Session().get_service_model('s3').operation_model('PutObject').input_shape.members; \
 importlib.import_module('projects.mmdet3d_plugin'); \
 config=Config.fromfile('/opt/BEVFormer/projects/configs/bevformerv2/bevformerv2-r50-t8-24ep.py'); \
 config.model.pretrained=None; \
