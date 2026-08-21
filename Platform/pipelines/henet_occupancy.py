@@ -12,9 +12,9 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from navigation.geometry import (
-    AUTOE2E_NAVIGATION_GEOMETRY,
-    NavigationRasterGeometry,
+from navigation.geometry import NavigationRasterGeometry
+from Platform.pipelines.semantic_occupancy import (
+    SEMANTIC_OCCUPANCY_GEOMETRY,
 )
 
 HENET_REPOSITORY = "https://github.com/VDIGPKU/HENet"
@@ -199,7 +199,7 @@ def _sample_henet_probability(
 def adapt_henet_segmentation(
     probability: np.ndarray,
     *,
-    geometry: NavigationRasterGeometry = AUTOE2E_NAVIGATION_GEOMETRY,
+    geometry: NavigationRasterGeometry = SEMANTIC_OCCUPANCY_GEOMETRY,
 ) -> np.ndarray:
     """Map official HENet probabilities to the fixed ASOC taxonomy and grid.
 
