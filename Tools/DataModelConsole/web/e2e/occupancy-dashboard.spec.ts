@@ -541,6 +541,35 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
   ).toHaveValue("0.2");
   await expect(region).toContainText("4 objects");
   await expect(region).not.toContainText("/56 objects");
+  const cameraLayout = await page
+    .getByRole("group", { name: "Camera evidence mosaic" })
+    .locator("figure")
+    .evaluateAll((figures) =>
+      figures.map((figure) => ({
+        col: figure.style.gridColumn,
+        label: figure.querySelector("figcaption")?.textContent?.trim(),
+        row: figure.style.gridRow,
+      })),
+    );
+  expect(cameraLayout).toEqual([
+    { col: "2", label: "front-center", row: "1" },
+    { col: "1", label: "front-left", row: "1" },
+    { col: "3", label: "front-right", row: "1" },
+    { col: "2", label: "rear", row: "2" },
+    { col: "1", label: "rear-left", row: "2" },
+    { col: "3", label: "rear-right", row: "2" },
+  ]);
+  const provenanceFollowsRenderer = await region.evaluate((renderer) => {
+    const provenance = document.querySelector(
+      '[aria-label="Occupancy model provenance"]',
+    );
+    return Boolean(
+      provenance &&
+        renderer.compareDocumentPosition(provenance) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+  expect(provenanceFollowsRenderer).toBe(true);
 
   await region.getByRole("button", { name: "Top view" }).click();
   await page.waitForTimeout(850);

@@ -29,6 +29,7 @@ import {
   resolveSemanticOccupancyRows,
   type SemanticOccupancyArtifact,
 } from "@/lib/semantic-occupancy";
+import { gridDimensions, rigCam } from "@/lib/rig";
 import type {
   SemanticOccupancyModel,
   ShardIndex,
@@ -237,6 +238,19 @@ export default function OccupancyPage() {
         .sort((left, right) => left - right),
     [sample],
   );
+  const cameraMembers = useMemo(
+    () => cameras.map((camera) => `cam_${camera}`),
+    [cameras],
+  );
+  const cameraGrid = useMemo(
+    () =>
+      gridDimensions(
+        dataset,
+        cameraMembers,
+        cameraMembers.length,
+      ),
+    [cameraMembers, dataset],
+  );
 
   const resetCoordinates = (
     nextDataset: string,
@@ -426,29 +440,63 @@ export default function OccupancyPage() {
             <Loader2 className="size-4 animate-spin" />
           </div>
         ) : (
-          <div className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-            {cameras.map((camera) => (
-              <figure
-                key={camera}
-                className="min-w-0 overflow-hidden border border-slate-800 bg-slate-950"
-              >
-                <CameraImage
-                  dataset={dataset}
-                  version={version}
-                  shard={shard}
-                  sampleKey={sample!.key}
-                  cam={camera}
-                  range={sample!.members[`cam_${camera}.jpg`]}
-                  className="aspect-square w-full"
-                />
-                <figcaption className="border-t border-slate-800 px-2 py-1 font-mono text-[9px] text-slate-500">
-                  cam_{camera}
-                </figcaption>
-              </figure>
-            ))}
+          <div
+            className="grid min-w-0 gap-2"
+            role="group"
+            aria-label="Camera evidence mosaic"
+            style={{
+              gridTemplateColumns: `repeat(${cameraGrid.cols}, minmax(0, 1fr))`,
+              gridTemplateRows: `repeat(${cameraGrid.rows}, auto)`,
+            }}
+          >
+            {cameras.map((camera, index) => {
+              const member = `cam_${camera}`;
+              const rig = rigCam(
+                dataset,
+                member,
+                index,
+                cameraMembers.length,
+              );
+              return (
+                <figure
+                  key={camera}
+                  className="min-w-0 overflow-hidden rounded-md border border-slate-800 bg-slate-950"
+                  style={{ gridRow: rig.row, gridColumn: rig.col }}
+                >
+                  <CameraImage
+                    dataset={dataset}
+                    version={version}
+                    shard={shard}
+                    sampleKey={sample!.key}
+                    cam={camera}
+                    range={sample!.members[`${member}.jpg`]}
+                    className="aspect-square w-full"
+                  />
+                  <figcaption className="border-t border-slate-800 px-2 py-1 font-mono text-[9px] text-slate-500">
+                    {rig.label}
+                  </figcaption>
+                </figure>
+              );
+            })}
           </div>
         )}
       </section>
+
+      {occupancyError && (
+        <ErrorState
+          error={occupancyError}
+          onRetry={() => setArtifactGeneration((value) => value + 1)}
+        />
+      )}
+      <SemanticOccupancyView
+        artifact={artifact}
+        row={row}
+        status={
+          occupancyStatus === "ready" && row === undefined
+            ? "unavailable"
+            : occupancyStatus
+        }
+      />
 
       {selectedModel && (
         <section
@@ -548,22 +596,6 @@ export default function OccupancyPage() {
           </div>
         </section>
       )}
-
-      {occupancyError && (
-        <ErrorState
-          error={occupancyError}
-          onRetry={() => setArtifactGeneration((value) => value + 1)}
-        />
-      )}
-      <SemanticOccupancyView
-        artifact={artifact}
-        row={row}
-        status={
-          occupancyStatus === "ready" && row === undefined
-            ? "unavailable"
-            : occupancyStatus
-        }
-      />
     </div>
   );
 }
