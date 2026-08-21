@@ -6,13 +6,13 @@ env:
     FLYTE_PROJECT: auto-e2e
     FLYTE_DOMAIN: development
     WORKFLOW_NAME: >-
-      Platform.pipelines.workflows.wf_pack_nuplan_snapshot_reactive_dataset
+      Platform.pipelines.nuplan_dataset.wf_pack_nuplan_snapshot_reactive_dataset
     FLYTE_VERSION: ""
     EXECUTION_NAME: ""
     SNAPSHOT_MANIFEST_URI: ""
     DATASETS_BUCKET: ""
     ARCHIVE_IDS_JSON: "[]"
-    LIMIT_TOTAL_SCENARIOS: "8"
+    LIMIT_TOTAL_SCENARIOS: "0"
     IMAGE_SIZE: "256"
     SAMPLES_PER_SHARD: "100"
     MAX_REJECTION_FRACTION: "0.25"
