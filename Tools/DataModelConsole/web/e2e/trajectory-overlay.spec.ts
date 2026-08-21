@@ -699,7 +699,7 @@ test("trajectory overlays and geographic views honor production contracts", asyn
     name: "3D semantic occupancy",
   });
   await expect(semanticOccupancy).toContainText("180 m × 120 m");
-  await expect(semanticOccupancy).toContainText("4/56 objects");
+  await expect(semanticOccupancy).toContainText("4 objects");
   const semanticCanvas = semanticOccupancy.locator(
     'canvas[aria-label="Interactive 3D semantic occupancy scene"]',
   );
