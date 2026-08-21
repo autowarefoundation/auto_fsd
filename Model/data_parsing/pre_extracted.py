@@ -400,6 +400,7 @@ def discover_bev_training_statistics(
     *,
     val_fraction: float,
     repeat_factors: Sequence[int] | None = None,
+    sample_uids: Sequence[str] | None = None,
 ) -> BEVTrainingStatistics:
     """Scan only sample and BEV-stat JSON members for exact train counts."""
     import tarfile
@@ -424,6 +425,16 @@ def discover_bev_training_statistics(
         or any(value < 1 for value in factors)
     ):
         raise ValueError("BEV repeat factors must be positive per class")
+    allowed_samples = (
+        frozenset(str(value) for value in sample_uids)
+        if sample_uids is not None
+        else None
+    )
+    if allowed_samples is not None and (
+        not allowed_samples
+        or len(allowed_samples) != len(sample_uids)
+    ):
+        raise ValueError("BEV sample subset must be non-empty and unique")
 
     records: dict[str, dict[str, object]] = {}
     stats_suffix = f".{BEV_SEGMENTATION_STATS_MEMBER}"
@@ -470,6 +481,11 @@ def discover_bev_training_statistics(
     valid_cells = np.zeros(class_count, dtype=np.int64)
     exposure_records: list[tuple[str, int]] = []
     for sample_uid, record in sorted(records.items()):
+        if (
+            allowed_samples is not None
+            and sample_uid not in allowed_samples
+        ):
+            continue
         if set(record) != {"sample", "stats"}:
             raise ValueError(
                 f"sample {sample_uid!r} lacks metadata or BEV statistics"
@@ -538,6 +554,98 @@ def discover_bev_training_statistics(
         valid_cell_count=tuple(int(value) for value in valid_cells),
         exposure_digest=hashlib.sha256(digest_payload).hexdigest(),
     )
+
+
+def discover_bev_positive_samples(
+    shard_dirs: Sequence[str | Path],
+    *,
+    val_fraction: float,
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Return train sample identities and positive classes without decoding."""
+    import tarfile
+
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_STATS_MEMBER,
+        decode_bev_segmentation_stats,
+    )
+
+    records: dict[str, dict[str, object]] = {}
+    stats_suffix = f".{BEV_SEGMENTATION_STATS_MEMBER}"
+    for root_value in shard_dirs:
+        root = Path(root_value)
+        tarfiles = sorted(root.glob("*.tar"))
+        if not tarfiles:
+            raise FileNotFoundError(f"No .tar shards found in {root}")
+        for tar_path in tarfiles:
+            with tarfile.open(tar_path, "r:*") as archive:
+                for member in archive:
+                    if not member.isfile():
+                        continue
+                    if member.name.endswith(stats_suffix):
+                        sample_uid = member.name.removesuffix(stats_suffix)
+                        key = "stats"
+                    elif member.name.endswith(".meta.json"):
+                        sample_uid = member.name.removesuffix(".meta.json")
+                        key = "sample"
+                    else:
+                        continue
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise ValueError(
+                            f"could not read {member.name} from {tar_path}"
+                        )
+                    record = records.setdefault(sample_uid, {})
+                    if key in record:
+                        raise ValueError(
+                            f"duplicate {member.name} for {sample_uid!r}"
+                        )
+                    payload = extracted.read()
+                    record[key] = (
+                        decode_bev_segmentation_stats(payload)
+                        if key == "stats"
+                        else _json_mapping(
+                            payload,
+                            member_name=f"{member.name} in {tar_path}",
+                        )
+                    )
+
+    summaries = []
+    for sample_uid, record in sorted(records.items()):
+        if set(record) != {"sample", "stats"}:
+            raise ValueError(
+                f"sample {sample_uid!r} lacks metadata or BEV statistics"
+            )
+        metadata = record["sample"]
+        stats = record["stats"]
+        if not isinstance(metadata, Mapping) or not isinstance(
+            stats, Mapping
+        ):
+            raise ValueError("invalid BEV sample summary metadata")
+        if metadata.get("sample_uid") != sample_uid:
+            raise ValueError(
+                f"sample metadata UID differs for {sample_uid!r}"
+            )
+        group_uid = metadata.get("split_group_uid")
+        if not isinstance(group_uid, str) or not group_uid:
+            raise ValueError(
+                f"sample {sample_uid!r} has no split_group_uid"
+            )
+        if _is_validation_group(group_uid, val_fraction):
+            continue
+        positive_cells = np.asarray(
+            stats["positive_cell_count"],
+            dtype=np.int64,
+        )
+        summaries.append((
+            sample_uid,
+            tuple(
+                int(value)
+                for value in np.flatnonzero(positive_cells > 0)
+            ),
+        ))
+    if not summaries:
+        raise ValueError("BEV sample discovery selected no training samples")
+    return tuple(summaries)
 
 
 def derive_bev_repeat_factors(
