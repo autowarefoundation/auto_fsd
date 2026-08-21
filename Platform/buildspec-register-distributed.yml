@@ -26,14 +26,25 @@ phases:
       - AUTO_E2E_RAY_STORAGE_PATH="s3://auto-e2e-platform-checkpoints-${ACCOUNT_ID}/ray-train"
       - export AUTO_E2E_RAY_STORAGE_PATH
       - >
-        IMAGE_DIGEST=$(aws ecr batch-get-image
+        TRAINING_IMAGE_DIGEST=$(aws ecr batch-get-image
         --repository-name auto-e2e/training
         --image-ids imageTag="${IMAGE_TAG}"
         --query 'images[0].imageId.imageDigest'
         --output text)
-      - test -n "${IMAGE_DIGEST}" && test "${IMAGE_DIGEST}" != "None"
-      - AUTO_E2E_TRAINING_IMAGE="${ECR_URL}/auto-e2e/training@${IMAGE_DIGEST}"
-      - export AUTO_E2E_TRAINING_IMAGE
+      - >
+        DATA_PREP_IMAGE_DIGEST=$(aws ecr batch-get-image
+        --repository-name auto-e2e/data-prep
+        --image-ids imageTag="${IMAGE_TAG}"
+        --query 'images[0].imageId.imageDigest'
+        --output text)
+      - >
+        test -n "${TRAINING_IMAGE_DIGEST}"
+        && test "${TRAINING_IMAGE_DIGEST}" != "None"
+        && test -n "${DATA_PREP_IMAGE_DIGEST}"
+        && test "${DATA_PREP_IMAGE_DIGEST}" != "None"
+      - AUTO_E2E_TRAINING_IMAGE="${ECR_URL}/auto-e2e/training@${TRAINING_IMAGE_DIGEST}"
+      - AUTO_E2E_DATA_PREP_IMAGE="${ECR_URL}/auto-e2e/data-prep@${DATA_PREP_IMAGE_DIGEST}"
+      - export AUTO_E2E_TRAINING_IMAGE AUTO_E2E_DATA_PREP_IMAGE
       - export PYTHONPATH="${CODEBUILD_SRC_DIR}/Model:${CODEBUILD_SRC_DIR}:${PYTHONPATH:-}"
       - |
         cat > /tmp/flyte.yaml << EOF
@@ -47,3 +58,4 @@ phases:
         --domain "${FLYTE_DOMAIN}"
         --image "${AUTO_E2E_TRAINING_IMAGE}"
         Platform/pipelines/distributed_training.py
+        Platform/pipelines/nuplan_dataset.py
