@@ -1328,7 +1328,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     model_config = {
         "backbone": str(config["backbone"]),
         "embed_dim": 256,
-        "is_pretrained": False,
+        "is_pretrained": bool(config["is_pretrained"]),
         **constructor_kwargs,
         "distributed_assignment_sha256": assignment_sha256,
         "distributed_global_batch": global_batch,
