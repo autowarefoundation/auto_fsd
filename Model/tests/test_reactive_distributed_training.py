@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,7 +35,11 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from distributed_training.reactive_stage import (
+    _all_reduce_bev_statistics,
+    _checkpoint_history,
+    _histogram_average_precision,
     _select_bev_overfit_subset,
+    _select_result_checkpoint,
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
     run_reactive_stage,
@@ -302,6 +307,7 @@ def _stage_config(stage: str) -> dict[str, object]:
         "overfit_min_ap": 0.9,
         "overfit_min_recall": 0.9,
         "overfit_sample_count": 0,
+        "overfit_shard_limit": 0,
         "parent_checkpoint_uri": (
             "s3://checkpoints/stage-a/checkpoint.pt"
             if stage == "l2d_continuation"
@@ -317,6 +323,7 @@ def _stage_config(stage: str) -> dict[str, object]:
         "steps_per_epoch": 0,
         "storage_path": "s3://checkpoints/ray-train",
         "val_fraction": 0.1,
+        "validation_sample_limit": 1024,
         "weight_decay": 0.01,
         "worker_cpus": 3,
     }
@@ -344,11 +351,57 @@ def test_validate_stage_config_rejects_parent_and_batch_contract_changes():
         validate_reactive_stage_config(caller_weighted)
 
 
-def test_ray_actor_cpu_reservation_matches_worker_config(monkeypatch):
+def test_ray_actor_cpu_reservation_matches_worker_config(
+    monkeypatch,
+    tmp_path,
+):
     ray = pytest.importorskip("ray")
     from ray.train import torch as ray_train_torch
 
     captured = {}
+    latest_directory = tmp_path / "latest"
+    latest_directory.mkdir()
+    best_metrics = {
+        "checkpoint_selection_score": 0.6,
+        "checkpoint_sha256": "a" * 64,
+        "epoch": 1,
+        "is_best": 1,
+        "world_size": 4,
+    }
+    final_metrics = {
+        "checkpoint_selection_score": 0.5,
+        "checkpoint_sha256": "b" * 64,
+        "epoch": 2,
+        "is_best": 0,
+        "world_size": 4,
+    }
+    (latest_directory / "history.json").write_text(json.dumps([
+        best_metrics,
+        final_metrics,
+    ]))
+
+    class FakeCheckpoint:
+        def __init__(self, path, directory):
+            self.path = path
+            self.directory = directory
+
+        def as_directory(self):
+            return nullcontext(str(self.directory))
+
+    latest_checkpoint = FakeCheckpoint(
+        (
+            "s3://checkpoints/ray-train/"
+            "reactive-stage-test/checkpoint_0002"
+        ),
+        latest_directory,
+    )
+    best_checkpoint = FakeCheckpoint(
+        (
+            "s3://checkpoints/ray-train/"
+            "reactive-stage-test/checkpoint_0001"
+        ),
+        latest_directory,
+    )
 
     class FakeTrainer:
         def __init__(self, **kwargs):
@@ -356,13 +409,9 @@ def test_ray_actor_cpu_reservation_matches_worker_config(monkeypatch):
 
         def fit(self):
             return SimpleNamespace(
-                checkpoint=SimpleNamespace(
-                    path=(
-                        "s3://checkpoints/ray-train/"
-                        "reactive-stage-test/checkpoint_0001"
-                    ),
-                ),
-                metrics={"world_size": 4},
+                best_checkpoints=[(best_checkpoint, best_metrics)],
+                checkpoint=latest_checkpoint,
+                metrics=final_metrics,
             )
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
@@ -371,12 +420,14 @@ def test_ray_actor_cpu_reservation_matches_worker_config(monkeypatch):
     config["num_workers"] = 4
     config["worker_cpus"] = 3
 
-    run_reactive_stage(config)
+    result = run_reactive_stage(config)
 
     assert captured["scaling_config"].resources_per_worker == {
         "CPU": 3,
         "GPU": 1,
     }
+    assert result["selected_epoch"] == 1
+    assert result["metrics"]["checkpoint_sha256"] == "a" * 64
 
 
 def test_validate_stage_config_rejects_missing_worker_cpu_contract():
@@ -482,10 +533,108 @@ def test_overfit_subset_is_class_complete_and_covers_every_rank():
     )
 
     assert len(selected) == 64
-    assert all(
-        any(uid.startswith(f"rank-{rank}-") for uid in selected)
+    assert [
+        sum(uid.startswith(f"rank-{rank}-") for uid in selected)
         for rank in range(4)
+    ] == [16, 16, 16, 16]
+    assert selected == _select_bev_overfit_subset(
+        tuple(reversed(rank_summaries)),
+        sample_count=64,
     )
+
+
+def test_bev_statistics_all_reduce_preserves_vector_offsets(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    local = BEVTrainingStatistics(
+        sample_count=2,
+        effective_exposure_count=3,
+        positive_sample_count=tuple(range(1, 9)),
+        positive_cell_count=tuple(range(11, 19)),
+        positive_mass=tuple(index + 0.5 for index in range(21, 29)),
+        valid_cell_count=tuple(range(101, 109)),
+        exposure_digest="a" * 64,
+    )
+
+    def all_reduce(tensor, op):
+        assert op == dist.ReduceOp.SUM
+        tensor.mul_(2)
+
+    def all_gather_object(output, _value):
+        output[:] = ["a" * 64, "b" * 64]
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+
+    combined = _all_reduce_bev_statistics(local, torch.device("cpu"))
+
+    assert combined.sample_count == 4
+    assert combined.effective_exposure_count == 6
+    assert combined.positive_sample_count == tuple(
+        2 * value for value in range(1, 9)
+    )
+    assert combined.positive_cell_count == tuple(
+        2 * value for value in range(11, 19)
+    )
+    assert combined.positive_mass == pytest.approx(tuple(
+        2 * (index + 0.5) for index in range(21, 29)
+    ))
+    assert combined.valid_cell_count == tuple(
+        2 * value for value in range(101, 109)
+    )
+
+
+def test_histogram_average_precision_matches_hand_calculation():
+    torch = pytest.importorskip("torch")
+
+    average_precision = _histogram_average_precision(
+        torch.tensor([1.0, 1.0]),
+        torch.tensor([1.0, 0.0]),
+    )
+
+    assert average_precision == pytest.approx(5.0 / 6.0)
+
+
+def test_result_checkpoint_selection_honors_ade_guard(tmp_path):
+    directory = tmp_path / "checkpoint"
+    directory.mkdir()
+    history = [{"checkpoint_sha256": "a" * 64, "epoch": 1}]
+    (directory / "history.json").write_text(json.dumps(history))
+    checkpoint = SimpleNamespace(
+        path="s3://checkpoints/ray-train/run/checkpoint_0001",
+        as_directory=lambda: nullcontext(str(directory)),
+    )
+    rejected = {
+        "checkpoint_selection_score": -1.0,
+        "checkpoint_sha256": "b" * 64,
+        "epoch": 2,
+        "is_best": 0,
+    }
+    accepted = {
+        "checkpoint_selection_score": 0.6,
+        "checkpoint_sha256": "a" * 64,
+        "epoch": 1,
+        "is_best": 1,
+    }
+    result = SimpleNamespace(
+        best_checkpoints=[
+            (SimpleNamespace(path="rejected"), rejected),
+            (checkpoint, accepted),
+        ],
+        checkpoint=SimpleNamespace(path="latest"),
+        metrics=rejected,
+    )
+
+    selected, metrics = _select_result_checkpoint(
+        result,
+        overfit_mode=False,
+    )
+
+    assert selected is checkpoint
+    assert metrics == accepted
+    assert _checkpoint_history(checkpoint) == history
 
 
 def test_bev_repeat_factors_are_frequency_aware_and_clipped():
