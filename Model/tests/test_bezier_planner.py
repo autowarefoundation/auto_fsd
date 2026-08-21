@@ -28,7 +28,8 @@ class _MockBackbone(nn.Module):
 
     def __init__(self, backbone="swin_v2_tiny", is_pretrained=True, **kwargs):
         super().__init__()
-        self.backbone_channels = 1440
+        self.feature_channels = [96, 192, 384, 768]
+        self.backbone_channels = sum(self.feature_channels)
         self._stages = nn.ModuleList([
             nn.Sequential(nn.Conv2d(3, 96, 3, 1, 1), nn.AdaptiveAvgPool2d(64)),
             nn.Sequential(nn.Conv2d(96, 192, 3, 1, 1), nn.AdaptiveAvgPool2d(32)),
