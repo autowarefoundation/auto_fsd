@@ -1017,10 +1017,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         BEVClassRepeatPolicy,
         derive_bev_pos_weights,
         derive_bev_repeat_factors,
-        discover_bev_positive_samples,
-        discover_bev_training_statistics,
+        discover_bev_sample_statistics,
         make_multi_dataset_loader,
         passthrough_nodesplitter,
+        summarize_bev_positive_samples,
+        summarize_bev_training_statistics,
     )
     from model_components.auto_e2e import AutoE2E
     from training.reactive_multitask import (
@@ -1064,8 +1065,13 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         raise ValueError(
             "BEV overfit gate dataset differs from the full training dataset"
         )
+    overfit_sample_count = int(config["overfit_sample_count"])
+    assignment_shards = plan.shards
+    overfit_shard_limit = int(config.get("overfit_shard_limit", 0))
+    if overfit_sample_count and overfit_shard_limit:
+        assignment_shards = plan.shards[:overfit_shard_limit]
     assignments = assign_reactive_shards(
-        plan.shards,
+        assignment_shards,
         world_size=world_size,
     )
     assignment_sha256 = reactive_assignment_sha256(assignments)
@@ -1082,12 +1088,17 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         rank_shards,
         cache_root=cache_root,
     )
-    overfit_sample_count = int(config["overfit_sample_count"])
+    local_bev_records = (
+        discover_bev_sample_statistics(local_directories)
+        if stage is ReactiveTrainingStage.NUPLAN_FULL
+        else None
+    )
     overfit_sample_uids: tuple[str, ...] | None = None
     overfit_sample_uid_sha256 = ""
     if overfit_sample_count:
-        local_summaries = discover_bev_positive_samples(
-            local_directories,
+        assert local_bev_records is not None
+        local_summaries = summarize_bev_positive_samples(
+            local_bev_records,
             val_fraction=float(config["val_fraction"]),
         )
         rank_summaries: list[Any] = [None] * world_size
@@ -1105,8 +1116,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     raw_bev_statistics = None
     effective_bev_statistics = None
     if stage is ReactiveTrainingStage.NUPLAN_FULL:
-        local_raw_statistics = discover_bev_training_statistics(
-            local_directories,
+        assert local_bev_records is not None
+        local_raw_statistics = summarize_bev_training_statistics(
+            local_bev_records,
             val_fraction=float(config["val_fraction"]),
             sample_uids=overfit_sample_uids,
         )
@@ -1132,30 +1144,36 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             ),
             max_repeat=int(config["bev_max_repeat"]),
         )
-        local_effective_statistics = (
-            discover_bev_training_statistics(
-                local_directories,
-                val_fraction=float(config["val_fraction"]),
-                repeat_factors=bev_repeat_factors,
-                sample_uids=overfit_sample_uids,
+        if overfit_sample_count:
+            effective_bev_statistics = raw_bev_statistics
+        else:
+            local_effective_statistics = (
+                summarize_bev_training_statistics(
+                    local_bev_records,
+                    val_fraction=float(config["val_fraction"]),
+                    repeat_factors=bev_repeat_factors,
+                    sample_uids=overfit_sample_uids,
+                )
             )
-        )
-        effective_bev_statistics = _all_reduce_bev_statistics(
-            local_effective_statistics,
-            device,
-        )
-        bev_pos_weights = derive_bev_pos_weights(
-            effective_bev_statistics,
-            max_weight=float(config["bev_pos_weight_cap"]),
-        )
-        mean_repeat = (
-            effective_bev_statistics.effective_exposure_count
-            / effective_bev_statistics.sample_count
-        )
-        bev_repeat_policy = BEVClassRepeatPolicy(
-            repeat_factors=bev_repeat_factors,
-            mean_repeat=mean_repeat,
-        )
+            effective_bev_statistics = _all_reduce_bev_statistics(
+                local_effective_statistics,
+                device,
+            )
+        bev_pos_weights = tuple(round(value, 6) for value in (
+            derive_bev_pos_weights(
+                effective_bev_statistics,
+                max_weight=float(config["bev_pos_weight_cap"]),
+            )
+        ))
+        if not overfit_sample_count:
+            mean_repeat = (
+                effective_bev_statistics.effective_exposure_count
+                / effective_bev_statistics.sample_count
+            )
+            bev_repeat_policy = BEVClassRepeatPolicy(
+                repeat_factors=bev_repeat_factors,
+                mean_repeat=mean_repeat,
+            )
 
     seed = int(config["training_seed"])
     _seed_epoch(seed, rank, 0)
@@ -1214,11 +1232,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     )
 
     if overfit_sample_count:
+        per_rank_overfit_samples = overfit_sample_count // world_size
         calculated_steps = max(1, math.ceil(
-            overfit_sample_count
+            per_rank_overfit_samples
             / (
-                world_size
-                * int(config["per_rank_batch_size"])
+                int(config["per_rank_batch_size"])
                 * int(config["gradient_accumulation_steps"])
             )
         ))
@@ -1309,6 +1327,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         )
         model_config["bev_overfit_sample_uid_sha256"] = (
             overfit_sample_uid_sha256
+        )
+        model_config["bev_overfit_staged_shard_count"] = len(
+            assignment_shards
         )
     started = time.perf_counter()
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
