@@ -8,6 +8,8 @@ import json
 import pytest
 
 from data_parsing.pre_extracted import (
+    derive_bev_pos_weights,
+    discover_bev_training_statistics,
     make_pre_extracted_loader,
     passthrough_nodesplitter,
 )
@@ -23,6 +25,7 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from distributed_training.reactive_stage import (
+    _select_bev_overfit_subset,
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
     validate_reactive_stage_config,
@@ -51,6 +54,12 @@ def _write_source(
         hashes[name] = hashlib.sha256(payload).hexdigest()
         counts[name] = sample_count
     manifest = {
+        "bev_statistics_count": (
+            sum(shard_counts) if include_bev else 0
+        ),
+        "bev_taxonomy_version": (
+            "bev_segmentation_v2" if include_bev else None
+        ),
         "dataset": dataset,
         "has_bev_segmentation": include_bev,
         "has_reactive_navigation": True,
@@ -267,7 +276,12 @@ def test_rank_owned_nodesplitter_preserves_every_assigned_shard():
 def _stage_config(stage: str) -> dict[str, object]:
     return {
         "backbone": "swin_v2_tiny",
-        "bev_pos_weights": [1.0] * 8,
+        "bev_ap_bins": 1024,
+        "bev_max_repeat": 4,
+        "bev_min_positive_cells": 1,
+        "bev_min_positive_samples": 1,
+        "bev_pos_weight_cap": 64.0,
+        "bev_repeat_frequency_threshold": 0.05,
         "epochs": 2,
         "grad_clip": 1.0,
         "gradient_accumulation_steps": 1,
@@ -275,6 +289,9 @@ def _stage_config(stage: str) -> dict[str, object]:
         "learning_rate": 1e-4,
         "num_loader_workers": 1,
         "num_workers": 8,
+        "overfit_min_dynamic_ap": 0.9,
+        "overfit_min_recall": 0.9,
+        "overfit_sample_count": 0,
         "parent_checkpoint_uri": (
             "s3://checkpoints/stage-a/checkpoint.pt"
             if stage == "l2d_continuation"
@@ -283,6 +300,8 @@ def _stage_config(stage: str) -> dict[str, object]:
         "per_rank_batch_size": 1,
         "precision": "bf16",
         "run_name": "reactive-stage-test",
+        "selection_ade_regression_margin_m": 0.5,
+        "selection_ade_scale_m": 5.0,
         "source_uris": ["s3://datasets/reactive"],
         "stage": stage,
         "steps_per_epoch": 0,
@@ -307,6 +326,11 @@ def test_validate_stage_config_rejects_parent_and_batch_contract_changes():
     stage_b["per_rank_batch_size"] = 2
     with pytest.raises(ValueError, match="per_rank_batch_size"):
         validate_reactive_stage_config(stage_b)
+
+    caller_weighted = _stage_config("nuplan_full")
+    caller_weighted["bev_pos_weights"] = [1.0] * 8
+    with pytest.raises(ValueError, match="derived"):
+        validate_reactive_stage_config(caller_weighted)
 
 
 @pytest.mark.parametrize(
@@ -367,3 +391,36 @@ def test_canary_dataset_uses_production_loader_contract(
     assert sample["map_context"].shape == (1, 14, 450, 300)
     assert sample["route_mask"].shape == (1, 2, 450, 300)
     assert bool(sample["bev_segmentation_available"][0]) is expected_bev
+    if stage is ReactiveTrainingStage.NUPLAN_FULL:
+        statistics = discover_bev_training_statistics(
+            [str(dataset)],
+            val_fraction=0.5,
+        )
+        weights = derive_bev_pos_weights(statistics)
+        assert len(weights) == 8
+        assert all(value >= 1.0 for value in weights)
+        assert statistics.positive_sample_count == (4,) * 8
+
+
+def test_overfit_subset_is_class_complete_and_covers_every_rank():
+    rank_summaries = tuple(
+        tuple(
+            (
+                f"rank-{rank}-sample-{index:03d}",
+                tuple(range(8)) if index == 0 else (index % 8,),
+            )
+            for index in range(20)
+        )
+        for rank in range(4)
+    )
+
+    selected = _select_bev_overfit_subset(
+        rank_summaries,
+        sample_count=64,
+    )
+
+    assert len(selected) == 64
+    assert all(
+        any(uid.startswith(f"rank-{rank}-") for uid in selected)
+        for rank in range(4)
+    )
