@@ -1,0 +1,199 @@
+version: 0.2
+
+# Publish the pinned native and BEVFormer V2 occupancy sets for KITScenes v3.3.
+#
+# Required start-build overrides:
+#   IMAGE_TAG, PUBLICATION_TIMESTAMP, REPOSITORY_REVISION
+# Optional:
+#   BEVFORMER_CHECKPOINT_URI and per-image tags
+
+env:
+  shell: bash
+  variables:
+    AWS_DEFAULT_REGION: us-west-2
+    FLYTE_PROJECT: auto-e2e
+    FLYTE_DOMAIN: development
+    IMAGE_TAG: ""
+    TRAINING_IMAGE_TAG: ""
+    DATA_PREP_IMAGE_TAG: ""
+    EVAL_IMAGE_TAG: ""
+    OFFLINE_RL_IMAGE_TAG: ""
+    BEVFORMER_V2_IMAGE_TAG: ""
+    AUTOE2E_CHECKPOINT_URI: ""
+    BEVFORMER_CHECKPOINT_URI: ""
+    PUBLISHED_SHARDS_URI: ""
+    ARTIFACTS_BUCKET: ""
+    DATASET: kitscenes
+    DATASET_VERSION: v3.3
+    DATASET_MANIFEST_SHA256: 31faf5d2ceef17522f1c79e6ab31558a2aceb6f75043a130d1f6b7da3ce6211d
+    PUBLICATION_TIMESTAMP: ""
+    REPOSITORY_REVISION: ""
+    SCORE_THRESHOLD: "0.2"
+
+phases:
+  install:
+    commands:
+      - pip install -q flytekit==1.14.9 numpy torch kubernetes --extra-index-url https://download.pytorch.org/whl/cpu
+  build:
+    commands:
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - test -n "${IMAGE_TAG}"
+      - test "${DATASET}" = "kitscenes"
+      - test "${DATASET_VERSION}" = "v3.3"
+      - test "${SCORE_THRESHOLD}" = "0.2"
+      - test "${DATASET_MANIFEST_SHA256}" = "31faf5d2ceef17522f1c79e6ab31558a2aceb6f75043a130d1f6b7da3ce6211d"
+      - test "${PUBLICATION_TIMESTAMP}" != ""
+      - test "${REPOSITORY_REVISION}" != ""
+      - |
+        [[ "${PUBLICATION_TIMESTAMP}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+        [[ "${REPOSITORY_REVISION}" =~ ^[0-9a-f]{40}$ ]]
+      - |
+        if [ -z "${AUTOE2E_CHECKPOINT_URI}" ]; then
+          AUTOE2E_CHECKPOINT_URI="s3://auto-e2e-platform-checkpoints-${ACCOUNT_ID}/ray-train/nuplan-mini-stage-a-4gpu-9c8a2786-r0-nuplan_full-ray-4/checkpoint_2026-08-19_13-37-37.087949/checkpoint.pt"
+        fi
+        if [ -z "${BEVFORMER_CHECKPOINT_URI}" ]; then
+          BEVFORMER_CHECKPOINT_URI="s3://auto-e2e-platform-checkpoints-${ACCOUNT_ID}/external/bevformer-v2/5585bc4d3ff8b396928cb92d91f773a2c57a81258f83cab0c668ebb2eb9d3307/epoch_24.pth"
+        fi
+        if [ -z "${PUBLISHED_SHARDS_URI}" ]; then
+          PUBLISHED_SHARDS_URI="s3://auto-e2e-platform-datasets-${ACCOUNT_ID}/kitscenes/v3.3/shards"
+        fi
+        if [ -z "${ARTIFACTS_BUCKET}" ]; then
+          ARTIFACTS_BUCKET="auto-e2e-platform-artifacts-${ACCOUNT_ID}"
+        fi
+        export AUTOE2E_CHECKPOINT_URI BEVFORMER_CHECKPOINT_URI
+        export PUBLISHED_SHARDS_URI ARTIFACTS_BUCKET
+      - |
+        verify_s3_sha256() {
+          URI="$1"
+          EXPECTED="$2"
+          OUTPUT="$3"
+          case "${URI}" in
+            s3://*) ;;
+            *)
+              echo "Expected an s3:// URI, got ${URI}" >&2
+              return 1
+              ;;
+          esac
+          aws s3 cp "${URI}" "${OUTPUT}" --only-show-errors
+          ACTUAL="$(sha256sum "${OUTPUT}" | cut -d' ' -f1)"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "SHA-256 mismatch for ${URI}: expected ${EXPECTED}, got ${ACTUAL}" >&2
+            return 1
+          fi
+        }
+        verify_s3_sha256 \
+          "${AUTOE2E_CHECKPOINT_URI}" \
+          "e41978b037986bc874ec9eec0aebf732c096ae5bfa64cee9c5fb3a4168e87a01" \
+          /tmp/autoe2e-checkpoint.pt
+        verify_s3_sha256 \
+          "${BEVFORMER_CHECKPOINT_URI}" \
+          "5585bc4d3ff8b396928cb92d91f773a2c57a81258f83cab0c668ebb2eb9d3307" \
+          /tmp/bevformer-v2-epoch-24.pth
+        verify_s3_sha256 \
+          "${PUBLISHED_SHARDS_URI%/}/manifest.json" \
+          "${DATASET_MANIFEST_SHA256}" \
+          /tmp/kitscenes-v3.3-manifest.json
+      - |
+        TRAINING_IMAGE_TAG="${TRAINING_IMAGE_TAG:-${IMAGE_TAG}}"
+        DATA_PREP_IMAGE_TAG="${DATA_PREP_IMAGE_TAG:-${IMAGE_TAG}}"
+        EVAL_IMAGE_TAG="${EVAL_IMAGE_TAG:-${IMAGE_TAG}}"
+        OFFLINE_RL_IMAGE_TAG="${OFFLINE_RL_IMAGE_TAG:-${IMAGE_TAG}}"
+        BEVFORMER_V2_IMAGE_TAG="${BEVFORMER_V2_IMAGE_TAG:-${IMAGE_TAG}}"
+        image_ref() {
+          REPOSITORY="$1"
+          TAG="$2"
+          DIGEST=$(aws ecr batch-get-image \
+            --repository-name "auto-e2e/${REPOSITORY}" \
+            --image-ids imageTag="${TAG}" \
+            --query 'images[0].imageId.imageDigest' \
+            --output text)
+          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "None" ]; then
+            echo "No digest found for auto-e2e/${REPOSITORY}:${TAG}" >&2
+            return 1
+          fi
+          printf '%s/auto-e2e/%s@%s' "${ECR_URL}" "${REPOSITORY}" "${DIGEST}"
+        }
+        AUTO_E2E_TRAINING_IMAGE="$(
+          image_ref training "${TRAINING_IMAGE_TAG}"
+        )" || exit 1
+        AUTO_E2E_EVAL_IMAGE="$(
+          image_ref eval "${EVAL_IMAGE_TAG}"
+        )" || exit 1
+        AUTO_E2E_OFFLINE_RL_IMAGE="$(
+          image_ref offline-rl "${OFFLINE_RL_IMAGE_TAG}"
+        )" || exit 1
+        AUTO_E2E_DATA_PREP_IMAGE="$(
+          image_ref data-prep "${DATA_PREP_IMAGE_TAG}"
+        )" || exit 1
+        AUTO_E2E_BEVFORMER_V2_IMAGE="$(
+          image_ref bevformer-v2 "${BEVFORMER_V2_IMAGE_TAG}"
+        )" || exit 1
+        export AUTO_E2E_TRAINING_IMAGE AUTO_E2E_EVAL_IMAGE
+        export AUTO_E2E_OFFLINE_RL_IMAGE AUTO_E2E_DATA_PREP_IMAGE
+        export AUTO_E2E_BEVFORMER_V2_IMAGE
+        export ECR_PREFIX="${ECR_URL}"
+        export PYTHONPATH="${CODEBUILD_SRC_DIR}/Model:${CODEBUILD_SRC_DIR}:${PYTHONPATH:-}"
+      - |
+        cat > /tmp/flyte.yaml << EOF
+        admin:
+          endpoint: dns:///k8s-flyte-flyteadm-be92e7737c-cf0d1a0f3df10f77.elb.us-west-2.amazonaws.com:81
+          insecure: true
+        EOF
+      - |
+        python3 - <<'PY'
+        import datetime
+        import json
+        import os
+
+        timestamp = os.environ["PUBLICATION_TIMESTAMP"]
+        parsed = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != timestamp:
+            raise ValueError("PUBLICATION_TIMESTAMP is not canonical UTC")
+
+        common = {
+            "shard_dirs": [os.environ["PUBLISHED_SHARDS_URI"]],
+            "dataset": os.environ["DATASET"],
+            "dataset_version": os.environ["DATASET_VERSION"],
+            "dataset_manifest_sha256": os.environ[
+                "DATASET_MANIFEST_SHA256"
+            ],
+            "artifacts_bucket": os.environ["ARTIFACTS_BUCKET"],
+            "publication_timestamp": timestamp,
+            "aws_region": os.environ["AWS_DEFAULT_REGION"],
+        }
+        native = {
+            **common,
+            "checkpoint": os.environ["AUTOE2E_CHECKPOINT_URI"],
+            "repository_revision": os.environ["REPOSITORY_REVISION"],
+            "batch_size": 2,
+            "num_workers": 0,
+        }
+        bevformer = {
+            **common,
+            "checkpoint": os.environ["BEVFORMER_CHECKPOINT_URI"],
+            "score_threshold": float(os.environ["SCORE_THRESHOLD"]),
+        }
+        for path, inputs in (
+            ("/tmp/native-occupancy-inputs.json", native),
+            ("/tmp/bevformer-v2-occupancy-inputs.json", bevformer),
+        ):
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(inputs, stream, sort_keys=True)
+        PY
+      - |
+        pyflyte --config /tmp/flyte.yaml run --remote \
+          --project "${FLYTE_PROJECT}" \
+          --domain "${FLYTE_DOMAIN}" \
+          --image "${AUTO_E2E_TRAINING_IMAGE}" \
+          Platform/pipelines/workflows.py \
+          wf_precompute_semantic_occupancy \
+          --inputs-file /tmp/native-occupancy-inputs.json
+      - |
+        pyflyte --config /tmp/flyte.yaml run --remote \
+          --project "${FLYTE_PROJECT}" \
+          --domain "${FLYTE_DOMAIN}" \
+          --image "${AUTO_E2E_TRAINING_IMAGE}" \
+          Platform/pipelines/workflows.py \
+          wf_precompute_bevformer_v2_occupancy \
+          --inputs-file /tmp/bevformer-v2-occupancy-inputs.json

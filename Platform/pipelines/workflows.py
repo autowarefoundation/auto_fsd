@@ -8,14 +8,22 @@ Architecture:
 MLflow: Training logs epoch metrics; evaluation logs final metrics and registry
 entries. Two experiments: imitation-learning and offline-rl.
 """
+from __future__ import annotations
+
 import enum
 import functools
+from pathlib import Path
 from flytekit import (
     task, workflow, dynamic, map_task, Resources, Secret, BatchSize,
 )
 from flytekit.types.file import FlyteFile
 from flytekit.types.directory import FlyteDirectory
-from typing import Annotated, NamedTuple, List, Optional
+from typing import NamedTuple, List, Optional
+
+try:
+    from typing import Annotated
+except ImportError:  # Python 3.8 in the pinned BEVFormer V2 runtime.
+    from typing_extensions import Annotated
 
 from data_processing.contract_versions import (
     GEOMETRY_VERSION as _GEOM_V,
@@ -23,6 +31,10 @@ from data_processing.contract_versions import (
     REASONING_LABEL_POLICY_VERSION as _LABEL_POLICY_V,
     SHARD_SCHEMA_VERSION as _SHARD_V,
     UID_SCHEMA_VERSION as _UID_V,
+)
+from data_processing.source_revisions import L2D_DATA_REVISION
+from data_parsing.kit_scenes.temporal_contract import (
+    kitscenes_temporal_contract,
 )
 from Platform.pipelines.dataset_publication import DatasetPublication
 from Platform.pipelines.overlay_tasks import (
@@ -35,7 +47,7 @@ from Platform.pipelines.trajectory_visualization_tasks import (
 
 import os as _os
 
-ECR_PREFIX = _os.environ.get("ECR_PREFIX", "381491877296.dkr.ecr.us-west-2.amazonaws.com")
+ECR_PREFIX = _os.environ.get("ECR_PREFIX", "registry.invalid")
 TRAINING_IMAGE = _os.environ.get(
     "AUTO_E2E_TRAINING_IMAGE",
     f"{ECR_PREFIX}/auto-e2e/training:latest",
@@ -52,17 +64,24 @@ DATA_PREP_IMAGE = _os.environ.get(
     "AUTO_E2E_DATA_PREP_IMAGE",
     f"{ECR_PREFIX}/auto-e2e/data-prep:latest",
 )
+BEVFORMER_V2_IMAGE = _os.environ.get(
+    "AUTO_E2E_BEVFORMER_V2_IMAGE",
+    f"{ECR_PREFIX}/auto-e2e/bevformer-v2:latest",
+)
 
 MLFLOW_URI = "http://mlflow.mlflow.svc.cluster.local:5000"
 DATASET_PACK_VERSION = "v2.2"
+L2D_REACTIVE_DATASET_VERSION = "v3.0-reactive-v1"
 KITSCENES_NAVIGATION_DATASET_VERSION = "v3.3"
+KITSCENES_BENCHMARK_DATASET_VERSION = "v3.3-benchmark-v3"
 BASELINE_TRAINING_OBJECTIVE_VERSION = "trajectory_imitation_v1"
 KITSCENES_NAVIGATION_OBJECTIVE_VERSION = (
     "kitscenes_navigation_objective_v1"
 )
 ROLLOUT_ALIGNED_OBJECTIVE_VERSION = "rollout_aligned_planner_v1"
 ROLLOUT_ALIGNED_CONTROL_OBJECTIVE_VERSION = "rollout_aligned_control_v1"
-L2D_SOURCE_REVISION = "main"
+SIMPLE_XY_IMITATION_OBJECTIVE_VERSION = "simple_xy_imitation_v1"
+L2D_SOURCE_REVISION = L2D_DATA_REVISION
 KITSCENES_SOURCE_REVISION = "6fde0034446669e2ed7235e4c7fe323cd23d599d"
 
 # The per-sample S3 label cache is REMOVED (#121 §3.4): at full L2D it was ~10M
@@ -173,9 +192,39 @@ def _large_shm_pod_template():
 
 # --- Enums ---
 class Dataset(enum.Enum):
+    NUPLAN = "nuplan/nuplan-v1.1"
     L2D = "yaak-ai/L2D"
     KITSCENES = "KIT-MRT/KITScenes-Multimodal"
     NVIDIA_PHYSICAL_AI = "nvidia/PhysicalAI-Autonomous-Vehicles"
+
+
+KITSCENES_TRAINING_SPLIT = "train"
+KITSCENES_BENCHMARK_SPLITS = frozenset({"val", "overlap_train_val"})
+
+
+def _validate_kitscenes_data_role(
+    *,
+    data_role: str,
+    source_split: str,
+) -> None:
+    """Keep held-out KITScenes scenes outside every training workflow."""
+    if data_role == "training":
+        if source_split != KITSCENES_TRAINING_SPLIT:
+            raise ValueError(
+                "KITScenes training accepts only the official train split, "
+                f"got {source_split!r}"
+            )
+        return
+    if data_role == "benchmark":
+        if source_split not in KITSCENES_BENCHMARK_SPLITS:
+            raise ValueError(
+                "KITScenes benchmark preparation accepts only val and "
+                f"overlap_train_val, got {source_split!r}"
+            )
+        return
+    raise ValueError(
+        f"unsupported KITScenes data_role {data_role!r}"
+    )
 
 
 class Backbone(enum.Enum):
@@ -201,8 +250,29 @@ def _row_decode_worker_count(dataset: Dataset, row_count: int) -> int:
     """Bound row decoders by each parser's per-process memory footprint."""
     # Each KITScenes child reparses the scene's Lanelet2 map and calibration.
     # Large scenes exceeded the 64 GiB pod limit with the generic 16-worker cap.
-    max_workers = 2 if dataset == Dataset.KITSCENES else 16
+    # Each L2D child owns video decoders for seven streams. Four workers retain
+    # useful decode parallelism without approaching the 64 GiB pod limit.
+    max_workers = 2 if dataset == Dataset.KITSCENES else 4
     return max(1, min(max_workers, row_count))
+
+
+def _use_parent_assembly_pack(
+    dataset: Dataset,
+    *,
+    has_samples: bool,
+    world_model: bool,
+    reactive_targets: bool,
+) -> bool:
+    """Select the memory-bounded row-decode path for structured targets."""
+    return (
+        dataset != Dataset.NVIDIA_PHYSICAL_AI
+        and has_samples
+        and (
+            world_model
+            or dataset == Dataset.KITSCENES
+            or reactive_targets
+        )
+    )
 
 
 # NOTE: view fusion is no longer selectable. The reactive-refactor (PR #94)
@@ -228,6 +298,18 @@ KITScenesBenchmarkOutput = NamedTuple(
     predictions=FlyteFile,
     report=FlyteFile,
 )
+KITScenesBenchmarkManifestOutput = NamedTuple(
+    "KITScenesBenchmarkManifestOutput",
+    manifest=FlyteFile,
+    manifest_sha256=str,
+)
+KITScenesBenchmarkPreparationOutput = NamedTuple(
+    "KITScenesBenchmarkPreparationOutput",
+    val_shards=List[FlyteDirectory],
+    overlap_shards=List[FlyteDirectory],
+    manifest=FlyteFile,
+    manifest_sha256=str,
+)
 ReconstructionAuditOutput = NamedTuple(
     "ReconstructionAuditOutput",
     thresholds_pass=bool,
@@ -235,6 +317,51 @@ ReconstructionAuditOutput = NamedTuple(
     records_sha256=str,
     report=FlyteFile,
     records=FlyteFile,
+)
+ReactiveTrainingProgramOutput = NamedTuple(
+    "ReactiveTrainingProgramOutput",
+    stage_a_checkpoint=FlyteFile,
+    stage_a_metadata=FlyteFile,
+    stage_b_checkpoint=FlyteFile,
+    stage_b_metadata=FlyteFile,
+    retention_report=FlyteFile,
+    retention_report_sha256=str,
+)
+ReactiveRetentionOutput = NamedTuple(
+    "ReactiveRetentionOutput",
+    report=FlyteFile,
+    report_sha256=str,
+)
+ReactiveBenchmarkProgramOutput = NamedTuple(
+    "ReactiveBenchmarkProgramOutput",
+    stage_a_ade_3s=float,
+    stage_a_fde_3s=float,
+    stage_a_ade_5s=float,
+    stage_a_fde_5s=float,
+    stage_a_predictions=FlyteFile,
+    stage_a_report=FlyteFile,
+    stage_b_ade_3s=float,
+    stage_b_fde_3s=float,
+    stage_b_ade_5s=float,
+    stage_b_fde_5s=float,
+    stage_b_predictions=FlyteFile,
+    stage_b_report=FlyteFile,
+)
+SemanticOccupancyPrecomputeOutput = NamedTuple(
+    "SemanticOccupancyPrecomputeOutput",
+    manifest_key=str,
+    manifest_sha256=str,
+    checkpoint_sha256=str,
+    shard_count=int,
+    sample_count=int,
+)
+NuPlanRawSnapshotOutput = NamedTuple(
+    "NuPlanRawSnapshotOutput",
+    manifest=FlyteFile,
+    manifest_sha256=str,
+    snapshot_prefix=str,
+    archive_count=int,
+    total_size_bytes=int,
 )
 # wf_create_dataset returns just the ready-to-train WebDataset shards (train_il
 # reads reasoning supervision from in-shard reasoning.json members). The
@@ -1539,6 +1666,14 @@ def _reasoning_label_indices(ds, label_stride: int) -> List[int]:
     return sorted(selected)
 
 
+def _packed_episode_count(
+    episodes: int,
+    group_ids: Optional[List[str]],
+) -> int:
+    """Return the exact source-group count represented by one packed shard."""
+    return len(group_ids) if group_ids is not None else episodes
+
+
 # ============================================================
 # Task: Resolve the immutable fan-out inventory
 # ============================================================
@@ -1562,6 +1697,7 @@ def plan_fanout_partitions(
     max_partitions: int,
     max_missing_scenes: int = 1,
     split: str = "train",
+    data_role: str = "training",
 ) -> List[List[str]]:
     """Resolve source groups once and return deterministic mapped-task inputs.
 
@@ -1592,15 +1728,14 @@ def plan_fanout_partitions(
         token = os.environ.get("HF_TOKEN", "")
 
     if dataset == Dataset.KITSCENES:
+        _validate_kitscenes_data_role(
+            data_role=data_role,
+            source_split=split,
+        )
         if source_revision != KITSCENES_SOURCE_REVISION:
             raise ValueError(
                 "KITScenes source_revision must match the audited pinned "
                 f"revision {KITSCENES_SOURCE_REVISION}, got {source_revision!r}"
-            )
-        if split != "train":
-            raise ValueError(
-                "The full training fan-out currently accepts only the official "
-                f"KITScenes train split, got {split!r}"
             )
         if partition_size != 1:
             raise ValueError(
@@ -1630,10 +1765,14 @@ def plan_fanout_partitions(
             + json.dumps(inventory.metadata(), sort_keys=True)
         )
     elif dataset == Dataset.L2D:
+        if data_role != "training" or split != "train":
+            raise ValueError(
+                "L2D fan-out supports only data_role='training', split='train'"
+            )
         if source_revision != L2D_SOURCE_REVISION:
             raise ValueError(
-                "L2D currently supports only revision='main' because the v3.0 "
-                f"tag is stale; got {source_revision!r}"
+                "L2D requires the audited source revision "
+                f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
             )
         if episodes == 0 or start_ep >= 0:
             try:
@@ -1653,6 +1792,11 @@ def plan_fanout_partitions(
             total = episodes
         group_ids = [str(index) for index in range(total)]
     else:
+        if data_role != "training" or split != "train":
+            raise ValueError(
+                "non-KITScenes fan-out supports only "
+                "data_role='training', split='train'"
+            )
         raise NotImplementedError(
             "NVIDIA PhysicalAI fan-out remains deferred; use the existing "
             "single-dataset workflow for that source."
@@ -1726,6 +1870,8 @@ def data_ingest(
     source_revision: str = L2D_SOURCE_REVISION,
     episodes: int = 3,
     group_ids: Optional[List[str]] = None,
+    source_split: str = "train",
+    data_role: str = "training",
 ) -> Annotated[FlyteDirectory, BatchSize(4)]:
     """Download raw dataset from HuggingFace (lerobot for L2D, physical_ai_av for NVIDIA).
 
@@ -1757,6 +1903,10 @@ def data_ingest(
         shutil.rmtree(out_dir)
 
     if dataset == Dataset.KITSCENES:
+        _validate_kitscenes_data_role(
+            data_role=data_role,
+            source_split=source_split,
+        )
         if source_revision != KITSCENES_SOURCE_REVISION:
             raise ValueError(
                 "KITScenes ingest requires pinned source revision "
@@ -1775,21 +1925,29 @@ def data_ingest(
         if group_ids is None:
             inventory = resolve_inventory(
                 downloader.archives,
-                split="train",
+                split=source_split,
                 source_revision=source_revision,
-                max_missing_scenes=1,
+                max_missing_scenes=(
+                    1 if data_role == "training" else 0
+                ),
             )
             scene_ids = list(inventory.selected_scene_ids)
             if episodes > 0:
                 scene_ids = scene_ids[:episodes]
         else:
             scene_ids = [str(scene_id) for scene_id in group_ids]
-        downloader.download(scene_ids, expected_split="train")
+        downloader.download(scene_ids, expected_split=source_split)
         print(
             f"Ingested {dataset.value}@{source_revision}: "
-            f"{len(scene_ids)} scenes -> {out_dir}"
+            f"{len(scene_ids)} {source_split} scenes -> {out_dir}"
         )
         return FlyteDirectory(out_dir)
+
+    if source_split != "train" or data_role != "training":
+        raise ValueError(
+            "non-KITScenes ingest supports only "
+            "data_role='training', source_split='train'"
+        )
 
     if dataset == Dataset.NVIDIA_PHYSICAL_AI:
         # NVIDIA PhysicalAI-AV: download via physical_ai_av SDK + unpack into the
@@ -1879,16 +2037,18 @@ def data_ingest(
     from huggingface_hub import hf_hub_download
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
-    # revision="main" — lerobot 0.5.0 defaults to CODEBASE_VERSION="v3.0", but
+    # The audited commit resolves the active branch content. lerobot 0.5.0
+    # defaults to CODEBASE_VERSION="v3.0", but
     # yaak-ai/L2D's v3.0 TAG points to a stale/broken snapshot (tasks.parquet
     # is 1485 bytes / 1 row at v3.0 vs 135484 bytes / 4219 rows on main;
     # episodes/data parquets are ~20% smaller too). Reading v3.0 causes
     # downstream KeyError in _absolute_to_relative_idx and IndexError in
-    # iloc[task_idx]. Pin to main so we always get the live L2D revision.
+    # iloc[task_idx]. Pin the audited main commit so later branch movement
+    # cannot change an experiment.
     if source_revision != L2D_SOURCE_REVISION:
         raise ValueError(
-            "L2D ingest supports revision='main' only because its v3.0 tag is "
-            f"stale; got {source_revision!r}"
+            "L2D ingest requires the audited source revision "
+            f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
         )
     _meta = LeRobotDatasetMetadata(
         repo_id=dataset.value,
@@ -2004,8 +2164,9 @@ def data_ingest(
 @task(
     container_image=DATA_PREP_IMAGE,
     pod_template=_data_prep_pod_template(),
-    # Process-parallel pack workers use the pod's available cores for camera
-    # decode/JPEG. The deduplicated WM path decodes each physical row once.
+    # Process-parallel camera workers decode/JPEG each physical row once for WM,
+    # KITScenes, and Reactive target packs. L2D uses four decoder processes so
+    # each process can own its video readers without exceeding the pod limit.
     # KITScenes one-scene partitions use the same schedulable Guaranteed profile
     # as ingest. The raw scene plus deduplicated 256px camera pool stays below
     # the default NodeClass's allocatable ephemeral storage.
@@ -2039,6 +2200,10 @@ def data_processing(
     reasoning_labels: Optional[FlyteDirectory] = None,
     group_ids: Optional[List[str]] = None,
     expected_reasoning_label_count: Optional[int] = None,
+    reactive_targets: bool = False,
+    osm_graph_snapshot: Optional[FlyteFile] = None,
+    source_split: str = "train",
+    data_role: str = "training",
 ) -> Annotated[FlyteDirectory, BatchSize(4)]:
     """Pre-extract aligned frames + egomotion → WebDataset shards.
 
@@ -2058,6 +2223,7 @@ def data_processing(
     (num_frames/stride) matches the online dataset so shards and on-the-fly
     windows are identical.
     """
+    import hashlib
     import os
     import io
     import json
@@ -2073,9 +2239,56 @@ def data_processing(
             raise ValueError(
                 "expected_reasoning_label_count requires reasoning_labels"
             )
+    if reactive_targets and dataset == Dataset.L2D:
+        if osm_graph_snapshot is None:
+            raise ValueError(
+                "L2D reactive targets require a pinned OSM graph snapshot"
+            )
+    elif osm_graph_snapshot is not None:
+        raise ValueError(
+            "osm_graph_snapshot is supported only for L2D reactive targets"
+        )
+    if reactive_targets and dataset not in {
+        Dataset.L2D,
+        Dataset.KITSCENES,
+    }:
+        raise ValueError(
+            "generic data_processing supports reactive targets only for "
+            "L2D and KITScenes; nuPlan uses its scenario adapter"
+        )
+    if dataset == Dataset.NUPLAN:
+        raise ValueError(
+            "nuPlan cannot use the LeRobot/KITScenes packer; provide shards "
+            "produced by the nuPlan scenario adapter"
+        )
+    if dataset == Dataset.KITSCENES:
+        _validate_kitscenes_data_role(
+            data_role=data_role,
+            source_split=source_split,
+        )
+    elif source_split != "train" or data_role != "training":
+        raise ValueError(
+            "non-KITScenes processing supports only "
+            "data_role='training', source_split='train'"
+        )
+    benchmark_protocol = (
+        dataset == Dataset.KITSCENES and data_role == "benchmark"
+    )
 
     raw_path = raw_data.download()
     print(f"Processing raw data from: {raw_path} (dataset={dataset.value})")
+    osm_graph_snapshot_path = (
+        osm_graph_snapshot.download()
+        if osm_graph_snapshot is not None
+        else None
+    )
+    osm_snapshot = None
+    if osm_graph_snapshot_path is not None:
+        from data_parsing.l2d import load_l2d_osm_graph_snapshot
+
+        osm_snapshot = load_l2d_osm_graph_snapshot(
+            osm_graph_snapshot_path
+        )
 
     # Reasoning labels present ⇒ this is a full-loss run, and the JEPA/world-model
     # loss needs the WM window (future frames) packed — so force WM on. Note the
@@ -2113,8 +2326,8 @@ def data_processing(
     else:
         if dataset == Dataset.L2D and source_revision != L2D_SOURCE_REVISION:
             raise ValueError(
-                "L2D pack supports revision='main' only because its v3.0 tag is "
-                f"stale; got {source_revision!r}"
+                "L2D pack requires the audited source revision "
+                f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
             )
         ep_list = ([int(g) for g in group_ids] if group_ids is not None
                    else (list(range(episodes)) if episodes > 0 else None))
@@ -2136,19 +2349,25 @@ def data_processing(
             from data_parsing.kit_scenes import KitScenesDataset
             ds = KitScenesDataset(
                 data_root=raw_path,
-                split="train",
+                split=source_split,
                 scene_ids=ep_list,
                 image_size=image_size,
                 include_world_model_windows=world_model,
                 include_navigation=False,
+                benchmark_protocol=benchmark_protocol,
             )
         else:
             from data_parsing.l2d import L2DDataset
             # World-Model windows (#16/#13) are only produced when requested, so the
             # imitation-only path stays cheap (no extra frame decode). root=raw_path:
             # read the partition's materialized raw, don't re-hit HF.
-            ds = L2DDataset(repo_id=dataset.value, episodes=ep_list,
-                            include_world_model_windows=world_model, root=raw_path)
+            ds = L2DDataset(
+                repo_id=dataset.value,
+                revision=source_revision,
+                episodes=ep_list,
+                include_world_model_windows=world_model,
+                root=raw_path,
+            )
         n_samples = len(ds)
         idx_iter = range(n_samples)
     except ValueError as e:
@@ -2168,7 +2387,6 @@ def data_processing(
     labels_by_id = {}
     _record_to_json = None
     if reasoning_labels is not None:
-        from pathlib import Path
         from data_processing.reasoning_label_generation.targets import (
             load_records_by_sample_id, record_to_json,
         )
@@ -2265,6 +2483,8 @@ def data_processing(
 
     shard_idx = 0
     shard_names: list[str] = []
+    shard_sample_counts: dict[str, int] = {}
+    current_shard_name: str | None = None
     sample_count = 0
     reasoning_label_count = 0
     joined_reasoning_ids: set[str] = set()
@@ -2291,12 +2511,14 @@ def data_processing(
         pool_frames_written += 1
 
     def open_new_shard():
-        nonlocal current_tar, shard_idx
+        nonlocal current_tar, current_shard_name, shard_idx
         if current_tar:
             current_tar.close()
         shard_name = published_shard_name(group_ids, shard_idx)
         current_tar = tarfile.open(os.path.join(out_dir, shard_name), "w")
         shard_names.append(shard_name)
+        shard_sample_counts[shard_name] = 0
+        current_shard_name = shard_name
         shard_idx += 1
 
     # Decode+JPEG-encode happens in the pack workers (parallel_pack); the parent
@@ -2316,11 +2538,15 @@ def data_processing(
     has_map = False
     has_wm = False
     navigation_artifact_summary = None
+    trajectory_xy_count = 0
+    bev_segmentation_count = 0
+    reactive_navigation_count = 0
 
-    if (
-        dataset != Dataset.NVIDIA_PHYSICAL_AI
-        and idx_list
-        and (world_model or dataset == Dataset.KITSCENES)
+    if _use_parent_assembly_pack(
+        dataset,
+        has_samples=bool(idx_list),
+        world_model=world_model,
+        reactive_targets=reactive_targets,
     ):
         # ── DECODE-DEDUP path: decode each UNIQUE physical row once ──
         # (#121 §3.4d) Previous approach decoded all 48 window frames per sample
@@ -2334,14 +2560,23 @@ def data_processing(
         # reasoning JOIN) from the pool — zero video decode.
         print(f"Packing {len(idx_list)} samples, parent-assembly mode "
               f"(row-level camera workers, world_model={world_model})...")
-        row_init = (dataset.value, ep_list, raw_path, image_size)
+        row_init = (
+            dataset.value,
+            ep_list,
+            raw_path,
+            image_size,
+            source_split,
+            source_revision,
+            benchmark_protocol,
+        )
 
         # Pass A: unique rows. ds is still alive here (not yet deleted).
         all_rows: set = set()
         # Collect the current-frame row (offset 0 = cam_*.jpg) FIRST so it's
         # tracked even if window_rows raises. Do NOT catch IndexError from
-        # window_rows: enumeration excludes edge frames (margins 64/64 dominate
-        # WM 30/40), so a raise here means the invariant has broken and we MUST
+        # window_rows: enumeration excludes edge frames. Training uses 64/64
+        # margins and the benchmark uses 40/50; both cover the WM 30/40 window.
+        # A raise here means the invariant has broken and we MUST
         # fail loudly rather than silently drop the sample's cam_*.jpg (which
         # would poison the shard: loader hits torch.stack([]) at train time).
         sample_cur_rows: dict = {}  # si -> (episode/scene, frame) current row
@@ -2393,17 +2628,19 @@ def data_processing(
             from data_parsing.kit_scenes import KitScenesDataset
             ds_asm = KitScenesDataset(
                 data_root=raw_path,
-                split="train",
+                split=source_split,
                 scene_ids=ep_list,
                 image_size=image_size,
                 include_world_model_windows=False,
                 include_navigation=True,
                 source_revision=source_revision,
+                benchmark_protocol=benchmark_protocol,
             )
         else:
             from data_parsing.l2d import L2DDataset
             ds_asm = L2DDataset(
                 repo_id=dataset.value,
+                revision=source_revision,
                 episodes=ep_list,
                 include_world_model_windows=False,
                 root=raw_path,
@@ -2484,6 +2721,54 @@ def data_processing(
                 "pose_current": pose_current,
                 "gps_future": gps_future,
             }))
+            if (
+                reactive_targets
+                and pose_current is not None
+                and gps_future is not None
+            ):
+                from data_processing.reactive_training_artifacts import (
+                    TRAJECTORY_XY_MEMBER,
+                    encode_trajectory_xy,
+                    wgs84_future_to_ego_xy,
+                )
+
+                trajectory_xy, trajectory_valid = (
+                    wgs84_future_to_ego_xy(
+                        gps_future,
+                        current_latitude_deg=float(
+                            pose_current["latitude_deg"]
+                        ),
+                        current_longitude_deg=float(
+                            pose_current["longitude_deg"]
+                        ),
+                        heading_deg_cw_from_north=float(
+                            pose_current[
+                                "heading_deg_cw_from_north"
+                            ]
+                        ),
+                    )
+                )
+                members[TRAJECTORY_XY_MEMBER] = encode_trajectory_xy(
+                    trajectory_xy,
+                    trajectory_valid,
+                )
+            if dataset == Dataset.L2D and osm_snapshot is not None:
+                if pose_current is None:
+                    raise ValueError(
+                        "L2D reactive targets require the current GPS pose"
+                    )
+                from data_parsing.l2d import (
+                    l2d_reactive_navigation_members,
+                )
+
+                members.update(
+                    l2d_reactive_navigation_members(
+                        osm_snapshot,
+                        ds_asm.route_waypoints_for(si),
+                        pose_current,
+                    )
+                )
+                has_map = True
             members["meta.json"] = json.dumps({
                 "idx": si, "dataset": dataset.value,
                 "sample_uid": uid, "split_group_uid": split_group,
@@ -2494,6 +2779,13 @@ def data_processing(
 
             for suffix, blob in members.items():
                 _add_member(uid, suffix, blob)
+            trajectory_xy_count += int("trajectory_xy.npz" in members)
+            bev_segmentation_count += int(
+                "bev_segmentation.npz" in members
+            )
+            reactive_navigation_count += int(
+                "navigation_meta.json" in members
+            )
             if _record_to_json is not None:
                 record = labels_by_id.get(uid)
                 if record is not None:
@@ -2502,6 +2794,8 @@ def data_processing(
                     reasoning_label_count += 1
                     joined_reasoning_ids.add(uid)
             sample_count += 1
+            assert current_shard_name is not None
+            shard_sample_counts[current_shard_name] += 1
 
     else:
         # ── Legacy path (imitation-only L2D, NVIDIA, or empty partition) ──
@@ -2510,7 +2804,15 @@ def data_processing(
         pack_workers = max(1, min(max_workers_cap, len(idx_list)))
         print(f"Packing {len(idx_list)} samples, legacy mode "
               f"(world_model={world_model}, per-sample decode)...")
-        pack_init = (dataset.value, ep_list, raw_path, image_size, world_model, calib_bytes)
+        pack_init = (
+            dataset.value,
+            ep_list,
+            raw_path,
+            image_size,
+            world_model,
+            calib_bytes,
+            osm_graph_snapshot_path,
+        )
         del ds
         with ProcessPoolExecutor(max_workers=pack_workers, mp_context=ctx,
                                  initializer=parallel_pack.init_pack_worker,
@@ -2529,6 +2831,15 @@ def data_processing(
                     or "map_semantic.npz" in members
                 )
                 has_wm = has_wm or ("window_index.json" in members)
+                trajectory_xy_count += int(
+                    "trajectory_xy.npz" in members
+                )
+                bev_segmentation_count += int(
+                    "bev_segmentation.npz" in members
+                )
+                reactive_navigation_count += int(
+                    "navigation_meta.json" in members
+                )
                 if _record_to_json is not None:
                     record = labels_by_id.get(sample_key)
                     if record is not None:
@@ -2537,9 +2848,27 @@ def data_processing(
                         reasoning_label_count += 1
                         joined_reasoning_ids.add(sample_key)
                 sample_count += 1
+                assert current_shard_name is not None
+                shard_sample_counts[current_shard_name] += 1
 
     if current_tar:
         current_tar.close()
+    shard_sha256 = {
+        name: hashlib.sha256(
+            Path(out_dir, name).read_bytes()
+        ).hexdigest()
+        for name in shard_names
+    }
+
+    if (
+        reactive_targets
+        and sample_count
+        and reactive_navigation_count != sample_count
+    ):
+        raise ValueError(
+            "reactive target packing was incomplete: "
+            f"{reactive_navigation_count}/{sample_count} samples"
+        )
 
     if expected_reasoning_label_count is not None:
         unjoined_ids = set(labels_by_id) - joined_reasoning_ids
@@ -2566,30 +2895,65 @@ def data_processing(
         GPS_SCHEMA_VERSION,
         POSE_SCHEMA_VERSION,
     )
-    from navigation.geometry import DEFAULT_NAVIGATION_GEOMETRY
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_ARTIFACT_VERSION,
+        BEV_SEGMENTATION_CLASSES,
+        REACTIVE_NAVIGATION_ARTIFACT_VERSION,
+        TRAJECTORY_XY_ARTIFACT_VERSION,
+    )
+    from navigation.geometry import (
+        AUTOE2E_NAVIGATION_GEOMETRY,
+        DEFAULT_NAVIGATION_GEOMETRY,
+    )
     from navigation.supervision import (
         ROUTE_SUPERVISION_ARTIFACT_VERSION,
     )
 
     manifest = {"total_samples": sample_count, "shards": shard_idx,
                 "shard_names": shard_names,
+                "shard_sample_counts": shard_sample_counts,
+                "shard_sha256": shard_sha256,
                 "partition_id": partition_id or None,
                 "hz": hz, "image_size": image_size, "dataset": dataset.value,
                 "source_revision": source_revision,
+                "source_split": source_split,
+                "data_role": data_role,
                 "dataset_version": dataset_version,
-                "episodes": episodes,
+                "episodes": _packed_episode_count(episodes, group_ids),
+                "temporal_sampling": (
+                    kitscenes_temporal_contract(
+                        benchmark_protocol=benchmark_protocol,
+                    )
+                    if dataset == Dataset.KITSCENES
+                    else None
+                ),
+                "reactive_targets_requested": reactive_targets,
                 "contracts": contract_versions(),
                 # num_views = real cameras only; the map view is stored under a
                 # separate map.jpg key and is NOT counted here (#77).
                 "num_views": num_views if sample_count else 0,
                 "has_map": bool(sample_count) and has_map,
-                "has_navigation": (
+                "has_navigation": bool(sample_count) and (
+                    navigation_artifact_summary is not None
+                    or reactive_navigation_count == sample_count
+                ),
+                "has_reactive_navigation": (
                     bool(sample_count)
-                    and navigation_artifact_summary is not None
+                    and reactive_navigation_count == sample_count
+                ),
+                "reactive_navigation_count": reactive_navigation_count,
+                "reactive_navigation_version": (
+                    REACTIVE_NAVIGATION_ARTIFACT_VERSION
+                    if reactive_navigation_count
+                    else None
                 ),
                 "has_route_supervision": (
                     bool(sample_count)
                     and navigation_artifact_summary is not None
+                ),
+                "has_route_reconstruction": (
+                    bool(sample_count)
+                    and reactive_navigation_count == sample_count
                 ),
                 "route_supervision_version": (
                     ROUTE_SUPERVISION_ARTIFACT_VERSION
@@ -2600,15 +2964,62 @@ def data_processing(
                     else None
                 ),
                 "navigation": navigation_artifact_summary,
+                "navigation_source": (
+                    {
+                        "type": "pinned_osm_graph",
+                        "sha256": osm_snapshot.source_sha256,
+                        "revision": osm_snapshot.source_revision,
+                        "attribution": osm_snapshot.attribution,
+                    }
+                    if osm_snapshot is not None
+                    else None
+                ),
                 "navigation_geometry": (
-                    DEFAULT_NAVIGATION_GEOMETRY.contract()
-                    if navigation_artifact_summary is not None
+                    (
+                        AUTOE2E_NAVIGATION_GEOMETRY.contract()
+                        if reactive_navigation_count
+                        else DEFAULT_NAVIGATION_GEOMETRY.contract()
+                    )
+                    if (
+                        navigation_artifact_summary is not None
+                        or reactive_navigation_count
+                    )
                     else None
                 ),
                 "map_context_channels": (
-                    14 if navigation_artifact_summary is not None else 3
+                    14
+                    if (
+                        navigation_artifact_summary is not None
+                        or reactive_navigation_count
+                    )
+                    else 3
                 ),
                 "route_channels": 2,
+                "has_trajectory_xy": (
+                    bool(sample_count)
+                    and trajectory_xy_count == sample_count
+                ),
+                "trajectory_xy_count": trajectory_xy_count,
+                "trajectory_xy_version": (
+                    TRAJECTORY_XY_ARTIFACT_VERSION
+                    if trajectory_xy_count
+                    else None
+                ),
+                "has_bev_segmentation": (
+                    bool(sample_count)
+                    and bev_segmentation_count == sample_count
+                ),
+                "bev_segmentation_count": bev_segmentation_count,
+                "bev_segmentation_version": (
+                    BEV_SEGMENTATION_ARTIFACT_VERSION
+                    if bev_segmentation_count
+                    else None
+                ),
+                "bev_segmentation_classes": (
+                    list(BEV_SEGMENTATION_CLASSES)
+                    if bev_segmentation_count
+                    else None
+                ),
                 # World-Model windows present when packed (enables JEPA training).
                 "has_world_model": bool(sample_count) and has_wm,
                 "has_reasoning_labels": reasoning_label_count > 0,
@@ -2887,8 +3298,8 @@ def generate_reasoning_labels(
     else:
         if dataset == Dataset.L2D and source_revision != L2D_SOURCE_REVISION:
             raise ValueError(
-                "L2D labeling supports revision='main' only because its v3.0 "
-                f"tag is stale; got {source_revision!r}"
+                "L2D labeling requires the audited source revision "
+                f"{L2D_SOURCE_REVISION}; got {source_revision!r}"
             )
         ep_list = ([int(g) for g in group_ids] if group_ids is not None
                    else (list(range(episodes)) if episodes > 0 else None))
@@ -2920,8 +3331,13 @@ def generate_reasoning_labels(
         else:
             from data_parsing.l2d import L2DDataset
             # root=raw_path: read the partition's materialized raw, don't re-hit HF.
-            ds = L2DDataset(repo_id=dataset.value, episodes=ep_list,
-                            reasoning_clip_only=True, root=raw_path)
+            ds = L2DDataset(
+                repo_id=dataset.value,
+                revision=source_revision,
+                episodes=ep_list,
+                reasoning_clip_only=True,
+                root=raw_path,
+            )
         n_samples = len(ds)
         label_indices = _reasoning_label_indices(ds, label_stride)
     except ValueError as e:
@@ -6149,6 +6565,2049 @@ def train_il(
 
 
 # ============================================================
+# Task: authorized nuPlan source -> immutable raw snapshot
+# ============================================================
+@task(
+    container_image=DATA_PREP_IMAGE,
+    pod_template=_data_prep_pod_template(),
+    requests=Resources(
+        cpu="2",
+        mem="4Gi",
+        ephemeral_storage="4Gi",
+    ),
+    limits=Resources(
+        cpu="2",
+        mem="4Gi",
+        ephemeral_storage="4Gi",
+    ),
+    retries=2,
+)
+def acquire_nuplan_archive(
+    source_manifest: FlyteFile,
+    archive_index: int,
+    datasets_bucket: str,
+    aws_region: str = "us-west-2",
+) -> FlyteFile:
+    """Import one authorized nuPlan archive into an immutable S3 snapshot."""
+    import json
+    import tempfile
+    from contextlib import closing
+    from pathlib import Path
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urlsplit
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+
+    from Platform.pipelines.nuplan_acquisition import (
+        ARCHIVE_RECEIPT_SCHEMA_VERSION,
+        archive_object_key,
+        archive_receipt_key,
+        canonical_json_bytes,
+        copy_s3_object_multipart,
+        digest_stream,
+        load_source_manifest_bytes,
+        official_nuplan_open_data_region,
+        upload_https_stream_multipart,
+        validate_archive_digest,
+        validate_public_https_uri,
+        validate_s3_source_head,
+    )
+
+    if (
+        not datasets_bucket
+        or datasets_bucket.startswith("s3://")
+        or "/" in datasets_bucket
+    ):
+        raise ValueError("datasets_bucket must be one S3 bucket name")
+    if archive_index < 0:
+        raise ValueError("archive_index must be non-negative")
+
+    source_bytes = Path(source_manifest.download()).read_bytes()
+    manifest, source_contract_sha256 = load_source_manifest_bytes(source_bytes)
+    if archive_index >= len(manifest["archives"]):
+        raise IndexError(
+            f"archive_index {archive_index} is outside "
+            f"{len(manifest['archives'])} source archives"
+        )
+    archive = manifest["archives"][archive_index]
+    parsed_source = urlsplit(archive["source_uri"])
+    object_key = archive_object_key(manifest, archive)
+    receipt_key = archive_receipt_key(manifest, archive)
+    s3 = boto3.client("s3", region_name=aws_region)
+
+    def receipt_output(payload: bytes) -> FlyteFile:
+        path = Path(tempfile.mkdtemp(prefix="nuplan-archive-receipt-"))
+        output = path / "receipt.json"
+        output.write_bytes(payload)
+        return FlyteFile(str(output))
+
+    try:
+        response = s3.get_object(
+            Bucket=datasets_bucket,
+            Key=receipt_key,
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "404",
+            "NoSuchKey",
+        }:
+            raise
+    else:
+        with closing(response["Body"]) as receipt_stream:
+            receipt_bytes = receipt_stream.read()
+        receipt = json.loads(receipt_bytes)
+        if (
+            receipt.get("schema_version")
+            != ARCHIVE_RECEIPT_SCHEMA_VERSION
+            or receipt.get("archive_id") != archive["archive_id"]
+            or receipt.get("source_contract_sha256")
+            != source_contract_sha256
+            or receipt.get("object_uri")
+            != f"s3://{datasets_bucket}/{object_key}"
+        ):
+            raise ValueError(
+                f"existing nuPlan receipt conflicts with {archive['archive_id']!r}"
+            )
+        head_arguments = {
+            "Bucket": datasets_bucket,
+            "Key": object_key,
+        }
+        if receipt.get("transfer_mode") == "s3_server_side_multipart_copy":
+            head_arguments["ChecksumMode"] = "ENABLED"
+        head = s3.head_object(**head_arguments)
+        if int(head["ContentLength"]) != int(receipt["size_bytes"]):
+            raise ValueError(
+                f"existing nuPlan object size differs from receipt: {object_key}"
+            )
+        if (
+            receipt.get("checksum_crc64nvme")
+            and head.get("ChecksumCRC64NVME")
+            != receipt["checksum_crc64nvme"]
+        ):
+            raise ValueError(
+                "existing nuPlan object checksum differs from receipt: "
+                f"{object_key}"
+            )
+        return receipt_output(receipt_bytes)
+
+    upload = None
+    try:
+        head = s3.head_object(
+            Bucket=datasets_bucket,
+            Key=object_key,
+            **(
+                {"ChecksumMode": "ENABLED"}
+                if parsed_source.scheme == "s3"
+                else {}
+            ),
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "404",
+            "NoSuchKey",
+        }:
+            raise
+    else:
+        if int(head["ContentLength"]) != int(archive["expected_size_bytes"]):
+            raise ValueError(
+                f"existing nuPlan object has the wrong size: {object_key}"
+            )
+        expected_metadata = {
+            "archive-id": archive["archive_id"],
+            "snapshot-id": manifest["snapshot_id"],
+            "source-contract-sha256": source_contract_sha256,
+            **(
+                {"source-etag": archive["expected_etag"]}
+                if archive["expected_etag"]
+                else {}
+            ),
+        }
+        actual_metadata = head.get("Metadata", {})
+        if any(
+            actual_metadata.get(key) != value
+            for key, value in expected_metadata.items()
+        ):
+            raise ValueError(
+                "existing nuPlan object metadata differs from its source "
+                f"contract: {object_key}"
+            )
+        if parsed_source.scheme == "s3":
+            checksum = head.get("ChecksumCRC64NVME")
+            if not isinstance(checksum, str) or not checksum:
+                raise ValueError(
+                    "existing server-side copied nuPlan object lacks "
+                    f"CRC64NVME: {object_key}"
+                )
+            upload = {
+                "checksum_crc64nvme": checksum,
+                "destination_etag": str(head["ETag"]).strip('"').lower(),
+                "md5": "",
+                "sha256": "",
+                "size_bytes": int(head["ContentLength"]),
+                "source_etag": archive["expected_etag"],
+                "transfer_mode": "s3_server_side_multipart_copy",
+            }
+        else:
+            existing_object = s3.get_object(
+                Bucket=datasets_bucket,
+                Key=object_key,
+            )
+            with closing(existing_object["Body"]) as existing_stream:
+                upload = digest_stream(existing_stream)
+            validate_archive_digest(
+                upload,
+                expected_size_bytes=archive["expected_size_bytes"],
+                expected_sha256=archive["expected_sha256"],
+                expected_md5=archive["expected_md5"],
+                label=object_key,
+            )
+            upload.update({
+                "checksum_crc64nvme": "",
+                "destination_etag": str(head["ETag"]).strip('"').lower(),
+                "source_etag": "",
+                "transfer_mode": "https_stream_hash",
+            })
+        print(
+            "Recovered nuPlan archive receipt from existing verified object "
+            f"id={archive['archive_id']}"
+        )
+
+    if upload is None:
+        if parsed_source.scheme == "s3":
+            source_bucket = parsed_source.netloc
+            source_key = parsed_source.path.lstrip("/")
+            open_data_region = official_nuplan_open_data_region(
+                source_bucket,
+                source_key,
+            )
+            if open_data_region is None:
+                source_s3 = boto3.client("s3")
+            else:
+                source_s3 = boto3.client(
+                    "s3",
+                    region_name=open_data_region,
+                    config=Config(signature_version=UNSIGNED),
+                )
+            source_head = source_s3.head_object(
+                Bucket=source_bucket,
+                Key=source_key,
+            )
+            validate_s3_source_head(source_head, archive)
+            upload = copy_s3_object_multipart(
+                s3_client=s3,
+                source_bucket=source_bucket,
+                source_key=source_key,
+                source_etag=archive["expected_etag"],
+                destination_bucket=datasets_bucket,
+                destination_key=object_key,
+                metadata={
+                    "archive-id": archive["archive_id"],
+                    "snapshot-id": manifest["snapshot_id"],
+                    "source-contract-sha256": source_contract_sha256,
+                    "source-etag": archive["expected_etag"],
+                },
+                expected_size_bytes=archive["expected_size_bytes"],
+            )
+        else:
+            validate_public_https_uri(archive["source_uri"])
+
+            class PublicHTTPSRedirectHandler(HTTPRedirectHandler):
+                def redirect_request(
+                    self,
+                    request,
+                    file_pointer,
+                    code,
+                    message,
+                    headers,
+                    new_url,
+                ):
+                    validate_public_https_uri(new_url)
+                    return super().redirect_request(
+                        request,
+                        file_pointer,
+                        code,
+                        message,
+                        headers,
+                        new_url,
+                    )
+
+            request = Request(
+                archive["source_uri"],
+                headers={
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "auto-e2e-nuplan-acquisition/1",
+                },
+            )
+            try:
+                source_response = build_opener(
+                    PublicHTTPSRedirectHandler()
+                ).open(
+                    request,
+                    timeout=120,
+                )
+            except HTTPError as error:
+                raise RuntimeError(
+                    "authorized HTTPS source returned "
+                    f"status={error.code} archive_id={archive['archive_id']}"
+                ) from None
+            except URLError as error:
+                raise RuntimeError(
+                    "authorized HTTPS source connection failed "
+                    f"archive_id={archive['archive_id']} "
+                    f"reason_type={type(error.reason).__name__}"
+                ) from None
+            with closing(source_response) as source_stream:
+                upload = upload_https_stream_multipart(
+                    s3_client=s3,
+                    stream=source_stream,
+                    bucket=datasets_bucket,
+                    key=object_key,
+                    metadata={
+                        "archive-id": archive["archive_id"],
+                        "snapshot-id": manifest["snapshot_id"],
+                        "source-contract-sha256": source_contract_sha256,
+                    },
+                    expected_size_bytes=archive["expected_size_bytes"],
+                    expected_sha256=archive["expected_sha256"],
+                    expected_md5=archive["expected_md5"],
+                )
+            upload.update({
+                "checksum_crc64nvme": "",
+                "source_etag": "",
+                "transfer_mode": "https_stream_hash",
+            })
+
+    head = s3.head_object(
+        Bucket=datasets_bucket,
+        Key=object_key,
+        **(
+            {"ChecksumMode": "ENABLED"}
+            if upload["transfer_mode"] == "s3_server_side_multipart_copy"
+            else {}
+        ),
+    )
+    if int(head["ContentLength"]) != int(upload["size_bytes"]):
+        raise ValueError(
+            f"uploaded nuPlan archive size differs after completion: {object_key}"
+        )
+    upload.setdefault(
+        "destination_etag",
+        str(head["ETag"]).strip('"').lower(),
+    )
+    receipt = {
+        "archive_id": archive["archive_id"],
+        "checksum_crc64nvme": upload.get("checksum_crc64nvme", ""),
+        "component": archive["component"],
+        "destination_etag": upload["destination_etag"],
+        "md5": upload["md5"],
+        "object_uri": f"s3://{datasets_bucket}/{object_key}",
+        "schema_version": ARCHIVE_RECEIPT_SCHEMA_VERSION,
+        "sha256": upload["sha256"],
+        "size_bytes": upload["size_bytes"],
+        "source_contract_sha256": source_contract_sha256,
+        "source_etag": upload.get("source_etag", ""),
+        "transfer_mode": upload["transfer_mode"],
+    }
+    receipt_bytes = canonical_json_bytes(receipt)
+    try:
+        s3.put_object(
+            Bucket=datasets_bucket,
+            Key=receipt_key,
+            Body=receipt_bytes,
+            ContentType="application/json",
+            IfNoneMatch="*",
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "PreconditionFailed",
+            "412",
+        }:
+            raise
+        existing = s3.get_object(
+            Bucket=datasets_bucket,
+            Key=receipt_key,
+        )["Body"].read()
+        if existing != receipt_bytes:
+            raise ValueError(
+                f"concurrent nuPlan receipt differs for {archive['archive_id']!r}"
+            ) from error
+    print(
+        "Imported nuPlan archive "
+        f"id={archive['archive_id']} component={archive['component']} "
+        f"size_bytes={upload['size_bytes']} "
+        f"transfer_mode={upload['transfer_mode']} "
+        f"integrity={upload.get('checksum_crc64nvme') or upload['sha256']}"
+    )
+    return receipt_output(receipt_bytes)
+
+
+@task(
+    container_image=DATA_PREP_IMAGE,
+    pod_template=_data_prep_pod_template(),
+    requests=Resources(cpu="1", mem="2Gi", ephemeral_storage="2Gi"),
+    limits=Resources(cpu="1", mem="2Gi", ephemeral_storage="2Gi"),
+)
+def finalize_nuplan_raw_snapshot(
+    source_manifest: FlyteFile,
+    archive_receipts: List[FlyteFile],
+    datasets_bucket: str,
+    aws_region: str = "us-west-2",
+) -> NuPlanRawSnapshotOutput:
+    """Publish the redacted canonical manifest after every archive is verified."""
+    import json
+    from pathlib import Path
+
+    import boto3
+    from botocore.exceptions import ClientError
+
+    from Platform.pipelines.nuplan_acquisition import (
+        build_snapshot_manifest,
+        canonical_json_bytes,
+        load_source_manifest_bytes,
+        sha256_bytes,
+        snapshot_manifest_key,
+        snapshot_prefix,
+    )
+
+    source_bytes = Path(source_manifest.download()).read_bytes()
+    manifest, source_contract_sha256 = load_source_manifest_bytes(source_bytes)
+    receipts = [
+        json.loads(Path(receipt.download()).read_text(encoding="utf-8"))
+        for receipt in archive_receipts
+    ]
+    snapshot = build_snapshot_manifest(
+        source_manifest=manifest,
+        source_contract_sha256=source_contract_sha256,
+        receipts=receipts,
+    )
+    payload = canonical_json_bytes(snapshot)
+    payload_sha256 = sha256_bytes(payload)
+    key = snapshot_manifest_key(manifest)
+    s3 = boto3.client("s3", region_name=aws_region)
+    try:
+        s3.put_object(
+            Bucket=datasets_bucket,
+            Key=key,
+            Body=payload,
+            ContentType="application/json",
+            Metadata={"manifest-sha256": payload_sha256},
+            IfNoneMatch="*",
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "PreconditionFailed",
+            "412",
+        }:
+            raise
+        existing = s3.get_object(Bucket=datasets_bucket, Key=key)["Body"].read()
+        if existing != payload:
+            raise ValueError(
+                "existing nuPlan snapshot manifest differs for "
+                f"{manifest['snapshot_id']!r}"
+            ) from error
+    manifest_uri = f"s3://{datasets_bucket}/{key}"
+    print(
+        "Published nuPlan raw snapshot "
+        f"id={manifest['snapshot_id']} archives={len(receipts)} "
+        f"total_size_bytes={snapshot['total_size_bytes']} "
+        f"manifest_sha256={payload_sha256}"
+    )
+    return NuPlanRawSnapshotOutput(
+        manifest=FlyteFile(manifest_uri),
+        manifest_sha256=payload_sha256,
+        snapshot_prefix=(
+            f"s3://{datasets_bucket}/{snapshot_prefix(manifest)}"
+        ),
+        archive_count=len(receipts),
+        total_size_bytes=int(snapshot["total_size_bytes"]),
+    )
+
+
+@dynamic(
+    container_image=DATA_PREP_IMAGE,
+    environment={"AUTO_E2E_DATA_PREP_IMAGE": DATA_PREP_IMAGE},
+)
+def _acquire_nuplan_raw_snapshot(
+    source_manifest: FlyteFile,
+    datasets_bucket: str,
+    aws_region: str,
+    concurrency: int,
+) -> NuPlanRawSnapshotOutput:
+    """Fan out authorized archive imports without exposing signed URLs."""
+    from pathlib import Path
+
+    from Platform.pipelines.nuplan_acquisition import load_source_manifest_bytes
+
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+    manifest, _ = load_source_manifest_bytes(
+        Path(source_manifest.download()).read_bytes()
+    )
+    importer = map_task(
+        functools.partial(
+            acquire_nuplan_archive,
+            source_manifest=source_manifest,
+            datasets_bucket=datasets_bucket,
+            aws_region=aws_region,
+        ),
+        concurrency=concurrency,
+    )
+    receipts = importer(
+        archive_index=list(range(len(manifest["archives"])))
+    )
+    return finalize_nuplan_raw_snapshot(
+        source_manifest=source_manifest,
+        archive_receipts=receipts,
+        datasets_bucket=datasets_bucket,
+        aws_region=aws_region,
+    )
+
+
+# ============================================================
+# Task: raw nuPlan -> immutable Reactive shards
+# ============================================================
+@task(
+    container_image=DATA_PREP_IMAGE,
+    requests=Resources(cpu="8", mem="32Gi"),
+    limits=Resources(cpu="8", mem="32Gi"),
+)
+def pack_nuplan_reactive_dataset(
+    data_root: FlyteDirectory,
+    map_root: FlyteDirectory,
+    sensor_root: FlyteDirectory,
+    db_files: List[str],
+    source_revision: str,
+    map_version: str,
+    limit_total_scenarios: int = 0,
+    image_size: int = 256,
+    samples_per_shard: int = 1000,
+    max_rejection_fraction: float = 0.0,
+) -> FlyteDirectory:
+    """Pack raw local nuPlan scenarios with camera, BEV, Route, and XY targets."""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from data_parsing.nuplan import pack_nuplan_reactive_scenarios
+    from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import (
+        NuPlanScenarioBuilder,
+    )
+    from nuplan.planning.scenario_builder.scenario_filter import (
+        ScenarioFilter,
+    )
+    from nuplan.planning.utils.multithreading.worker_sequential import (
+        Sequential,
+    )
+
+    if not source_revision or not map_version:
+        raise ValueError("nuPlan source_revision and map_version are required")
+    if limit_total_scenarios < 0:
+        raise ValueError("limit_total_scenarios must be non-negative")
+    local_data = Path(data_root.download()).resolve()
+    local_map = Path(map_root.download()).resolve()
+    local_sensor = Path(sensor_root.download()).resolve()
+    for name, path in (
+        ("data_root", local_data),
+        ("map_root", local_map),
+        ("sensor_root", local_sensor),
+    ):
+        if not path.is_dir():
+            raise FileNotFoundError(f"nuPlan {name} is not a directory: {path}")
+
+    resolved_db_files = []
+    for relative in db_files:
+        candidate = (local_data / relative).resolve()
+        if local_data not in candidate.parents or candidate.suffix != ".db":
+            raise ValueError(
+                "nuPlan db_files must be relative .db children of data_root"
+            )
+        if not candidate.is_file():
+            raise FileNotFoundError(f"nuPlan DB is missing: {candidate}")
+        resolved_db_files.append(str(candidate))
+    os.environ["NUPLAN_DATA_STORE"] = "local"
+    builder = NuPlanScenarioBuilder(
+        data_root=str(local_data),
+        map_root=str(local_map),
+        sensor_root=str(local_sensor),
+        db_files=resolved_db_files or None,
+        map_version=map_version,
+        include_cameras=True,
+        max_workers=1,
+        verbose=False,
+    )
+    scenario_filter = ScenarioFilter(
+        scenario_types=None,
+        scenario_tokens=None,
+        log_names=None,
+        map_names=None,
+        num_scenarios_per_type=None,
+        limit_total_scenarios=(
+            limit_total_scenarios or None
+        ),
+        timestamp_threshold_s=None,
+        ego_displacement_minimum_m=None,
+        expand_scenarios=False,
+        remove_invalid_goals=True,
+        shuffle=False,
+    )
+    scenarios = builder.get_scenarios(
+        scenario_filter,
+        Sequential(),
+    )
+    output = Path(tempfile.mkdtemp(prefix="nuplan-reactive-shards-"))
+    pack_nuplan_reactive_scenarios(
+        scenarios,
+        output,
+        source_revision=source_revision,
+        map_version=map_version,
+        image_size=image_size,
+        samples_per_shard=samples_per_shard,
+        max_rejection_fraction=max_rejection_fraction,
+    )
+    return FlyteDirectory(str(output))
+
+
+@task(
+    container_image=DATA_PREP_IMAGE,
+    requests=Resources(cpu="4", mem="16Gi"),
+    limits=Resources(cpu="4", mem="16Gi"),
+)
+def build_l2d_osm_graph_artifact(
+    source_pbf: FlyteFile,
+    source_revision: str,
+    source_date: str,
+    attribution: str = "OpenStreetMap contributors",
+) -> FlyteFile:
+    """Convert one pinned regional OSM PBF into the canonical L2D graph."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from data_parsing.l2d import build_l2d_osm_graph_snapshot
+
+    if not source_revision or not source_date or not attribution:
+        raise ValueError("OSM provenance fields must not be empty")
+    downloaded = Path(source_pbf.download())
+    output_directory = Path(
+        tempfile.mkdtemp(prefix="l2d-osm-graph-")
+    )
+    source = downloaded
+    if source.suffixes[-2:] != [".osm", ".pbf"]:
+        source = output_directory / "source.osm.pbf"
+        shutil.copyfile(downloaded, source)
+    output = output_directory / "l2d-osm-graph.json"
+    build_l2d_osm_graph_snapshot(
+        source,
+        output,
+        source_revision=source_revision,
+        source_date=source_date,
+        attribution=attribution,
+    )
+    return FlyteFile(str(output))
+
+
+# ============================================================
+# Task: Reactive nuPlan -> L2D multi-stage training
+# ============================================================
+@task(
+    container_image=TRAINING_IMAGE,
+    requests=Resources(cpu="4", mem="24Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="24Gi", gpu="1"),
+    pod_template=_large_shm_pod_template(),
+    environment={"MLFLOW_TRACKING_URI": MLFLOW_URI},
+)
+def train_reactive_multitask_stage(
+    shards: List[FlyteDirectory],
+    dataset: Dataset,
+    stage: str,
+    parent_checkpoint: Optional[FlyteFile] = None,
+    backbone: Backbone = Backbone.SWIN_V2_TINY,
+    epochs: int = 3,
+    batch_size: int = 2,
+    lr: float = 1e-4,
+    weight_decay: float = 1e-2,
+    grad_clip: float = 1.0,
+    val_fraction: float = 0.1,
+    num_workers: int = 0,
+    training_seed: int = 149,
+    bev_weight: float = 1.0,
+    route_weight: float = 1.0,
+    bev_pos_weights: Optional[List[float]] = None,
+    corridor_pos_weight: float = 1.0,
+) -> TrainOutput:
+    """Train one locked Reactive stage on already packed immutable shards."""
+    import hashlib
+    import json
+    import os
+    import random
+    from pathlib import Path
+
+    import mlflow
+    import numpy as np
+    import torch
+    from flytekit import current_context
+
+    from data_parsing.pre_extracted import make_multi_dataset_loader
+    from model_components.auto_e2e import AutoE2E
+    from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
+    from Platform.pipelines.training_checkpoint import stable_digest
+    from training.reactive_multitask import (
+        SIMPLE_XY_IMITATION_OBJECTIVE_VERSION,
+        ReactiveMultitaskObjective,
+        ReactiveTrainingStage,
+        configure_model_for_stage,
+        reactive_model_kwargs,
+    )
+    from training.reactive_stage_runner import (
+        evaluate_reactive_xy,
+        inspect_reactive_checkpoint_identity,
+        load_stage_a_parent,
+        run_reactive_epoch,
+        save_reactive_checkpoint,
+    )
+
+    try:
+        training_stage = ReactiveTrainingStage(stage)
+    except ValueError as error:
+        raise ValueError(f"unsupported Reactive training stage {stage!r}") from error
+    expected_dataset = (
+        Dataset.NUPLAN
+        if training_stage is ReactiveTrainingStage.NUPLAN_FULL
+        else Dataset.L2D
+    )
+    if dataset is not expected_dataset:
+        raise ValueError(
+            f"{training_stage.value} requires dataset={expected_dataset.value}"
+        )
+    if (
+        training_stage is ReactiveTrainingStage.NUPLAN_FULL
+        and parent_checkpoint is not None
+    ):
+        raise ValueError("Stage A must not load a parent checkpoint")
+    if (
+        training_stage is ReactiveTrainingStage.L2D_CONTINUATION
+        and parent_checkpoint is None
+    ):
+        raise ValueError("Stage B requires the exact Stage A checkpoint")
+    if epochs <= 0 or batch_size <= 0:
+        raise ValueError("epochs and batch_size must be positive")
+    if lr <= 0.0 or weight_decay < 0.0 or grad_clip <= 0.0:
+        raise ValueError("optimizer parameters are invalid")
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be between zero and one")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    normalized_bev_pos_weights = (
+        [1.0] * 8
+        if bev_pos_weights is None
+        else bev_pos_weights
+    )
+    if len(normalized_bev_pos_weights) != 8 or any(
+        not np.isfinite(value) or value <= 0.0
+        for value in normalized_bev_pos_weights
+    ):
+        raise ValueError("bev_pos_weights must contain eight positive values")
+    if not 0 <= training_seed <= 2**32 - 1:
+        raise ValueError("training_seed is outside uint32")
+
+    random.seed(training_seed)
+    np.random.seed(training_seed)
+    torch.manual_seed(training_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(training_seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    if num_workers:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+
+    shard_dirs: list[str] = []
+    manifest_identities: list[dict] = []
+    view_counts: set[int] = set()
+    expected_geometry = AUTOE2E_NAVIGATION_GEOMETRY.contract()
+    for shard in shards:
+        shard_uri = str(
+            getattr(shard, "remote_source", "") or shard
+        )
+        shard_dir = _loader_download_dir(shard)
+        manifest_path = Path(shard_dir) / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"packed shard manifest is missing: {manifest_path}"
+            )
+        manifest_bytes = manifest_path.read_bytes()
+        try:
+            manifest = json.loads(manifest_bytes)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"packed shard manifest is invalid: {manifest_path}"
+            ) from error
+        if manifest.get("dataset") != dataset.value:
+            continue
+        sample_count = int(manifest.get("total_samples", 0))
+        if sample_count <= 0:
+            continue
+        required_flags = {
+            "has_reactive_navigation": True,
+            "has_route_reconstruction": True,
+            "has_trajectory_xy": True,
+        }
+        if training_stage is ReactiveTrainingStage.NUPLAN_FULL:
+            required_flags["has_bev_segmentation"] = True
+        mismatched_flags = {
+            key: manifest.get(key)
+            for key, expected in required_flags.items()
+            if manifest.get(key) is not expected
+        }
+        if mismatched_flags:
+            raise ValueError(
+                "packed Reactive target coverage is incomplete: "
+                f"{mismatched_flags} ({manifest_path})"
+            )
+        if manifest.get("navigation_geometry") != expected_geometry:
+            raise ValueError(
+                "packed navigation geometry differs from the common "
+                f"450x300 contract: {manifest_path}"
+            )
+        if int(manifest.get("map_context_channels", 0)) != 14:
+            raise ValueError("Reactive stages require 14 map channels")
+        if int(manifest.get("route_channels", 0)) != 2:
+            raise ValueError("Reactive stages require two route channels")
+        num_views = int(manifest.get("num_views", 0))
+        if num_views <= 0:
+            raise ValueError("Reactive stage shard has no camera views")
+        view_counts.add(num_views)
+        shard_dirs.append(shard_dir)
+        manifest_identities.append({
+            "dataset": dataset.value,
+            "manifest_sha256": hashlib.sha256(
+                manifest_bytes
+            ).hexdigest(),
+            "partition_id": manifest.get("partition_id"),
+            "shard_names": list(manifest.get("shard_names", [])),
+            "source_revision": manifest.get("source_revision"),
+            "total_samples": sample_count,
+            "uri": shard_uri,
+        })
+    if not shard_dirs:
+        raise ValueError(
+            f"no non-empty packed shards matched {dataset.value}"
+        )
+    if len(view_counts) != 1:
+        raise ValueError(
+            f"Reactive stage mixes camera counts: {sorted(view_counts)}"
+        )
+    manifest_identities.sort(
+        key=lambda item: (
+            str(item["partition_id"]),
+            str(item["shard_names"]),
+            str(item["uri"]),
+        )
+    )
+    dataset_manifest_sha256 = stable_digest(manifest_identities)
+    num_views = next(iter(view_counts))
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    constructor_kwargs = reactive_model_kwargs(
+        training_stage,
+        num_views=num_views,
+    )
+    model = AutoE2E(
+        backbone=backbone.value,
+        embed_dim=256,
+        is_pretrained=(
+            training_stage is ReactiveTrainingStage.NUPLAN_FULL
+        ),
+        **constructor_kwargs,
+    ).to(device)
+    lineage: dict[str, str] = {}
+    if parent_checkpoint is not None:
+        lineage.update(
+            load_stage_a_parent(
+                model,
+                str(parent_checkpoint.download()),
+            )
+        )
+    configure_model_for_stage(model, training_stage)
+    objective = ReactiveMultitaskObjective(
+        training_stage,
+        bev_pos_weight=normalized_bev_pos_weights,
+        bev_weight=bev_weight,
+        route_weight=route_weight,
+        corridor_pos_weight=corridor_pos_weight,
+    ).to(device)
+    trainable = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        trainable,
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=1,
+        threshold=1e-4,
+        threshold_mode="abs",
+    )
+    train_loader = make_multi_dataset_loader(
+        shard_dirs,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        split="train",
+        val_fraction=val_fraction,
+        shuffle=1000,
+        shuffle_seed=training_seed,
+        pin_memory=(device.type == "cuda"),
+        decode_future_frames=False,
+    )
+    validation_loader = make_multi_dataset_loader(
+        shard_dirs,
+        batch_size=batch_size,
+        num_workers=min(num_workers, 1),
+        split="val",
+        val_fraction=val_fraction,
+        shuffle=0,
+        pin_memory=(device.type == "cuda"),
+        max_active_loaders=1,
+        decode_future_frames=False,
+    )
+
+    output_dir = Path("/tmp/reactive-multistage") / training_stage.value
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "best.pt"
+    metadata_path = output_dir / "metadata.json"
+    history = []
+    best_ade = float("inf")
+    best_epoch = 0
+    best_sha256 = ""
+    model_config = {
+        "backbone": backbone.value,
+        "embed_dim": 256,
+        # Evaluation must never download initialization weights.
+        "is_pretrained": False,
+        **constructor_kwargs,
+    }
+
+    mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+    mlflow.set_experiment("reactive-multistage")
+    ctx = current_context()
+    with mlflow.start_run() as active_run:
+        run_id = active_run.info.run_id
+        mlflow.log_params({
+            "training_stage": training_stage.value,
+            "dataset": dataset.value,
+            "training_objective_version": (
+                SIMPLE_XY_IMITATION_OBJECTIVE_VERSION
+            ),
+            "navigation_geometry_id": (
+                AUTOE2E_NAVIGATION_GEOMETRY.geometry_id
+            ),
+            "planner_mode": "gru",
+            "enable_world_model": False,
+            "enable_reasoning": False,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "bev_weight": bev_weight,
+            "route_weight": route_weight,
+        })
+        for epoch in range(1, epochs + 1):
+            train_metrics = run_reactive_epoch(
+                model,
+                train_loader,
+                objective,
+                optimizer,
+                device=device,
+                grad_clip=grad_clip,
+            )
+            validation_metrics = evaluate_reactive_xy(
+                model,
+                validation_loader,
+                device=device,
+            )
+            scheduler.step(validation_metrics["ade_6p4s_m"])
+            record = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "validation": validation_metrics,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+            }
+            history.append(record)
+            mlflow.log_metrics(
+                {
+                    **{
+                        f"train/{name}": value
+                        for name, value in train_metrics.items()
+                    },
+                    **{
+                        f"val/{name}": value
+                        for name, value in validation_metrics.items()
+                    },
+                },
+                step=epoch,
+            )
+            if validation_metrics["ade_6p4s_m"] < best_ade:
+                best_ade = validation_metrics["ade_6p4s_m"]
+                best_epoch = epoch
+                best_sha256 = save_reactive_checkpoint(
+                    checkpoint_path,
+                    model,
+                    stage=training_stage,
+                    dataset_manifest_sha256=dataset_manifest_sha256,
+                    epoch=epoch,
+                    model_config=model_config,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    metrics=validation_metrics,
+                    training_state={
+                        "run_id": run_id,
+                        "flyte_execution_id": (
+                            ctx.execution_id.name
+                            if ctx.execution_id
+                            else "local"
+                        ),
+                    },
+                    lineage=lineage,
+                )
+        mlflow.log_artifact(str(checkpoint_path), artifact_path="checkpoints")
+
+    checkpoint_identity = inspect_reactive_checkpoint_identity(
+        checkpoint_path
+    )
+    metadata = {
+        "schema_version": "reactive_multistage_training_v1",
+        "training_stage": training_stage.value,
+        "dataset": dataset.value,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "best_epoch": best_epoch,
+        "best_checkpoint_sha256": best_sha256,
+        "best_checkpoint_identity": checkpoint_identity,
+        "history": history,
+        "lineage": lineage,
+        "model_config": model_config,
+        "objective": {
+            "version": SIMPLE_XY_IMITATION_OBJECTIVE_VERSION,
+            "bev_weight": (
+                bev_weight
+                if training_stage is ReactiveTrainingStage.NUPLAN_FULL
+                else 0.0
+            ),
+            "route_weight": route_weight,
+        },
+    }
+    metadata_path.write_text(
+        json.dumps(
+            metadata,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    return TrainOutput(
+        checkpoint=FlyteFile(str(checkpoint_path)),
+        metadata=FlyteFile(str(metadata_path)),
+    )
+
+
+@task(
+    container_image=EVAL_IMAGE,
+    requests=Resources(cpu="4", mem="24Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="24Gi", gpu="1"),
+    pod_template=_large_shm_pod_template(),
+)
+def evaluate_reactive_transfer_matrix(
+    stage_a_checkpoint: FlyteFile,
+    stage_b_checkpoint: FlyteFile,
+    nuplan_shards: List[FlyteDirectory],
+    l2d_shards: List[FlyteDirectory],
+    batch_size: int = 2,
+    val_fraction: float = 0.1,
+    num_workers: int = 0,
+) -> ReactiveRetentionOutput:
+    """Evaluate Stage A/B on one frozen nuPlan/L2D validation split."""
+    import hashlib
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from data_parsing.pre_extracted import (
+        discover_split_inventory,
+        make_multi_dataset_loader,
+    )
+    from data_processing.dataset_snapshot import split_bucket
+    from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
+    from Platform.pipelines.inference import load_policy
+    from Platform.pipelines.training_checkpoint import stable_digest
+    from training.reactive_multitask import ReactiveTrainingStage
+    from training.reactive_stage_runner import (
+        evaluate_reactive_multitask,
+        inspect_reactive_checkpoint_identity,
+    )
+
+    if batch_size <= 0 or num_workers < 0:
+        raise ValueError("invalid retention evaluation loader settings")
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be between zero and one")
+
+    expected_geometry = AUTOE2E_NAVIGATION_GEOMETRY.contract()
+
+    def resolve_dataset(
+        shards: List[FlyteDirectory],
+        dataset: Dataset,
+    ) -> tuple[list[str], str, dict]:
+        directories: list[str] = []
+        identities: list[dict] = []
+        for shard in shards:
+            directory = _loader_download_dir(shard)
+            manifest_path = Path(directory) / "manifest.json"
+            if not manifest_path.is_file():
+                raise FileNotFoundError(
+                    f"packed shard manifest is missing: {manifest_path}"
+                )
+            payload = manifest_path.read_bytes()
+            manifest = json.loads(payload)
+            if manifest.get("dataset") != dataset.value:
+                continue
+            if int(manifest.get("total_samples", 0)) <= 0:
+                continue
+            if manifest.get("navigation_geometry") != expected_geometry:
+                raise ValueError(
+                    "retention dataset navigation geometry differs from "
+                    "the common contract"
+                )
+            required = {
+                "has_reactive_navigation": True,
+                "has_route_reconstruction": True,
+                "has_trajectory_xy": True,
+            }
+            if dataset is Dataset.NUPLAN:
+                required["has_bev_segmentation"] = True
+            mismatches = {
+                key: manifest.get(key)
+                for key, expected in required.items()
+                if manifest.get(key) is not expected
+            }
+            if mismatches:
+                raise ValueError(
+                    "retention dataset target coverage is incomplete: "
+                    f"{mismatches}"
+                )
+            directories.append(directory)
+            identities.append({
+                "dataset": dataset.value,
+                "manifest_sha256": hashlib.sha256(payload).hexdigest(),
+                "partition_id": manifest.get("partition_id"),
+                "shard_names": list(manifest.get("shard_names", [])),
+                "source_revision": manifest.get("source_revision"),
+                "total_samples": int(manifest["total_samples"]),
+                "uri": str(
+                    getattr(shard, "remote_source", "") or shard
+                ),
+            })
+        if not directories:
+            raise ValueError(
+                f"no non-empty retention shards matched {dataset.value}"
+            )
+        identities.sort(
+            key=lambda item: (
+                str(item["partition_id"]),
+                str(item["shard_names"]),
+                str(item["uri"]),
+            )
+        )
+        inventory = discover_split_inventory(directories)
+        buckets = 10
+        validation_bucket_count = max(
+            1,
+            min(buckets - 1, round(val_fraction * buckets)),
+        )
+        validation_groups = tuple(
+            group_uid
+            for group_uid in inventory.group_uids
+            if split_bucket(group_uid, buckets) < validation_bucket_count
+        )
+        if not validation_groups:
+            raise ValueError(
+                f"{dataset.value} has no groups in the frozen validation split"
+            )
+        expected_count, expected_uid_digest = (
+            inventory.sample_identity_for_groups(validation_groups)
+        )
+        return directories, stable_digest(identities), {
+            "dataset": dataset.value,
+            "manifest_digest": stable_digest(identities),
+            "validation_group_count": len(validation_groups),
+            "validation_group_sha256": hashlib.sha256(
+                "\n".join(validation_groups).encode("utf-8")
+            ).hexdigest(),
+            "validation_groups": list(validation_groups),
+            "expected_sample_count": expected_count,
+            "expected_sample_uid_sha256": expected_uid_digest,
+        }
+
+    nuplan_directories, nuplan_digest, nuplan_split = resolve_dataset(
+        nuplan_shards,
+        Dataset.NUPLAN,
+    )
+    l2d_directories, l2d_digest, l2d_split = resolve_dataset(
+        l2d_shards,
+        Dataset.L2D,
+    )
+    dataset_specs = {
+        "nuplan": (
+            nuplan_directories,
+            nuplan_split,
+        ),
+        "l2d": (
+            l2d_directories,
+            l2d_split,
+        ),
+    }
+
+    stage_a_path = str(stage_a_checkpoint.download())
+    stage_b_path = str(stage_b_checkpoint.download())
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+    stage_a_identity = inspect_reactive_checkpoint_identity(stage_a_path)
+    stage_b_identity = inspect_reactive_checkpoint_identity(stage_b_path)
+    stage_a_sha256 = stage_a_identity["checkpoint_sha256"]
+    stage_b_sha256 = stage_b_identity["checkpoint_sha256"]
+
+    loader_factories = {
+        dataset_name: functools.partial(
+            make_multi_dataset_loader,
+            directories,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            split="val",
+            val_fraction=0.0,
+            shuffle=0,
+            pin_memory=(device.type == "cuda"),
+            max_active_loaders=1,
+            validation_group_uids=(
+                split_metadata["validation_groups"]
+            ),
+            decode_future_frames=False,
+        )
+        for dataset_name, (
+            directories,
+            split_metadata,
+        ) in dataset_specs.items()
+    }
+    matrix: dict[str, dict[str, dict]] = {
+        "stage_a": {},
+        "stage_b": {},
+    }
+    checkpoint_specs = (
+        (
+            "stage_a",
+            stage_a_path,
+            ReactiveTrainingStage.NUPLAN_FULL.value,
+            nuplan_digest,
+        ),
+        (
+            "stage_b",
+            stage_b_path,
+            ReactiveTrainingStage.L2D_CONTINUATION.value,
+            l2d_digest,
+        ),
+    )
+    checkpoint_configs = {}
+    for (
+        checkpoint_name,
+        checkpoint_path,
+        expected_stage,
+        expected_manifest_digest,
+    ) in checkpoint_specs:
+        model, config, loaded_sha256 = load_policy(
+            checkpoint_path,
+            device,
+        )
+        expected_sha256 = (
+            stage_a_sha256
+            if checkpoint_name == "stage_a"
+            else stage_b_sha256
+        )
+        if loaded_sha256 != expected_sha256:
+            raise ValueError(
+                f"{checkpoint_name} identity changed while loading"
+            )
+        if config.get("training_stage") != expected_stage:
+            raise ValueError(
+                f"{checkpoint_name} checkpoint has the wrong training stage"
+            )
+        if config.get(
+            "dataset_manifest_sha256"
+        ) != expected_manifest_digest:
+            raise ValueError(
+                f"{checkpoint_name} checkpoint was trained on different shards"
+            )
+        if (
+            checkpoint_name == "stage_b"
+            and config.get("stage_a_parent_checkpoint_sha256")
+            != stage_a_sha256
+        ):
+            raise ValueError(
+                "Stage B lineage does not reference the supplied "
+                "Stage A checkpoint"
+            )
+        checkpoint_configs[checkpoint_name] = config
+        for dataset_name, loader_factory in loader_factories.items():
+            matrix[checkpoint_name][dataset_name] = (
+                evaluate_reactive_multitask(
+                    model,
+                    loader_factory(),
+                    device=device,
+                )
+            )
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    stage_b_config = checkpoint_configs["stage_b"]
+    for dataset_name in dataset_specs:
+        stage_a_metrics = matrix["stage_a"][dataset_name]
+        stage_b_metrics = matrix["stage_b"][dataset_name]
+        if (
+            stage_a_metrics["sample_count"]
+            != stage_b_metrics["sample_count"]
+            or stage_a_metrics["sample_uid_sha256"]
+            != stage_b_metrics["sample_uid_sha256"]
+        ):
+            raise ValueError(
+                "Stage A and Stage B retention cells used different "
+                f"{dataset_name} validation samples"
+            )
+    for checkpoint_name in ("stage_a", "stage_b"):
+        for dataset_name, (
+            _,
+            split_metadata,
+        ) in dataset_specs.items():
+            metrics = matrix[checkpoint_name][dataset_name]
+            if metrics["sample_count"] != (
+                split_metadata["expected_sample_count"]
+            ):
+                raise ValueError(
+                    "retention evaluation sample count differs from "
+                    f"the frozen inventory for {dataset_name}"
+                )
+            if metrics["sample_uid_sha256"] != (
+                split_metadata["expected_sample_uid_sha256"]
+            ):
+                raise ValueError(
+                    "retention evaluation sample UID digest differs from "
+                    f"the frozen inventory for {dataset_name}"
+                )
+
+    report = {
+        "schema_version": "reactive_transfer_matrix_v1",
+        "checkpoint_lineage": {
+            "stage_a_checkpoint_sha256": stage_a_sha256,
+            "stage_b_checkpoint_sha256": stage_b_sha256,
+            "stage_b_parent_checkpoint_sha256": stage_b_config[
+                "stage_a_parent_checkpoint_sha256"
+            ],
+            "stage_a_config_digest": stage_a_identity["config_sha256"],
+            "stage_b_config_digest": stage_b_identity["config_sha256"],
+            "stage_a_model_state_sha256": (
+                stage_a_identity["model_state_sha256"]
+            ),
+            "stage_b_model_state_sha256": (
+                stage_b_identity["model_state_sha256"]
+            ),
+        },
+        "datasets": {
+            "nuplan": nuplan_split,
+            "l2d": l2d_split,
+        },
+        "matrix": matrix,
+    }
+    report_payload = (
+        json.dumps(
+            report,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    report_sha256 = hashlib.sha256(report_payload).hexdigest()
+    output_path = (
+        Path(tempfile.mkdtemp(prefix="reactive-retention-"))
+        / "retention-report.json"
+    )
+    output_path.write_bytes(report_payload)
+    return ReactiveRetentionOutput(
+        report=FlyteFile(str(output_path)),
+        report_sha256=report_sha256,
+    )
+
+
+@task(
+    container_image=EVAL_IMAGE,
+    requests=Resources(cpu="4", mem="24Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="24Gi", gpu="1"),
+    pod_template=_large_shm_pod_template(),
+)
+def precompute_semantic_occupancy_artifacts(
+    checkpoint: FlyteFile,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    repository_revision: str,
+    aws_region: str = "us-west-2",
+    batch_size: int = 2,
+    num_workers: int = 0,
+) -> SemanticOccupancyPrecomputeOutput:
+    """Precompute immutable 2D semantic occupancy bodies per packed tar."""
+    import hashlib
+    import json
+    import os
+    import re
+    from pathlib import Path
+
+    import boto3
+    import torch
+
+    from data_parsing.pre_extracted import make_pre_extracted_loader
+    from Platform.pipelines.inference import load_policy
+    from Platform.pipelines.overlay_tasks import _put_s3_immutable
+    from Platform.pipelines.occupancy_store import (
+        encode_occupancy_set_manifest,
+        occupancy_model_artifact_id,
+        occupancy_set_manifest,
+        occupancy_set_s3_key,
+    )
+    from Platform.pipelines.semantic_occupancy import (
+        SEMANTIC_OCCUPANCY_CLASS_NAMES,
+        SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        SEMANTIC_OCCUPANCY_HEAD_VERSION,
+        SEMANTIC_OCCUPANCY_SCHEMA,
+        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        encode_semantic_occupancy,
+        infer_semantic_occupancy,
+        semantic_occupancy_s3_key,
+    )
+
+    if not re.fullmatch(r"[0-9a-f]{64}", dataset_manifest_sha256):
+        raise ValueError(
+            "dataset_manifest_sha256 must be a lowercase SHA-256"
+        )
+    for name, value in (
+        ("dataset", dataset),
+        ("dataset_version", dataset_version),
+        ("artifacts_bucket", artifacts_bucket),
+        ("publication_timestamp", publication_timestamp),
+        ("repository_revision", repository_revision),
+        ("aws_region", aws_region),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+    if "/" in dataset or "\\" in dataset:
+        raise ValueError("dataset must be one path segment")
+    if not shard_dirs:
+        raise ValueError("shard_dirs must not be empty")
+    if batch_size <= 0 or num_workers < 0:
+        raise ValueError("invalid semantic occupancy loader settings")
+
+    packed_shards = []
+    seen_shards = set()
+    for shard_directory in shard_dirs:
+        local_directory = Path(shard_directory.download())
+        if not (local_directory / "manifest.json").is_file():
+            raise FileNotFoundError(
+                f"packed manifest missing: {local_directory}"
+            )
+        for tar_path in sorted(local_directory.glob("*.tar")):
+            if tar_path.name in seen_shards:
+                raise ValueError(
+                    "semantic occupancy shard names are not unique: "
+                    f"{tar_path.name}"
+                )
+            seen_shards.add(tar_path.name)
+            packed_shards.append((local_directory, tar_path))
+    if not packed_shards:
+        raise ValueError("packed directories contain no tar shards")
+    packed_shards.sort(key=lambda item: item[1].name)
+
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+    if num_workers:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    checkpoint_path = str(checkpoint.download())
+    model, config, checkpoint_sha256 = load_policy(
+        checkpoint_path,
+        device,
+    )
+    config_payload = json.dumps(
+        config,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    model_source = {
+        "code_license_spdx": "Apache-2.0",
+        "config": (
+            "embedded-checkpoint-config-sha256:"
+            f"{hashlib.sha256(config_payload).hexdigest()}"
+        ),
+        "license_spdx": "NOASSERTION",
+        "repository": (
+            "https://github.com/autowarefoundation/auto_e2e"
+        ),
+        "repository_revision": repository_revision,
+        "training_data_license_spdx": "NOASSERTION",
+        "weight_sha256": checkpoint_sha256,
+        "weight_source_url": f"urn:sha256:{checkpoint_sha256}",
+    }
+    producer_config = {
+        "batch_size": batch_size,
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+        "deterministic_algorithms": True,
+        "num_workers": num_workers,
+        "probability_encoding": "uint8-rint-gzip-level-6-v1",
+        "random_seed": 0,
+    }
+    model_artifact_id = occupancy_model_artifact_id(
+        artifact_kind="native-semantic-occupancy",
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=SEMANTIC_OCCUPANCY_HEAD_VERSION,
+        input_contract="autoe2e-packed-calibrated-camera-v1",
+        model_source=model_source,
+        producer_config=producer_config,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+    )
+    manifest_key = occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        model_artifact_id,
+        dataset_manifest_sha256,
+    )
+    if not config.get("enable_bev_segmentation", False):
+        raise ValueError("checkpoint has no BEV segmentation head")
+
+    s3 = boto3.client("s3", region_name=aws_region)
+    entries = []
+    total_samples = 0
+    for local_directory, tar_path in packed_shards:
+        loader = make_pre_extracted_loader(
+            str(local_directory),
+            batch_size=batch_size,
+            num_workers=num_workers,
+            split="all",
+            val_fraction=0.0,
+            shuffle=0,
+            pin_memory=(device.type == "cuda"),
+            prefetch_factor=1,
+            shard_files=[tar_path],
+            decode_history_frames=False,
+            decode_future_frames=False,
+        )
+        (
+            sample_uids,
+            probability,
+            teacher,
+            valid_mask,
+        ) = infer_semantic_occupancy(
+            model,
+            loader,
+            device=device,
+        )
+        payload = encode_semantic_occupancy(
+            sample_uids,
+            probability,
+            teacher=teacher,
+            valid_mask=valid_mask,
+        )
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        key = semantic_occupancy_s3_key(
+            model_artifact_id,
+            dataset_manifest_sha256,
+            dataset,
+            tar_path.name,
+        )
+        _put_s3_immutable(
+            s3,
+            bucket=artifacts_bucket,
+            key=key,
+            payload=payload,
+            metadata={
+                "checkpoint-sha256": checkpoint_sha256,
+                "dataset-manifest-sha256": (
+                    dataset_manifest_sha256
+                ),
+                "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+                "head-version": SEMANTIC_OCCUPANCY_HEAD_VERSION,
+                "model-artifact-id": model_artifact_id,
+                "payload-sha256": payload_sha256,
+                "sample-count": str(len(sample_uids)),
+                "schema": SEMANTIC_OCCUPANCY_SCHEMA,
+                "taxonomy-version": (
+                    SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
+                ),
+            },
+            content_type=(
+                "application/vnd.auto-e2e.semantic-occupancy"
+            ),
+            content_encoding="gzip",
+        )
+        entries.append({
+            "byte_size": len(payload),
+            "sample_count": len(sample_uids),
+            "s3_key": key,
+            "sha256": payload_sha256,
+            "shard": tar_path.name,
+            "teacher_present": teacher is not None,
+        })
+        total_samples += len(sample_uids)
+    entries.sort(key=lambda entry: entry["shard"])
+    teacher_available = all(
+        entry["teacher_present"]
+        for entry in entries
+    )
+    limitations = [
+        (
+            "Predictions use the checkpoint's native BEV segmentation head "
+            "without viewer-side geometry correction."
+        ),
+    ]
+    if not teacher_available:
+        limitations.append(
+            "Teacher and Error views are unavailable because KITScenes "
+            "packed shards do not contain perception ground truth."
+        )
+    manifest = occupancy_set_manifest(
+        artifact_kind="native-semantic-occupancy",
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        created_at=publication_timestamp,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        display_name="AutoE2E Reactive BEV segmentation",
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=SEMANTIC_OCCUPANCY_HEAD_VERSION,
+        input_contract="autoe2e-packed-calibrated-camera-v1",
+        limitations=limitations,
+        model_artifact_id=model_artifact_id,
+        model_family="AutoE2E Reactive",
+        model_source=model_source,
+        producer_config=producer_config,
+        shards=entries,
+        supported_classes=SEMANTIC_OCCUPANCY_CLASS_NAMES,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        teacher_available=teacher_available,
+    )
+    manifest_payload, manifest_sha256 = encode_occupancy_set_manifest(
+        manifest
+    )
+    _put_s3_immutable(
+        s3,
+        bucket=artifacts_bucket,
+        key=manifest_key,
+        payload=manifest_payload,
+        metadata={
+            "checkpoint-sha256": checkpoint_sha256,
+            "dataset-manifest-sha256": dataset_manifest_sha256,
+            "manifest-sha256": manifest_sha256,
+            "model-artifact-id": model_artifact_id,
+            "sample-count": str(total_samples),
+            "schema": manifest["schema_version"],
+        },
+        content_type="application/json",
+    )
+    return SemanticOccupancyPrecomputeOutput(
+        manifest_key=manifest_key,
+        manifest_sha256=manifest_sha256,
+        checkpoint_sha256=checkpoint_sha256,
+        shard_count=len(entries),
+        sample_count=total_samples,
+    )
+
+
+@task(
+    container_image=BEVFORMER_V2_IMAGE,
+    requests=Resources(cpu="4", mem="28Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="28Gi", gpu="1"),
+    pod_template=_large_shm_pod_template(),
+)
+def precompute_bevformer_v2_occupancy_artifacts(
+    checkpoint: FlyteFile,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    aws_region: str = "us-west-2",
+    repository_path: str = "/opt/BEVFormer",
+    score_threshold: float = 0.2,
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish detection-derived KITScenes occupancy from official V2 weights."""
+    import hashlib
+    import json
+    import os
+    import re
+    from pathlib import Path
+
+    import boto3
+    import numpy as np
+    import torch
+
+    from Platform.pipelines.bevformer_v2_occupancy import (
+        BEVFORMER_V2_ARTIFACT_KIND,
+        BEVFORMER_V2_CODE_LICENSE_SPDX,
+        BEVFORMER_V2_CONFIG_NAME,
+        BEVFORMER_V2_FRAMES,
+        BEVFORMER_V2_HEAD_VERSION,
+        BEVFORMER_V2_REPOSITORY,
+        BEVFORMER_V2_REVISION,
+        BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES,
+        BEVFORMER_V2_TRAINING_DATA_LICENSE_SPDX,
+        BEVFORMER_V2_WEIGHT_LICENSE_SPDX,
+        BEVFORMER_V2_WEIGHT_SHA256,
+        BEVFORMER_V2_WEIGHT_SOURCE_URL,
+        provenance,
+    )
+    from Platform.pipelines.bevformer_v2_runtime import (
+        BEVFORMER_V2_IMAGE_HEIGHT,
+        BEVFORMER_V2_IMAGE_WIDTH,
+        infer_bevformer_frame,
+        iter_packed_bevformer_frames,
+        load_official_bevformer_v2,
+        remember_history_frame,
+        temporal_frames_for,
+    )
+    from Platform.pipelines.occupancy_store import (
+        encode_occupancy_set_manifest,
+        occupancy_model_artifact_id,
+        occupancy_set_manifest,
+        occupancy_set_s3_key,
+    )
+    from Platform.pipelines.overlay_tasks import _put_s3_immutable
+    from Platform.pipelines.semantic_occupancy import (
+        SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        SEMANTIC_OCCUPANCY_SCHEMA,
+        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        encode_semantic_occupancy,
+        quantize_semantic_occupancy,
+        semantic_occupancy_s3_key,
+    )
+
+    if dataset != "kitscenes":
+        raise ValueError("BEVFormer V2 occupancy supports only KITScenes")
+    if not re.fullmatch(r"v[1-9][0-9]*\.[0-9]+", dataset_version):
+        raise ValueError("dataset_version must match v<major>.<minor>")
+    if not re.fullmatch(r"[0-9a-f]{64}", dataset_manifest_sha256):
+        raise ValueError(
+            "dataset_manifest_sha256 must be a lowercase SHA-256"
+        )
+    for name, value in (
+        ("artifacts_bucket", artifacts_bucket),
+        ("publication_timestamp", publication_timestamp),
+        ("aws_region", aws_region),
+        ("repository_path", repository_path),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+    if not shard_dirs:
+        raise ValueError("shard_dirs must not be empty")
+    if not 0.0 <= score_threshold <= 1.0:
+        raise ValueError("score_threshold must be in [0,1]")
+
+    packed_shards = []
+    seen_shards = set()
+    for shard_directory in shard_dirs:
+        local_directory = Path(shard_directory.download())
+        packed_manifest_path = local_directory / "manifest.json"
+        if not packed_manifest_path.is_file():
+            raise FileNotFoundError(
+                f"packed manifest missing: {local_directory}"
+            )
+        packed_manifest = json.loads(
+            packed_manifest_path.read_text(encoding="utf-8")
+        )
+        packed_dataset_version = packed_manifest.get(
+            "dataset_version",
+            packed_manifest.get("version"),
+        )
+        if (
+            packed_manifest.get("dataset") != dataset
+            or packed_dataset_version != dataset_version
+            or int(packed_manifest.get("num_views", 0))
+            != 6
+            or not packed_manifest.get("has_gps", False)
+        ):
+            raise ValueError(
+                "packed KITScenes manifest differs from the BEVFormer input "
+                f"contract: {packed_manifest_path}"
+            )
+        for tar_path in sorted(local_directory.glob("*.tar")):
+            if tar_path.name in seen_shards:
+                raise ValueError(
+                    "semantic occupancy shard names are not unique: "
+                    f"{tar_path.name}"
+                )
+            seen_shards.add(tar_path.name)
+            packed_shards.append(tar_path)
+    if not packed_shards:
+        raise ValueError("packed directories contain no tar shards")
+    packed_shards.sort(key=lambda path: path.name)
+
+    model_source = {
+        "code_license_spdx": BEVFORMER_V2_CODE_LICENSE_SPDX,
+        "config": BEVFORMER_V2_CONFIG_NAME,
+        "license_spdx": BEVFORMER_V2_WEIGHT_LICENSE_SPDX,
+        "repository": BEVFORMER_V2_REPOSITORY,
+        "repository_revision": BEVFORMER_V2_REVISION,
+        "training_data_license_spdx": (
+            BEVFORMER_V2_TRAINING_DATA_LICENSE_SPDX
+        ),
+        "weight_sha256": BEVFORMER_V2_WEIGHT_SHA256,
+        "weight_source_url": BEVFORMER_V2_WEIGHT_SOURCE_URL,
+    }
+    producer_config = {
+        "cublas_workspace_config": ":4096:8",
+        "deterministic_algorithms": True,
+        "image_height": BEVFORMER_V2_IMAGE_HEIGHT,
+        "image_width": BEVFORMER_V2_IMAGE_WIDTH,
+        "max_detections": 300,
+        "probability_encoding": "uint8-rint-gzip-level-6-v1",
+        "random_seed": 0,
+        "score_threshold": score_threshold,
+        "temporal_frame_offsets": list(BEVFORMER_V2_FRAMES),
+    }
+    model_artifact_id = occupancy_model_artifact_id(
+        artifact_kind=BEVFORMER_V2_ARTIFACT_KIND,
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=BEVFORMER_V2_HEAD_VERSION,
+        input_contract=(
+            "kitscenes-packed-256-square-six-camera-to-"
+            "bevformer-640x256-v1"
+        ),
+        model_source=model_source,
+        producer_config=producer_config,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+    )
+    manifest_key = occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        model_artifact_id,
+        dataset_manifest_sha256,
+    )
+
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = (
+        producer_config["cublas_workspace_config"]
+    )
+    torch.use_deterministic_algorithms(True)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = str(checkpoint.download())
+    model, box_type_3d = load_official_bevformer_v2(
+        repository_path=repository_path,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    s3 = boto3.client("s3", region_name=aws_region)
+    entries = []
+    total_samples = 0
+    incomplete_history_frames = 0
+    missing_history_slots = 0
+    history = {}
+    active_episode = None
+    last_frame_index = None
+    for tar_path in packed_shards:
+        sample_uids = []
+        probabilities = []
+        for frame in iter_packed_bevformer_frames(tar_path):
+            if active_episode != frame.episode_id:
+                history.clear()
+                active_episode = frame.episode_id
+                last_frame_index = None
+            if (
+                last_frame_index is not None
+                and frame.frame_index <= last_frame_index
+            ):
+                raise ValueError(
+                    "packed KITScenes frames are not strictly increasing "
+                    f"within episode {frame.episode_id!r}"
+                )
+            available_history = temporal_frames_for(frame, history)
+            missing_slots = (
+                len(BEVFORMER_V2_FRAMES) - len(available_history)
+            )
+            if missing_slots:
+                incomplete_history_frames += 1
+                missing_history_slots += missing_slots
+            probability = infer_bevformer_frame(
+                model,
+                frame,
+                history,
+                box_type_3d=box_type_3d,
+                device=device,
+                score_threshold=score_threshold,
+            )
+            probabilities.append(
+                quantize_semantic_occupancy(probability)
+            )
+            sample_uids.append(frame.sample_uid)
+            remember_history_frame(history, frame)
+            last_frame_index = frame.frame_index
+        if not sample_uids:
+            raise ValueError(f"packed shard is empty: {tar_path}")
+        payload = encode_semantic_occupancy(
+            sample_uids,
+            np.stack(probabilities),
+        )
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        key = semantic_occupancy_s3_key(
+            model_artifact_id,
+            dataset_manifest_sha256,
+            dataset,
+            tar_path.name,
+            head_version=BEVFORMER_V2_HEAD_VERSION,
+        )
+        _put_s3_immutable(
+            s3,
+            bucket=artifacts_bucket,
+            key=key,
+            payload=payload,
+            metadata={
+                "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
+                "dataset-manifest-sha256": (
+                    dataset_manifest_sha256
+                ),
+                "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+                "head-version": BEVFORMER_V2_HEAD_VERSION,
+                "model-artifact-id": model_artifact_id,
+                "payload-sha256": payload_sha256,
+                "sample-count": str(len(sample_uids)),
+                "schema": SEMANTIC_OCCUPANCY_SCHEMA,
+                "taxonomy-version": (
+                    SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
+                ),
+                "weight-sha256": BEVFORMER_V2_WEIGHT_SHA256,
+            },
+            content_type=(
+                "application/vnd.auto-e2e.semantic-occupancy"
+            ),
+            content_encoding="gzip",
+        )
+        entries.append({
+            "byte_size": len(payload),
+            "sample_count": len(sample_uids),
+            "s3_key": key,
+            "sha256": payload_sha256,
+            "shard": tar_path.name,
+            "teacher_present": False,
+        })
+        total_samples += len(sample_uids)
+    metadata = provenance()
+    limitations = list(metadata["limitations"])
+    limitations.append(
+        "The official weight is supplied at execution time and is not "
+        "redistributed in the AutoE2E container image."
+    )
+    if incomplete_history_frames:
+        limitations.append(
+            f"{incomplete_history_frames} of {total_samples} frames had "
+            f"{missing_history_slots} unavailable exact t8 history slots at "
+            "scene or packed-sequence boundaries; unavailable inputs were "
+            "omitted without substituting adjacent KITScenes frames."
+        )
+    manifest = occupancy_set_manifest(
+        artifact_kind=BEVFORMER_V2_ARTIFACT_KIND,
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        created_at=publication_timestamp,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        display_name="BEVFormer V2 R50 t8 detection footprints",
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=BEVFORMER_V2_HEAD_VERSION,
+        input_contract=(
+            "kitscenes-packed-256-square-six-camera-to-"
+            "bevformer-640x256-v1"
+        ),
+        limitations=limitations,
+        model_artifact_id=model_artifact_id,
+        model_family="BEVFormer V2",
+        model_source=model_source,
+        producer_config=producer_config,
+        shards=entries,
+        supported_classes=(
+            BEVFORMER_V2_SUPPORTED_SEMANTIC_CLASSES
+        ),
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        teacher_available=False,
+    )
+    manifest_payload, manifest_sha256 = encode_occupancy_set_manifest(
+        manifest
+    )
+    _put_s3_immutable(
+        s3,
+        bucket=artifacts_bucket,
+        key=manifest_key,
+        payload=manifest_payload,
+        metadata={
+            "artifact-kind": BEVFORMER_V2_ARTIFACT_KIND,
+            "dataset-manifest-sha256": dataset_manifest_sha256,
+            "manifest-sha256": manifest_sha256,
+            "model-artifact-id": model_artifact_id,
+            "sample-count": str(total_samples),
+            "schema": manifest["schema_version"],
+            "weight-sha256": BEVFORMER_V2_WEIGHT_SHA256,
+        },
+        content_type="application/json",
+    )
+    return SemanticOccupancyPrecomputeOutput(
+        manifest_key=manifest_key,
+        manifest_sha256=manifest_sha256,
+        checkpoint_sha256=BEVFORMER_V2_WEIGHT_SHA256,
+        shard_count=len(entries),
+        sample_count=total_samples,
+    )
+
+
+# ============================================================
 # Task: Offline RL
 # ============================================================
 @task(
@@ -7155,6 +9614,478 @@ def evaluate_rl_policy(
 
 
 @task(
+    container_image=DATA_PREP_IMAGE,
+    pod_template=_data_prep_pod_template(),
+    requests=Resources(cpu="1", mem="2Gi", ephemeral_storage="2Gi"),
+    limits=Resources(cpu="1", mem="2Gi", ephemeral_storage="2Gi"),
+    secret_requests=[
+        Secret(
+            group="hf-token",
+            key="HF_TOKEN",
+            mount_requirement=Secret.MountType.ENV_VAR,
+        )
+    ],
+    cache=True,
+    cache_version="kitscenes-benchmark-inventory-v1",
+    retries=2,
+)
+def audit_kitscenes_benchmark_inventory() -> FlyteFile:
+    """Audit the pinned val/overlap archive inventory without downloading it."""
+    import json
+    import os
+    import tempfile
+
+    from flytekit import current_context
+
+    from data_parsing.kit_scenes.source import (
+        KITSCENES_SDK_REVISION,
+        fetch_archive_manifest,
+        resolve_inventory,
+    )
+
+    try:
+        token = current_context().secrets.get("hf-token", "HF_TOKEN")
+    except Exception:
+        token = os.environ.get("HF_TOKEN", "")
+    with tempfile.TemporaryDirectory(
+        prefix="kitscenes_benchmark_inventory_"
+    ) as tmp:
+        archives = fetch_archive_manifest(
+            tmp,
+            revision=KITSCENES_SOURCE_REVISION,
+            token=token or None,
+        )
+
+    splits = {}
+    total_size_bytes = 0
+    total_scene_count = 0
+    for source_split in ("val", "overlap_train_val"):
+        inventory = resolve_inventory(
+            archives,
+            split=source_split,
+            source_revision=KITSCENES_SOURCE_REVISION,
+            max_missing_scenes=0,
+        )
+        scene_records = [
+            {
+                "archive_path": archives[scene_id].filename,
+                "archive_sha256": archives[scene_id].sha256,
+                "archive_size_bytes": archives[scene_id].size_bytes,
+                "scene_id": scene_id,
+            }
+            for scene_id in inventory.selected_scene_ids
+        ]
+        split_size = sum(
+            int(record["archive_size_bytes"]) for record in scene_records
+        )
+        splits[source_split] = {
+            **inventory.metadata(),
+            "archives": scene_records,
+            "total_size_bytes": split_size,
+        }
+        total_size_bytes += split_size
+        total_scene_count += len(scene_records)
+
+    report = {
+        "dataset": Dataset.KITSCENES.value,
+        "dataset_revision": KITSCENES_SOURCE_REVISION,
+        "sdk_revision": KITSCENES_SDK_REVISION,
+        "schema_version": "kitscenes_benchmark_inventory_v1",
+        "splits": splits,
+        "total_scene_count": total_scene_count,
+        "total_size_bytes": total_size_bytes,
+    }
+    output_dir = Path("/tmp/kitscenes-benchmark-inventory")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "inventory.json"
+    output_path.write_text(
+        json.dumps(
+            report,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    print(
+        "KITScenes benchmark inventory: "
+        f"scenes={total_scene_count} bytes={total_size_bytes}"
+    )
+    return FlyteFile(os.fspath(output_path))
+
+
+@task(
+    container_image=DATA_PREP_IMAGE,
+    pod_template=_data_prep_pod_template(),
+    requests=Resources(cpu="2", mem="8Gi", ephemeral_storage="20Gi"),
+    limits=Resources(cpu="2", mem="8Gi", ephemeral_storage="20Gi"),
+)
+def create_kitscenes_paper_approximation_manifest(
+    val_shards: List[FlyteDirectory],
+    overlap_shards: List[FlyteDirectory],
+    release_id: str = "autoe2e-paper-approx-v1",
+) -> KITScenesBenchmarkManifestOutput:
+    """Create a deterministic 200-window development manifest.
+
+    The exact authority-issued sample UIDs are not public. This task scans only
+    immutable packed metadata, removes overlapping windows per scene, and ranks
+    candidates by a pinned hash seed. It never reads trajectory values or model
+    metrics while selecting samples.
+    """
+    import hashlib
+    import json
+    import os
+    import tarfile
+
+    from evaluation.kitscenes_benchmark import (
+        KITScenesBenchmarkCandidate,
+        MANIFEST_SCHEMA_VERSION,
+        PAPER_APPROXIMATION_SELECTION_SEED,
+        PAPER_APPROXIMATION_SELECTION_VERSION,
+        PAPER_PROTOCOL_SOURCE,
+        PAPER_WINDOW_STEPS,
+        PROTOCOL_ID,
+        parse_benchmark_manifest,
+        sample_uid_digest,
+        select_paper_approximation_samples,
+    )
+    from data_parsing.kit_scenes.source import KITSCENES_SDK_REVISION
+
+    split_inputs = {
+        "val": (val_shards, "val"),
+        "overlap-train-val": (
+            overlap_shards,
+            "overlap_train_val",
+        ),
+    }
+    candidates_by_split: dict[
+        str, list[KITScenesBenchmarkCandidate]
+    ] = {}
+    packed_sources: dict[str, list[dict[str, object]]] = {}
+    empty_partition_ids: dict[str, list[str]] = {}
+    seen_partition_ids: set[str] = set()
+    for protocol_split, (shards, source_split) in split_inputs.items():
+        if not shards:
+            raise ValueError(
+                f"KITScenes benchmark split {protocol_split} has no shards"
+            )
+        split_candidates: list[KITScenesBenchmarkCandidate] = []
+        split_sources: list[dict[str, object]] = []
+        for shard in shards:
+            shard_uri = str(
+                getattr(shard, "remote_source", "") or shard
+            )
+            shard_dir = Path(shard.download())
+            packed_manifest_path = shard_dir / "manifest.json"
+            if not packed_manifest_path.is_file():
+                raise FileNotFoundError(
+                    "KITScenes benchmark shard has no manifest: "
+                    f"{packed_manifest_path}"
+                )
+            packed_manifest_bytes = packed_manifest_path.read_bytes()
+            packed_manifest = json.loads(packed_manifest_bytes)
+            expected_fields = {
+                "dataset": Dataset.KITSCENES.value,
+                "source_revision": KITSCENES_SOURCE_REVISION,
+                "source_split": source_split,
+                "data_role": "benchmark",
+                "dataset_version": KITSCENES_BENCHMARK_DATASET_VERSION,
+                "hz": 10,
+                "temporal_sampling": kitscenes_temporal_contract(
+                    benchmark_protocol=True,
+                ),
+            }
+            for field, expected in expected_fields.items():
+                actual = packed_manifest.get(field)
+                if actual != expected:
+                    raise ValueError(
+                        "KITScenes benchmark packed manifest differs from "
+                        f"the evaluation contract: {field}={actual!r}, "
+                        f"expected={expected!r}"
+                    )
+            partition_id = str(
+                packed_manifest.get("partition_id", "")
+            )
+            if not partition_id:
+                raise ValueError(
+                    "KITScenes benchmark shard has no partition_id"
+                )
+            if partition_id in seen_partition_ids:
+                raise ValueError(
+                    "KITScenes benchmark has duplicate partition_id "
+                    f"{partition_id}"
+                )
+            seen_partition_ids.add(partition_id)
+
+            shard_names = list(packed_manifest.get("shard_names", []))
+            shard_count = packed_manifest.get("shards")
+            total_samples = packed_manifest.get("total_samples")
+            shard_sample_counts = packed_manifest.get(
+                "shard_sample_counts"
+            )
+            num_views = packed_manifest.get("num_views")
+            if (
+                isinstance(shard_count, bool)
+                or not isinstance(shard_count, int)
+                or shard_count < 0
+            ):
+                raise ValueError(
+                    "KITScenes benchmark shard count must be a "
+                    f"non-negative integer: {shard_count!r}"
+                )
+            if (
+                isinstance(total_samples, bool)
+                or not isinstance(total_samples, int)
+                or total_samples < 0
+            ):
+                raise ValueError(
+                    "KITScenes benchmark total_samples must be a "
+                    f"non-negative integer: {total_samples!r}"
+                )
+            if not isinstance(shard_sample_counts, dict):
+                raise ValueError(
+                    "KITScenes benchmark shard_sample_counts must be a map"
+                )
+            counted_samples = 0
+            for shard_name, count in shard_sample_counts.items():
+                if (
+                    not isinstance(shard_name, str)
+                    or not shard_name
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count <= 0
+                ):
+                    raise ValueError(
+                        "KITScenes benchmark shard_sample_counts contains "
+                        f"an invalid entry: {shard_name!r}={count!r}"
+                    )
+                counted_samples += count
+
+            is_empty = total_samples == 0
+            if is_empty:
+                empty_contract = {
+                    "num_views": 0,
+                    "shards": 0,
+                    "shard_names": [],
+                    "shard_sample_counts": {},
+                }
+                actual_empty_contract = {
+                    "num_views": num_views,
+                    "shards": shard_count,
+                    "shard_names": shard_names,
+                    "shard_sample_counts": shard_sample_counts,
+                }
+                if actual_empty_contract != empty_contract:
+                    raise ValueError(
+                        "KITScenes empty benchmark partition differs from "
+                        f"the empty contract: {actual_empty_contract!r}"
+                    )
+                for field in ("has_map", "has_gps", "has_navigation"):
+                    if bool(packed_manifest.get(field, False)):
+                        raise ValueError(
+                            "KITScenes empty benchmark partition requires "
+                            f"{field}=false"
+                        )
+                empty_partition_ids.setdefault(protocol_split, []).append(
+                    partition_id
+                )
+                split_sources.append({
+                    "empty": True,
+                    "manifest_sha256": hashlib.sha256(
+                        packed_manifest_bytes
+                    ).hexdigest(),
+                    "partition_id": partition_id,
+                    "sample_count": 0,
+                    "uri": shard_uri,
+                })
+                continue
+
+            if num_views != 6:
+                raise ValueError(
+                    "KITScenes benchmark packed manifest differs from "
+                    "the evaluation contract: "
+                    f"num_views={num_views!r}, expected=6"
+                )
+            for field in ("has_map", "has_gps", "has_navigation"):
+                if not bool(packed_manifest.get(field, False)):
+                    raise ValueError(
+                        f"KITScenes benchmark shard requires {field}=true"
+                    )
+            if (
+                not shard_names
+                or shard_count != len(shard_names)
+                or set(shard_names) != set(shard_sample_counts)
+                or counted_samples != total_samples
+            ):
+                raise ValueError(
+                    "KITScenes benchmark non-empty partition has "
+                    "inconsistent shard metadata: "
+                    f"partition_id={partition_id!r}, shards={shard_count}, "
+                    f"shard_names={len(shard_names)}, "
+                    f"counted_samples={counted_samples}, "
+                    f"total_samples={total_samples}"
+                )
+            metadata_count = 0
+            for shard_name in shard_names:
+                tar_path = shard_dir / str(shard_name)
+                if not tar_path.is_file():
+                    raise FileNotFoundError(
+                        f"KITScenes packed tar is missing: {tar_path}"
+                    )
+                with tarfile.open(tar_path, "r") as archive:
+                    for member in archive:
+                        if not member.isfile() or not member.name.endswith(
+                            ".meta.json"
+                        ):
+                            continue
+                        stream = archive.extractfile(member)
+                        if stream is None:
+                            raise ValueError(
+                                f"unable to read packed member {member.name}"
+                            )
+                        metadata = json.loads(stream.read())
+                        sample_uid = str(metadata.get("sample_uid", ""))
+                        split_group_uid = str(
+                            metadata.get("split_group_uid", "")
+                        )
+                        expected_prefix = "kitscenes-"
+                        if not split_group_uid.startswith(expected_prefix):
+                            raise ValueError(
+                                "KITScenes sample has invalid split_group_uid "
+                                f"{split_group_uid!r}"
+                            )
+                        frame_index = metadata.get("frame_idx")
+                        if (
+                            isinstance(frame_index, bool)
+                            or not isinstance(frame_index, int)
+                        ):
+                            raise ValueError(
+                                "KITScenes sample frame_idx must be an integer"
+                            )
+                        split_candidates.append(
+                            KITScenesBenchmarkCandidate(
+                                sample_uid=sample_uid,
+                                source_split=protocol_split,
+                                scene_id=split_group_uid[
+                                    len(expected_prefix):
+                                ],
+                                frame_index=frame_index,
+                            )
+                        )
+                        metadata_count += 1
+            if metadata_count != total_samples:
+                raise ValueError(
+                    "KITScenes benchmark metadata count differs from "
+                    f"manifest: {metadata_count} != {total_samples}"
+                )
+            split_sources.append({
+                "empty": False,
+                "manifest_sha256": hashlib.sha256(
+                    packed_manifest_bytes
+                ).hexdigest(),
+                "partition_id": partition_id,
+                "sample_count": metadata_count,
+                "uri": shard_uri,
+            })
+        candidates_by_split[protocol_split] = split_candidates
+        packed_sources[protocol_split] = sorted(
+            split_sources,
+            key=lambda item: str(item["partition_id"]),
+        )
+        empty_partition_ids.setdefault(protocol_split, [])
+        empty_partition_ids[protocol_split].sort()
+
+    sample_uids, selection = select_paper_approximation_samples(
+        candidates_by_split,
+    )
+    empty_partition_count_by_split = {
+        split: len(empty_partition_ids[split])
+        for split in sorted(empty_partition_ids)
+    }
+    temporal_sampling = kitscenes_temporal_contract(
+        benchmark_protocol=True,
+    )
+    payload = {
+        "authority": "auto-e2e",
+        "benchmark_id": "autoe2e-kitscenes-paper-approx-v1",
+        "dataset_revision": KITSCENES_SOURCE_REVISION,
+        "frequency_hz": 10,
+        "history_adapter": "left_zero_pad_to_64",
+        "horizons_seconds": [3, 5],
+        "input_track": "camera-map-route",
+        "packed_sources": packed_sources,
+        "past_seconds": 4,
+        "protocol_id": PROTOCOL_ID,
+        "protocol_source": PAPER_PROTOCOL_SOURCE,
+        "protocol_status": "paper_protocol_approximation",
+        "release_id": release_id,
+        "sample_count": len(sample_uids),
+        "sample_uid_digest": sample_uid_digest(sample_uids),
+        "sample_uids": list(sample_uids),
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "sdk_revision": KITSCENES_SDK_REVISION,
+        "selection": {
+            **selection,
+            "anchor_policy": (
+                "first_packed_anchor_then_greedy_90_frame_stride"
+            ),
+            "empty_partition_count": sum(
+                empty_partition_count_by_split.values()
+            ),
+            "empty_partition_count_by_split": (
+                empty_partition_count_by_split
+            ),
+            "empty_partition_ids_by_split": {
+                split: empty_partition_ids[split]
+                for split in sorted(empty_partition_ids)
+            },
+            "metric_or_target_values_read": False,
+            "packed_future_steps": temporal_sampling["abi_future_steps"],
+            "packed_history_steps": temporal_sampling["abi_history_steps"],
+            "paper_future_steps": 50,
+            "paper_observation_steps": 40,
+            "sampling_future_steps": temporal_sampling[
+                "sampling_future_steps"
+            ],
+            "sampling_history_steps": temporal_sampling[
+                "sampling_history_steps"
+            ],
+            "selection_seed": PAPER_APPROXIMATION_SELECTION_SEED,
+            "selection_version": PAPER_APPROXIMATION_SELECTION_VERSION,
+            "window_steps": PAPER_WINDOW_STEPS,
+        },
+        "source_splits": ["val", "overlap-train-val"],
+    }
+    parse_benchmark_manifest(payload)
+    output_dir = Path("/tmp/kitscenes-paper-approximation")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "manifest.json"
+    output_path.write_text(
+        json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
+    print(
+        "KITScenes paper approximation manifest: "
+        f"samples={len(sample_uids)} sha256={digest} "
+        f"selection={json.dumps(selection, sort_keys=True)}"
+    )
+    return KITScenesBenchmarkManifestOutput(
+        manifest=FlyteFile(os.fspath(output_path)),
+        manifest_sha256=digest,
+    )
+
+
+@task(
     container_image=EVAL_IMAGE,
     requests=Resources(cpu="4", mem="16Gi", gpu="1"),
     limits=Resources(cpu="4", mem="16Gi", gpu="1"),
@@ -7268,9 +10199,17 @@ def evaluate_kitscenes_benchmark_checkpoint(
     if not isinstance(payload["config"], dict):
         raise ValueError("benchmark checkpoint config must be an object")
     config = dict(payload["config"])
-    training_policy = training_policy_from_config(
-        config,
-        Dataset.KITSCENES.value,
+    simple_xy_objective = (
+        config.get("training_objective_version")
+        == SIMPLE_XY_IMITATION_OBJECTIVE_VERSION
+    )
+    training_policy = (
+        None
+        if simple_xy_objective
+        else training_policy_from_config(
+            config,
+            Dataset.KITSCENES.value,
+        )
     )
     epoch = int(payload["epoch"])
     if epoch <= 0:
@@ -7297,6 +10236,16 @@ def evaluate_kitscenes_benchmark_checkpoint(
     shard_identities: list[dict] = []
     dataset_versions: set[str] = set()
     contract_digests: set[str] = set()
+    packed_source_splits: set[str] = set()
+    protocol_to_packed_split = {
+        "val": "val",
+        "overlap-train-val": "overlap_train_val",
+    }
+    expected_packed_splits = {
+        protocol_to_packed_split[split]
+        for split in manifest.source_splits
+        if split in protocol_to_packed_split
+    }
     for shard in benchmark_shards:
         shard_uri = str(
             getattr(shard, "remote_source", "") or shard
@@ -7330,6 +10279,21 @@ def evaluate_kitscenes_benchmark_checkpoint(
                 f"manifest: shard={packed_manifest.get('source_revision')!r} "
                 f"manifest={manifest.dataset_revision!r}"
             )
+        packed_source_split = str(
+            packed_manifest.get("source_split", "")
+        )
+        if packed_source_split not in expected_packed_splits:
+            raise ValueError(
+                "benchmark shard source split differs from the fixed "
+                f"manifest: shard={packed_source_split!r} "
+                f"manifest={sorted(expected_packed_splits)!r}"
+            )
+        if packed_manifest.get("data_role") != "benchmark":
+            raise ValueError(
+                "benchmark evaluation refuses shards not prepared with "
+                "data_role='benchmark'"
+            )
+        packed_source_splits.add(packed_source_split)
         if int(packed_manifest.get("hz", 0)) != manifest.frequency_hz:
             raise ValueError(
                 "benchmark shard frequency differs from the protocol: "
@@ -7364,6 +10328,7 @@ def evaluate_kitscenes_benchmark_checkpoint(
                 packed_manifest.get("shard_names", [])
             ),
             "source_revision": packed_manifest.get("source_revision"),
+            "source_split": packed_source_split,
             "total_samples": total_samples,
             "uri": shard_uri,
         })
@@ -7403,6 +10368,12 @@ def evaluate_kitscenes_benchmark_checkpoint(
         )
     if len(contract_digests) != 1:
         raise ValueError("benchmark shards mix packing contracts")
+    if packed_source_splits != expected_packed_splits:
+        raise ValueError(
+            "benchmark shards do not cover the fixed manifest splits: "
+            f"actual={sorted(packed_source_splits)} "
+            f"expected={sorted(expected_packed_splits)}"
+        )
     shard_identities.sort(
         key=lambda item: (
             str(item["partition_id"]),
@@ -7485,9 +10456,13 @@ def evaluate_kitscenes_benchmark_checkpoint(
                     "benchmark GPS trajectory has unexpected shape "
                     f"{getattr(gps_future, 'shape', None)}"
                 )
-            policy_history = adapt_egomotion_history(
-                history,
-                training_policy,
+            policy_history = (
+                history
+                if training_policy is None
+                else adapt_egomotion_history(
+                    history,
+                    training_policy,
+                )
             )
             limited_history = limit_egomotion_history(
                 policy_history,
@@ -8028,6 +11003,216 @@ def audit_kitscenes_target_reconstruction(
 # Workflows
 # ============================================================
 @workflow
+def wf_acquire_nuplan_raw_snapshot(
+    source_manifest: FlyteFile,
+    datasets_bucket: str,
+    aws_region: str = "us-west-2",
+    concurrency: int = 4,
+) -> NuPlanRawSnapshotOutput:
+    """Acquire authorized nuPlan archives once into an immutable S3 snapshot."""
+    return _acquire_nuplan_raw_snapshot(
+        source_manifest=source_manifest,
+        datasets_bucket=datasets_bucket,
+        aws_region=aws_region,
+        concurrency=concurrency,
+    )
+
+
+@workflow
+def wf_pack_nuplan_reactive_dataset(
+    data_root: FlyteDirectory,
+    map_root: FlyteDirectory,
+    sensor_root: FlyteDirectory,
+    db_files: List[str],
+    source_revision: str,
+    map_version: str,
+    limit_total_scenarios: int = 0,
+    image_size: int = 256,
+    samples_per_shard: int = 1000,
+    max_rejection_fraction: float = 0.0,
+) -> FlyteDirectory:
+    """Build the immutable Stage A source shards from raw nuPlan assets."""
+    return pack_nuplan_reactive_dataset(
+        data_root=data_root,
+        map_root=map_root,
+        sensor_root=sensor_root,
+        db_files=db_files,
+        source_revision=source_revision,
+        map_version=map_version,
+        limit_total_scenarios=limit_total_scenarios,
+        image_size=image_size,
+        samples_per_shard=samples_per_shard,
+        max_rejection_fraction=max_rejection_fraction,
+    )
+
+
+@workflow
+def wf_train_reactive_nuplan_l2d(
+    nuplan_shards: List[FlyteDirectory],
+    l2d_shards: List[FlyteDirectory],
+    backbone: Backbone = Backbone.SWIN_V2_TINY,
+    stage_a_epochs: int = 3,
+    stage_b_epochs: int = 3,
+    batch_size: int = 2,
+    stage_a_lr: float = 1e-4,
+    stage_b_lr: float = 3e-5,
+    val_fraction: float = 0.1,
+    num_workers: int = 0,
+    training_seed: int = 149,
+    bev_weight: float = 1.0,
+    route_weight: float = 1.0,
+) -> ReactiveTrainingProgramOutput:
+    """Run Stage A nuPlan and Stage B L2D with a weights-only boundary."""
+    stage_a = train_reactive_multitask_stage(
+        shards=nuplan_shards,
+        dataset=Dataset.NUPLAN,
+        stage="nuplan_full",
+        parent_checkpoint=None,
+        backbone=backbone,
+        epochs=stage_a_epochs,
+        batch_size=batch_size,
+        lr=stage_a_lr,
+        val_fraction=val_fraction,
+        num_workers=num_workers,
+        training_seed=training_seed,
+        bev_weight=bev_weight,
+        route_weight=route_weight,
+    )
+    stage_b = train_reactive_multitask_stage(
+        shards=l2d_shards,
+        dataset=Dataset.L2D,
+        stage="l2d_continuation",
+        parent_checkpoint=stage_a.checkpoint,
+        backbone=backbone,
+        epochs=stage_b_epochs,
+        batch_size=batch_size,
+        lr=stage_b_lr,
+        val_fraction=val_fraction,
+        num_workers=num_workers,
+        training_seed=training_seed,
+        bev_weight=0.0,
+        route_weight=route_weight,
+    )
+    retention = evaluate_reactive_transfer_matrix(
+        stage_a_checkpoint=stage_a.checkpoint,
+        stage_b_checkpoint=stage_b.checkpoint,
+        nuplan_shards=nuplan_shards,
+        l2d_shards=l2d_shards,
+        batch_size=batch_size,
+        val_fraction=val_fraction,
+        num_workers=num_workers,
+    )
+    return ReactiveTrainingProgramOutput(
+        stage_a_checkpoint=stage_a.checkpoint,
+        stage_a_metadata=stage_a.metadata,
+        stage_b_checkpoint=stage_b.checkpoint,
+        stage_b_metadata=stage_b.metadata,
+        retention_report=retention.report,
+        retention_report_sha256=retention.report_sha256,
+    )
+
+
+@workflow
+def wf_benchmark_reactive_program(
+    stage_a_checkpoint: FlyteFile,
+    stage_b_checkpoint: FlyteFile,
+    benchmark_shards: List[FlyteDirectory],
+    benchmark_manifest: FlyteFile,
+    expected_manifest_sha256: str = "",
+    stage_a_mlflow_run_id: str = "",
+    stage_b_mlflow_run_id: str = "",
+    batch_size: int = 4,
+) -> ReactiveBenchmarkProgramOutput:
+    """Evaluate predeclared Stage A/B checkpoints without optimizer access."""
+    stage_a = evaluate_kitscenes_benchmark_checkpoint(
+        checkpoint=stage_a_checkpoint,
+        benchmark_shards=benchmark_shards,
+        benchmark_manifest=benchmark_manifest,
+        expected_manifest_sha256=expected_manifest_sha256,
+        mlflow_run_id=stage_a_mlflow_run_id,
+        batch_size=batch_size,
+    )
+    stage_b = evaluate_kitscenes_benchmark_checkpoint(
+        checkpoint=stage_b_checkpoint,
+        benchmark_shards=benchmark_shards,
+        benchmark_manifest=benchmark_manifest,
+        expected_manifest_sha256=expected_manifest_sha256,
+        mlflow_run_id=stage_b_mlflow_run_id,
+        batch_size=batch_size,
+    )
+    return ReactiveBenchmarkProgramOutput(
+        stage_a_ade_3s=stage_a.ade_3s,
+        stage_a_fde_3s=stage_a.fde_3s,
+        stage_a_ade_5s=stage_a.ade_5s,
+        stage_a_fde_5s=stage_a.fde_5s,
+        stage_a_predictions=stage_a.predictions,
+        stage_a_report=stage_a.report,
+        stage_b_ade_3s=stage_b.ade_3s,
+        stage_b_fde_3s=stage_b.fde_3s,
+        stage_b_ade_5s=stage_b.ade_5s,
+        stage_b_fde_5s=stage_b.fde_5s,
+        stage_b_predictions=stage_b.predictions,
+        stage_b_report=stage_b.report,
+    )
+
+
+@workflow
+def wf_precompute_semantic_occupancy(
+    checkpoint: FlyteFile,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    repository_revision: str,
+    aws_region: str = "us-west-2",
+    batch_size: int = 2,
+    num_workers: int = 0,
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish Dashboard semantic bodies without running model inference in API."""
+    return precompute_semantic_occupancy_artifacts(
+        checkpoint=checkpoint,
+        shard_dirs=shard_dirs,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        artifacts_bucket=artifacts_bucket,
+        publication_timestamp=publication_timestamp,
+        repository_revision=repository_revision,
+        aws_region=aws_region,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+
+@workflow
+def wf_precompute_bevformer_v2_occupancy(
+    checkpoint: FlyteFile,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    aws_region: str = "us-west-2",
+    score_threshold: float = 0.2,
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish official V2 detection footprints for the Occupancy Dashboard."""
+    return precompute_bevformer_v2_occupancy_artifacts(
+        checkpoint=checkpoint,
+        shard_dirs=shard_dirs,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        artifacts_bucket=artifacts_bucket,
+        publication_timestamp=publication_timestamp,
+        aws_region=aws_region,
+        score_threshold=score_threshold,
+    )
+
+
+@workflow
 def wf_evaluate_kitscenes_benchmark(
     checkpoint: FlyteFile,
     benchmark_shards: List[FlyteDirectory],
@@ -8230,6 +11415,10 @@ def _map_dataset_partitions(
     ingest_concurrency: int,
     label_concurrency: int,
     pack_concurrency: int,
+    reactive_targets: bool,
+    osm_graph_snapshot: Optional[FlyteFile],
+    source_split: str,
+    data_role: str,
 ) -> List[FlyteDirectory]:
     """Execute each data-prep stage as one bounded Flyte array node."""
     for name, value in (
@@ -8239,6 +11428,18 @@ def _map_dataset_partitions(
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
+    if (
+        reactive_targets
+        and dataset == Dataset.L2D
+        and osm_graph_snapshot is None
+    ):
+        raise ValueError(
+            "L2D Reactive packing requires an OSM graph snapshot"
+        )
+    if reasoning_teacher != "none" and data_role != "training":
+        raise ValueError(
+            "benchmark dataset preparation must not invoke reasoning teachers"
+        )
 
     ingest = map_task(
         functools.partial(
@@ -8246,6 +11447,8 @@ def _map_dataset_partitions(
             dataset=dataset,
             source_revision=source_revision,
             episodes=0,
+            source_split=source_split,
+            data_role=data_role,
         ),
         concurrency=ingest_concurrency,
     )
@@ -8278,6 +11481,10 @@ def _map_dataset_partitions(
                 episodes=0,
                 world_model=True,
                 expected_reasoning_label_count=None,
+                reactive_targets=reactive_targets,
+                osm_graph_snapshot=osm_graph_snapshot,
+                source_split=source_split,
+                data_role=data_role,
             ),
             concurrency=pack_concurrency,
         )
@@ -8299,6 +11506,10 @@ def _map_dataset_partitions(
             world_model=world_model,
             reasoning_labels=None,
             expected_reasoning_label_count=None,
+            reactive_targets=reactive_targets,
+            osm_graph_snapshot=osm_graph_snapshot,
+            source_split=source_split,
+            data_role=data_role,
         ),
         concurrency=pack_concurrency,
     )
@@ -8469,6 +11680,8 @@ def wf_create_dataset_sharded(
     ingest_concurrency: int = 60,
     label_concurrency: int = 5,
     pack_concurrency: int = 60,
+    reactive_targets: bool = False,
+    osm_graph_snapshot: Optional[FlyteFile] = None,
 ) -> List[FlyteDirectory]:
     """Fan out immutable source groups through bounded ingest/label/pack arrays.
 
@@ -8501,6 +11714,187 @@ def wf_create_dataset_sharded(
         label_workers=label_workers,
         ingest_concurrency=ingest_concurrency,
         label_concurrency=label_concurrency,
+        pack_concurrency=pack_concurrency,
+        reactive_targets=reactive_targets,
+        osm_graph_snapshot=osm_graph_snapshot,
+        source_split="train",
+        data_role="training",
+    )
+
+
+@workflow
+def wf_audit_kitscenes_benchmark_inventory() -> FlyteFile:
+    """Report pinned held-out archive sizes before any large download."""
+    return audit_kitscenes_benchmark_inventory()
+
+
+@workflow
+def wf_prepare_kitscenes_paper_approximation(
+    val_scene_limit: int = 0,
+    overlap_scene_limit: int = 0,
+    ingest_concurrency: int = 20,
+    pack_concurrency: int = 20,
+    release_id: str = "autoe2e-paper-approx-v1",
+) -> KITScenesBenchmarkPreparationOutput:
+    """Pack held-out scenes and freeze a deterministic 200-window manifest.
+
+    This workflow is evaluation-only. It cannot select ``train`` scenes and
+    does not invoke any optimizer, reasoning teacher, or checkpoint selection.
+    A zero scene limit means all official scenes in that split.
+    """
+    val_partitions = plan_fanout_partitions(
+        dataset=Dataset.KITSCENES,
+        source_revision=KITSCENES_SOURCE_REVISION,
+        episodes=val_scene_limit,
+        start_ep=-1,
+        end_ep=-1,
+        partition_size=1,
+        max_partitions=200,
+        max_missing_scenes=0,
+        split="val",
+        data_role="benchmark",
+    )
+    overlap_partitions = plan_fanout_partitions(
+        dataset=Dataset.KITSCENES,
+        source_revision=KITSCENES_SOURCE_REVISION,
+        episodes=overlap_scene_limit,
+        start_ep=-1,
+        end_ep=-1,
+        partition_size=1,
+        max_partitions=200,
+        max_missing_scenes=0,
+        split="overlap_train_val",
+        data_role="benchmark",
+    )
+    val_shards = _map_dataset_partitions(
+        partitions=val_partitions,
+        dataset=Dataset.KITSCENES,
+        source_revision=KITSCENES_SOURCE_REVISION,
+        dataset_version=KITSCENES_BENCHMARK_DATASET_VERSION,
+        image_size=256,
+        world_model=False,
+        reasoning_teacher="none",
+        prompt_version="unused",
+        label_stride=10,
+        label_workers=1,
+        ingest_concurrency=ingest_concurrency,
+        label_concurrency=1,
+        pack_concurrency=pack_concurrency,
+        reactive_targets=False,
+        osm_graph_snapshot=None,
+        source_split="val",
+        data_role="benchmark",
+    )
+    overlap_shards = _map_dataset_partitions(
+        partitions=overlap_partitions,
+        dataset=Dataset.KITSCENES,
+        source_revision=KITSCENES_SOURCE_REVISION,
+        dataset_version=KITSCENES_BENCHMARK_DATASET_VERSION,
+        image_size=256,
+        world_model=False,
+        reasoning_teacher="none",
+        prompt_version="unused",
+        label_stride=10,
+        label_workers=1,
+        ingest_concurrency=ingest_concurrency,
+        label_concurrency=1,
+        pack_concurrency=pack_concurrency,
+        reactive_targets=False,
+        osm_graph_snapshot=None,
+        source_split="overlap_train_val",
+        data_role="benchmark",
+    )
+    manifest = create_kitscenes_paper_approximation_manifest(
+        val_shards=val_shards,
+        overlap_shards=overlap_shards,
+        release_id=release_id,
+    )
+    return KITScenesBenchmarkPreparationOutput(
+        val_shards=val_shards,
+        overlap_shards=overlap_shards,
+        manifest=manifest.manifest,
+        manifest_sha256=manifest.manifest_sha256,
+    )
+
+
+@workflow
+def wf_build_l2d_osm_graph_artifact(
+    source_pbf: FlyteFile,
+    source_revision: str,
+    source_date: str,
+    attribution: str = "OpenStreetMap contributors",
+) -> FlyteFile:
+    """Build the immutable OSM graph used by all L2D pack partitions."""
+    return build_l2d_osm_graph_artifact(
+        source_pbf=source_pbf,
+        source_revision=source_revision,
+        source_date=source_date,
+        attribution=attribution,
+    )
+
+
+@workflow
+def wf_pack_l2d_reactive_dataset(
+    osm_graph_snapshot: FlyteFile,
+    episodes: int = 0,
+    start_ep: int = -1,
+    end_ep: int = -1,
+    partition_size: int = 1,
+    max_partitions: int = 600,
+    ingest_concurrency: int = 40,
+    pack_concurrency: int = 40,
+) -> List[FlyteDirectory]:
+    """Repack L2D with trajectory, OSM Map, and Route targets."""
+    return wf_create_dataset_sharded(
+        dataset=Dataset.L2D,
+        source_revision=L2D_SOURCE_REVISION,
+        dataset_version=L2D_REACTIVE_DATASET_VERSION,
+        episodes=episodes,
+        start_ep=start_ep,
+        end_ep=end_ep,
+        partition_size=partition_size,
+        image_size=256,
+        world_model=False,
+        reasoning_teacher="none",
+        max_partitions=max_partitions,
+        max_missing_scenes=0,
+        ingest_concurrency=ingest_concurrency,
+        label_concurrency=1,
+        pack_concurrency=pack_concurrency,
+        reactive_targets=True,
+        osm_graph_snapshot=osm_graph_snapshot,
+    )
+
+
+@workflow
+def wf_prepare_l2d_reactive_dataset(
+    source_pbf: FlyteFile,
+    source_revision: str,
+    source_date: str,
+    attribution: str = "OpenStreetMap contributors",
+    episodes: int = 0,
+    start_ep: int = -1,
+    end_ep: int = -1,
+    partition_size: int = 1,
+    max_partitions: int = 600,
+    ingest_concurrency: int = 40,
+    pack_concurrency: int = 40,
+) -> List[FlyteDirectory]:
+    """Build a pinned OSM graph and pack one immutable L2D subset."""
+    osm_graph_snapshot = build_l2d_osm_graph_artifact(
+        source_pbf=source_pbf,
+        source_revision=source_revision,
+        source_date=source_date,
+        attribution=attribution,
+    )
+    return wf_pack_l2d_reactive_dataset(
+        osm_graph_snapshot=osm_graph_snapshot,
+        episodes=episodes,
+        start_ep=start_ep,
+        end_ep=end_ep,
+        partition_size=partition_size,
+        max_partitions=max_partitions,
+        ingest_concurrency=ingest_concurrency,
         pack_concurrency=pack_concurrency,
     )
 
@@ -8893,7 +12287,7 @@ def wf_precompute_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     sampler: str = "model-default",
@@ -8912,6 +12306,11 @@ def wf_precompute_overlays(
         prepare_overlay_set,
         resolve_overlay_model,
     )
+    normalized_base_seeds = (
+        [0]
+        if base_seeds is None
+        else base_seeds
+    )
 
     resolved = resolve_overlay_model(
         registered_model_name=registered_model_name,
@@ -8929,7 +12328,7 @@ def wf_precompute_overlays(
         artifacts_bucket=artifacts_bucket,
         dynamo_table=dynamo_table,
         aws_region=aws_region,
-        base_seeds=base_seeds,
+        base_seeds=normalized_base_seeds,
         sampler=sampler,
     )
     result = precompute_overlay_partition(
@@ -8946,7 +12345,7 @@ def wf_precompute_overlays(
         artifacts_bucket=artifacts_bucket,
         dynamo_table=dynamo_table,
         aws_region=aws_region,
-        base_seeds=base_seeds,
+        base_seeds=normalized_base_seeds,
         batch_size=batch_size,
         num_workers=num_workers,
         sampler=sampler,
@@ -9025,7 +12424,7 @@ def wf_publish_and_precompute_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -9085,7 +12484,7 @@ def wf_publish_full_run_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -9137,7 +12536,7 @@ def wf_publish_selected_checkpoint_overlays(
     dataset_version: str = DATASET_PACK_VERSION,
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -9203,7 +12602,7 @@ def wf_create_publish_and_precompute_overlays(
     registered_model_name: str = "auto-e2e-driving-policy",
     dynamo_table: str = "auto-e2e-console",
     aws_region: str = "us-west-2",
-    base_seeds: List[int] = [0],
+    base_seeds: Optional[List[int]] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     copy_workers: int = 16,
@@ -9256,7 +12655,7 @@ def wf_export_trajectory_report(
     dataset_manifest: FlyteFile,
     overlay_manifest: FlyteFile,
     selection_manifest: Optional[FlyteFile] = None,
-    scene_uids: List[str] = [],
+    scene_uids: Optional[List[str]] = None,
     seed_index: int = 0,
     camera_index: int = 0,
     max_frames_per_scene: int = 300,

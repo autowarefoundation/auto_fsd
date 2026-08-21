@@ -101,6 +101,15 @@ resource "aws_iam_role_policy" "flyte_user_s3" {
             "arn:aws:s3:::${var.datasets_bucket}",
           ]
         },
+        # S3 multipart copy authorizes the source through the Flyte task role.
+        # Keep this read-only grant scoped to the official nuPlan v1.1 prefix.
+        {
+          Effect = "Allow"
+          Action = ["s3:GetObject"]
+          Resource = [
+            "arn:aws:s3:::motional-nuplan/public/nuplan-v1.1/*",
+          ]
+        },
         {
           Effect = "Allow"
           Action = ["dynamodb:GetItem", "dynamodb:PutItem"]
@@ -164,6 +173,10 @@ resource "helm_release" "flyte" {
     value = var.region
   }
   set {
+    name  = "userSettings.controlPlaneRoleName"
+    value = "${var.cluster_name}-s3-access"
+  }
+  set {
     name  = "userSettings.certificateArn"
     value = ""
   }
@@ -189,6 +202,22 @@ resource "helm_release" "flyte" {
   }
   set {
     name  = "flyteadmin.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.cluster_name}-s3-access"
+  }
+  set {
+    name  = "flytepropeller.serviceAccount.name"
+    value = "flytepropeller"
+  }
+  set {
+    name  = "flytepropeller.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.cluster_name}-s3-access"
+  }
+  set {
+    name  = "datacatalog.serviceAccount.name"
+    value = "datacatalog"
+  }
+  set {
+    name  = "datacatalog.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
     value = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.cluster_name}-s3-access"
   }
   set {
