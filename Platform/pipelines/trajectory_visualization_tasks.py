@@ -30,7 +30,7 @@ def export_trajectory_report(
     dataset_manifest: FlyteFile,
     overlay_manifest: FlyteFile,
     selection_manifest: Optional[FlyteFile] = None,
-    scene_uids: List[str] = [],
+    scene_uids: Optional[List[str]] = None,
     seed_index: int = 0,
     camera_index: int = 0,
     max_frames_per_scene: int = 300,

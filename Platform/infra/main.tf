@@ -60,12 +60,20 @@ module "training_operator" {
   depends_on = [module.eks]
 }
 
+module "kuberay" {
+  source = "./modules/kuberay"
+
+  cluster_name = var.cluster_name
+
+  depends_on = [module.eks]
+}
+
 module "kueue" {
   source = "./modules/kueue"
 
   cluster_name = var.cluster_name
 
-  depends_on = [module.training_operator]
+  depends_on = [module.training_operator, module.kuberay]
 }
 
 module "mlflow" {
@@ -158,6 +166,10 @@ output "codebuild_project" {
 
 output "overlay_launch_project" {
   value = module.codebuild.overlay_launch_project
+}
+
+output "occupancy_publish_project" {
+  value = module.codebuild.occupancy_publish_project
 }
 
 # --- UI Exposure: CloudFront + VPC Origin → Internal NLB (K8s managed) ---

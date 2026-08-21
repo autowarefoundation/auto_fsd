@@ -232,10 +232,10 @@ aws codebuild start-build \
 ```
 
 The commit-derived tag keeps active workflows that still reference `latest`
-unchanged. Registration and launch resolve the selected `training`, `eval`,
-`offline-rl`, and `data-prep` tags to ECR digests. The launcher also recomputes
-the preprocessing and inference source digests inside the source bundle; Flyte
-tasks reject any mismatch at runtime.
+unchanged. Registration resolves the selected `training`, `eval`, `offline-rl`,
+`data-prep`, and `bevformer-v2` tags to ECR digests. The launcher also
+recomputes the preprocessing and inference source digests inside the source
+bundle; Flyte tasks reject any mismatch at runtime.
 
 ### Launch the one-episode smoke
 
@@ -373,6 +373,104 @@ inputs. It is cached by immutable input URI and report schema.
 
 ---
 
+## Use case I — "I want to publish the KITScenes occupancy models"
+
+**You are**: a platform operator publishing the pinned native AutoE2E
+segmentation and official BEVFormer V2 detection footprints for the Occupancy
+Dashboard.
+
+Use only the VPC-local CodeBuild project
+`auto-e2e-platform-occupancy-publish`. Its launcher submits these two workflows:
+
+- `wf_precompute_semantic_occupancy`
+- `wf_precompute_bevformer_v2_occupancy`
+
+The production recipe is fixed to these inputs:
+
+| Input | Required identity |
+|------|-------------------|
+| AutoE2E checkpoint | `e41978b037986bc874ec9eec0aebf732c096ae5bfa64cee9c5fb3a4168e87a01` |
+| BEVFormer V2 weight | `5585bc4d3ff8b396928cb92d91f773a2c57a81258f83cab0c668ebb2eb9d3307` |
+| KITScenes v3.3 manifest | `31faf5d2ceef17522f1c79e6ab31558a2aceb6f75043a130d1f6b7da3ce6211d` |
+| BEVFormer score threshold | `0.2` |
+
+### Stage the official weight once
+
+Download `epoch_24.pth` from the official BEVFormer V2 release linked in the
+model provenance. Verify it locally, then create the canonical checkpoint
+object without replacing an existing object:
+
+```bash
+export AWS_PROFILE=autowarefoundation
+export AWS_REGION=us-west-2
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+CHECKPOINTS_BUCKET="auto-e2e-platform-checkpoints-${ACCOUNT_ID}"
+BEVFORMER_SHA=5585bc4d3ff8b396928cb92d91f773a2c57a81258f83cab0c668ebb2eb9d3307
+BEVFORMER_KEY="external/bevformer-v2/${BEVFORMER_SHA}/epoch_24.pth"
+
+test "$(shasum -a 256 /path/to/epoch_24.pth | cut -d' ' -f1)" = \
+  "${BEVFORMER_SHA}"
+aws s3api put-object \
+  --bucket "${CHECKPOINTS_BUCKET}" \
+  --key "${BEVFORMER_KEY}" \
+  --body /path/to/epoch_24.pth \
+  --if-none-match '*' \
+  --metadata "sha256=${BEVFORMER_SHA}"
+```
+
+If the conditional upload reports that the object exists, use `head-object` and
+verify it independently. Do not overwrite the canonical key.
+
+### Build, register, and launch
+
+Apply the tested Terraform first so the ECR repository and dedicated CodeBuild
+project exist. Then archive the exact tested commit and build all five runtime
+images as in Use case G:
+
+```bash
+REPOSITORY_REVISION=$(git rev-parse HEAD)
+IMAGE_TAG="occupancy-${REPOSITORY_REVISION:0:12}"
+CACHE_BUCKET="auto-e2e-platform-codebuild-cache-${ACCOUNT_ID}"
+PUBLICATION_TIMESTAMP=2026-08-20T00:00:00Z
+
+git archive --format=zip --output=/tmp/auto-e2e-source.zip HEAD
+aws s3 cp /tmp/auto-e2e-source.zip "s3://${CACHE_BUCKET}/source.zip"
+
+aws codebuild start-build \
+  --project-name auto-e2e-platform-build-images \
+  --environment-variables-override \
+    "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT"
+
+# Wait for the image build to reach SUCCEEDED before continuing.
+aws codebuild start-build \
+  --project-name auto-e2e-platform-flyte-register \
+  --environment-variables-override \
+    "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT"
+
+# Wait for registration to reach SUCCEEDED before continuing.
+aws codebuild start-build \
+  --project-name auto-e2e-platform-occupancy-publish \
+  --environment-variables-override \
+    "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
+    "name=PUBLICATION_TIMESTAMP,value=${PUBLICATION_TIMESTAMP},type=PLAINTEXT" \
+    "name=REPOSITORY_REVISION,value=${REPOSITORY_REVISION},type=PLAINTEXT"
+```
+
+Wait for each CodeBuild invocation to succeed before starting the next one.
+The publication launcher downloads and verifies both checkpoints and the
+published manifest before resolving all five ECR tags to immutable digests.
+
+A successful publication CodeBuild run means both remote executions were
+submitted. In Flyte Console, wait for both occupancy workflows to succeed.
+Their outputs report the immutable manifest key, manifest SHA-256, checkpoint
+SHA-256, shard count, and sample count. The Dashboard advertises a model only
+after its schema-v2 manifest is present.
+
+Keep `PUBLICATION_TIMESTAMP` unchanged when retrying the same recipe. Changing
+it would produce conflicting bytes at the recipe-stable manifest key.
+
+---
+
 ## Reading the DAG of `wf_full_pipeline`
 
 ```
@@ -424,6 +522,7 @@ n1 data_processing(L2D)    n3 data_processing(NVIDIA) ← run in parallel
 | Publish existing shards only | `wf_publish_dataset_snapshot` | `shards`, `published_dataset`, `dataset_version` |
 | Precompute an already identified snapshot | `wf_precompute_overlays` | `shards`, model version, dataset manifest digest |
 | Export an overlay shard as MP4 | `wf_export_trajectory_report` | matching immutable `shard`, `overlay`, dataset-manifest, and overlay-manifest URIs |
+| Publish KITScenes occupancy models | `wf_precompute_semantic_occupancy`, `wf_precompute_bevformer_v2_occupancy` | ops-only CodeBuild launch, pinned checkpoints and manifest |
 | Train IL from existing shards | `wf_train_il` | `shards` list, `dataset` |
 | Refine with Offline RL | `wf_train_offline_rl` | `pretrained`, `il_metadata`, `shards` |
 | See metrics | (MLflow, not Flyte) | experiment `imitation-learning` / `offline-rl` |
