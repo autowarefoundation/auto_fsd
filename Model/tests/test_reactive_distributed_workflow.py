@@ -138,6 +138,11 @@ def test_four_rank_performance_capacity_matches_ray_contract():
     assert "capacityReservationSelectorTerms" not in node_classes[
         "auto-e2e-gpu-performance-ondemand"
     ]["spec"]
+    training_class = node_classes["auto-e2e-gpu-training"]["spec"]
+    assert training_class["capacityReservationSelectorTerms"] == [{
+        "ownerID": "REPLACE_WITH_AWS_ACCOUNT_ID",
+        "tags": {"Name": "auto-e2e-distributed-training"},
+    }]
 
     node_pools = {
         item["metadata"]["name"]: item
@@ -167,6 +172,23 @@ def test_four_rank_performance_capacity_matches_ray_contract():
         "g6.2xlarge"
     ]
     assert requirements["karpenter.sh/capacity-type"] == ["reserved"]
+    training_pool = node_pools["gpu-training"]["spec"]
+    assert training_pool["template"]["spec"]["nodeClassRef"]["name"] == (
+        "auto-e2e-gpu-training"
+    )
+    training_requirements = {
+        item["key"]: item["values"]
+        for item in training_pool["template"]["spec"]["requirements"]
+    }
+    assert training_requirements["karpenter.sh/capacity-type"] == [
+        "reserved"
+    ]
+    assert training_pool["limits"] == {
+        "cpu": "64",
+        "memory": "512Gi",
+        "nodes": "4",
+        "nvidia.com/gpu": "4",
+    }
 
     queue_objects = {
         (
@@ -206,7 +228,37 @@ def test_four_rank_performance_capacity_matches_ray_contract():
         "karpenter-nodepools/gpu-nodepool.yaml"
     )
     assert render_index < node_pool_index
+    assert "kueue-config/kueue-objects.yaml" in deploy_script
+    assert "nodepool/gpu-performance-reserved" in deploy_script
     assert re.search(r"\b[0-9]{12}\b", deploy_script) is None
+    for relative_path in re.findall(
+        r"\.\./k8s/[A-Za-z0-9_./-]+\.yaml",
+        deploy_script,
+    ):
+        assert (
+            platform_root
+            / "infra"
+            / relative_path
+        ).resolve().is_file()
+
+
+def test_reactive_ray_cpu_contract_has_one_source_of_truth():
+    for config in (
+        distributed_training.RAY_2,
+        distributed_training.RAY_REACTIVE_4,
+        distributed_training.RAY_8,
+    ):
+        worker = config.worker_node_config[0]
+        cpu = worker.ray_start_params["num-cpus"]
+        resources = (
+            worker.pod_template.pod_spec
+            .containers[0].resources
+        )
+        assert resources.requests["cpu"] == cpu
+        assert resources.limits["cpu"] == cpu
+        assert int(cpu) == distributed_training._reactive_worker_cpus(
+            worker.replicas
+        )
 
 
 def test_ray_tasks_serialize_the_resolved_storage_path():
@@ -233,8 +285,11 @@ def test_ray_tasks_serialize_the_resolved_storage_path():
 
 
 def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
-    stage_a, stage_b = (
+    overfit, stage_a, stage_b = (
         distributed_training.wf_train_reactive_nuplan_l2d_ray_8.nodes
+    )
+    assert overfit.flyte_entity.name.endswith(
+        "train_reactive_stage_ray_4"
     )
     assert stage_a.flyte_entity.name.endswith(
         "train_reactive_stage_ray_8"
@@ -256,6 +311,9 @@ def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
     assert stage_b_bindings["stage"].scalar.primitive.string_value == (
         "l2d_continuation"
     )
+    gate_promise = stage_a_bindings["gate_metadata"].promise
+    assert gate_promise.node_id == overfit.id
+    assert gate_promise.var == "metadata"
     parent_promise = stage_b_bindings["parent_checkpoint"].promise
     assert parent_promise.node_id == stage_a.id
     assert parent_promise.var == "checkpoint"
@@ -362,6 +420,17 @@ def test_bev_overfit_gate_validates_final_evidence(tmp_path):
     ) == "b" * 64
 
 
+def test_bev_overfit_gate_accepts_128_sample_evidence(tmp_path):
+    metadata = _bev_overfit_gate_metadata(
+        tmp_path,
+        overfit_sample_count=128,
+    )
+
+    assert distributed_training._validated_bev_overfit_gate_dataset(
+        metadata
+    ) == "b" * 64
+
+
 @pytest.mark.parametrize(
     ("override_name", "override_value", "match"),
     [
@@ -426,6 +495,14 @@ def test_bev_overfit_gate_rejects_unit_weights_and_history_tampering(
 def test_four_rank_full_task_rejects_direct_ungated_call():
     with pytest.raises(ValueError, match="requires BEV overfit gate"):
         distributed_training.train_reactive_stage_ray_4.task_function(
+            shards=[],
+            stage="nuplan_full",
+        )
+
+
+def test_eight_rank_stage_a_rejects_direct_ungated_call():
+    with pytest.raises(ValueError, match="requires BEV overfit gate"):
+        distributed_training.train_reactive_stage_ray_8.task_function(
             shards=[],
             stage="nuplan_full",
         )
@@ -566,12 +643,16 @@ def test_canary_gate_requires_loss_decrease_and_stage_b_bev_off(tmp_path):
                 **common,
                 **stage_a_metrics,
                 "train_bev_segmentation": 0.5,
+                "train_bev_segmentation_bce": 0.6,
+                "train_bev_segmentation_dice": 0.4,
                 "train_total": 1.7,
             },
             {
                 **common,
                 **stage_a_metrics,
                 "train_bev_segmentation": 0.4,
+                "train_bev_segmentation_bce": 0.5,
+                "train_bev_segmentation_dice": 0.3,
                 "train_total": 1.5,
             },
         ],
@@ -582,11 +663,15 @@ def test_canary_gate_requires_loss_decrease_and_stage_b_bev_off(tmp_path):
             {
                 **common,
                 "train_bev_segmentation": 0.0,
+                "train_bev_segmentation_bce": 0.0,
+                "train_bev_segmentation_dice": 0.0,
                 "train_total": 1.2,
             },
             {
                 **common,
                 "train_bev_segmentation": 0.0,
+                "train_bev_segmentation_bce": 0.0,
+                "train_bev_segmentation_dice": 0.0,
                 "train_total": 1.1,
             },
         ],
