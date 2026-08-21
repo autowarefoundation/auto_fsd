@@ -20,6 +20,7 @@ phases:
       - (docker pull ${ECR_URL}/auto-e2e/training:latest || true) &
       - (docker pull ${ECR_URL}/auto-e2e/data-prep:latest || true) &
       - (docker pull ${ECR_URL}/auto-e2e/bevformer-v2:latest || true) &
+      - (docker pull ${ECR_URL}/auto-e2e/henet:latest || true) &
       - wait
   build:
     commands:
@@ -57,6 +58,16 @@ phases:
           -t ${ECR_URL}/auto-e2e/bevformer-v2:${IMAGE_TAG}
           -f Platform/docker/bevformer-v2/Dockerfile .
 
+      # ── HENet ── independent CUDA 11.8 runtime for the official BEV
+      # segmentation checkpoint. Its OpenMMLab toolchain is incompatible with
+      # both the shared training image and the BEVFormer legacy runtime.
+      - echo "=== Building HENet occupancy image ==="
+      - DOCKER_BUILDKIT=1 docker build
+          --cache-from ${ECR_URL}/auto-e2e/henet:latest
+          --build-arg BUILDKIT_INLINE_CACHE=1
+          -t ${ECR_URL}/auto-e2e/henet:${IMAGE_TAG}
+          -f Platform/docker/henet/Dockerfile .
+
       # ── Push ALL images in parallel now that every image is built. ECR dedups
       # blobs so the training/eval/offline-rl push is paid once, and data-prep
       # ships in parallel — much faster than the old sequential push.
@@ -72,6 +83,8 @@ phases:
         PID_D=$!
         docker push ${ECR_URL}/auto-e2e/bevformer-v2:${IMAGE_TAG} &
         PID_B=$!
+        docker push ${ECR_URL}/auto-e2e/henet:${IMAGE_TAG} &
+        PID_H=$!
         # wait -n was returning early on some CodeBuild agents; wait on each PID
         # explicitly so a push failure is surfaced.
         wait $PID_T && echo "training pushed" || exit 1
@@ -79,6 +92,7 @@ phases:
         wait $PID_O && echo "offline-rl pushed" || exit 1
         wait $PID_D && echo "data-prep pushed" || exit 1
         wait $PID_B && echo "bevformer-v2 pushed" || exit 1
+        wait $PID_H && echo "henet pushed" || exit 1
 
 cache:
   paths:
