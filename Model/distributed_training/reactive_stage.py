@@ -1216,8 +1216,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         validation_sample_uid_sha256 = hashlib.sha256(
             "\n".join(global_validation_uids).encode("utf-8")
         ).hexdigest()
-    bev_pos_weights = (1.0,) * 8
-    bev_repeat_factors = (1,) * 8
+    bev_pos_weights: tuple[float, ...] = (1.0,) * 8
+    bev_repeat_factors: tuple[int, ...] = (1,) * 8
     bev_repeat_policy = None
     raw_bev_statistics = None
     effective_bev_statistics = None
