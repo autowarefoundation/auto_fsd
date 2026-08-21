@@ -200,6 +200,7 @@ def load_stage_a_parent(
         "enable_world_model": False,
         "enable_reasoning": False,
         "planner_mode": "gru",
+        "bev_taxonomy_version": "bev_segmentation_v2",
     }
     mismatches = {
         key: (config.get(key), expected)
@@ -209,6 +210,27 @@ def load_stage_a_parent(
     if mismatches:
         raise ValueError(
             f"Stage A parent checkpoint contract differs: {mismatches}"
+        )
+    pos_weights = np.asarray(
+        config.get("bev_pos_weights", ()),
+        dtype=np.float64,
+    )
+    repeat_factors = np.asarray(
+        config.get("bev_repeat_factors", ()),
+        dtype=np.float64,
+    )
+    class_count = len(BEV_SEGMENTATION_CLASSES)
+    if (
+        pos_weights.shape != (class_count,)
+        or not np.isfinite(pos_weights).all()
+        or np.any(pos_weights < 1.0)
+        or repeat_factors.shape != (class_count,)
+        or not np.isfinite(repeat_factors).all()
+        or np.any(repeat_factors < 1.0)
+        or np.any(repeat_factors != np.floor(repeat_factors))
+    ):
+        raise ValueError(
+            "Stage A parent checkpoint lacks valid BEV weighting evidence"
         )
     state_dict = payload.get("model_state_dict")
     if not isinstance(state_dict, Mapping):
