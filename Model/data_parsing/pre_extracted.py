@@ -27,6 +27,7 @@ import functools
 import hashlib
 import io
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ _HIST_KEY_RE = re.compile(r"^hist_(\d+)_cam_(\d+)\.jpg$")
 _FUT_KEY_RE = re.compile(r"^fut_(\d+)_cam_(\d+)\.jpg$")
 
 NAVIGATION_REPEAT_POLICY_VERSION = "navigation_repeat_v1"
+BEV_CLASS_REPEAT_POLICY_VERSION = "bev_class_repeat_v1"
 _DECISIVE_ROUTE_MANEUVERS = frozenset({
     "left",
     "right",
@@ -308,6 +310,350 @@ def discover_navigation_exposure(
         junction_exposure_counts=junction_exposure,
         exposure_digest=hashlib.sha256(digest_payload).hexdigest(),
     )
+
+
+@dataclass(frozen=True)
+class BEVTrainingStatistics:
+    """Exact train-split class counts from packed BEV metadata."""
+
+    sample_count: int
+    effective_exposure_count: int
+    positive_sample_count: tuple[int, ...]
+    positive_cell_count: tuple[int, ...]
+    positive_mass: tuple[float, ...]
+    valid_cell_count: tuple[int, ...]
+    exposure_digest: str
+
+    def __post_init__(self) -> None:
+        from data_processing.reactive_training_artifacts import (
+            BEV_SEGMENTATION_CLASSES,
+        )
+
+        class_count = len(BEV_SEGMENTATION_CLASSES)
+        vectors = (
+            self.positive_sample_count,
+            self.positive_cell_count,
+            self.positive_mass,
+            self.valid_cell_count,
+        )
+        if (
+            self.sample_count <= 0
+            or self.effective_exposure_count < self.sample_count
+            or any(len(vector) != class_count for vector in vectors)
+        ):
+            raise ValueError("BEV training statistics have invalid shape")
+        if (
+            any(value < 0 for value in self.positive_sample_count)
+            or any(value < 0 for value in self.positive_cell_count)
+            or any(value < 0.0 for value in self.positive_mass)
+            or any(value < 0 for value in self.valid_cell_count)
+            or any(
+                positive > valid
+                for positive, valid in zip(
+                    self.positive_cell_count,
+                    self.valid_cell_count,
+                )
+            )
+            or any(
+                positive > valid + 1e-6
+                for positive, valid in zip(
+                    self.positive_mass,
+                    self.valid_cell_count,
+                )
+            )
+            or len(self.exposure_digest) != 64
+        ):
+            raise ValueError("BEV training statistics are inconsistent")
+
+    def metadata(self) -> dict[str, object]:
+        from data_processing.reactive_training_artifacts import (
+            BEV_SEGMENTATION_CLASSES,
+        )
+
+        return {
+            "classes": list(BEV_SEGMENTATION_CLASSES),
+            "effective_exposure_count": self.effective_exposure_count,
+            "exposure_digest": self.exposure_digest,
+            "positive_cell_count": list(self.positive_cell_count),
+            "positive_mass": list(self.positive_mass),
+            "positive_sample_count": list(self.positive_sample_count),
+            "sample_count": self.sample_count,
+            "valid_cell_count": list(self.valid_cell_count),
+        }
+
+
+def _is_validation_group(group_uid: str, val_fraction: float) -> bool:
+    if not group_uid:
+        raise ValueError("split_group_uid must not be empty")
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be between zero and one")
+    buckets = 10
+    val_buckets = max(1, min(
+        buckets - 1,
+        round(val_fraction * buckets),
+    ))
+    return _split_bucket(group_uid, buckets) < val_buckets
+
+
+def discover_bev_training_statistics(
+    shard_dirs: Sequence[str | Path],
+    *,
+    val_fraction: float,
+    repeat_factors: Sequence[int] | None = None,
+) -> BEVTrainingStatistics:
+    """Scan only sample and BEV-stat JSON members for exact train counts."""
+    import tarfile
+
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_CLASSES,
+        BEV_SEGMENTATION_STATS_MEMBER,
+        decode_bev_segmentation_stats,
+    )
+
+    roots = [Path(shard_dir) for shard_dir in shard_dirs]
+    if not roots:
+        raise ValueError("at least one shard directory is required")
+    class_count = len(BEV_SEGMENTATION_CLASSES)
+    factors = (
+        tuple(int(value) for value in repeat_factors)
+        if repeat_factors is not None
+        else (1,) * class_count
+    )
+    if (
+        len(factors) != class_count
+        or any(value < 1 for value in factors)
+    ):
+        raise ValueError("BEV repeat factors must be positive per class")
+
+    records: dict[str, dict[str, object]] = {}
+    stats_suffix = f".{BEV_SEGMENTATION_STATS_MEMBER}"
+    for root in roots:
+        tarfiles = sorted(root.glob("*.tar"))
+        if not tarfiles:
+            raise FileNotFoundError(f"No .tar shards found in {root}")
+        for tar_path in tarfiles:
+            with tarfile.open(tar_path, "r:*") as archive:
+                for member in archive:
+                    if not member.isfile():
+                        continue
+                    if member.name.endswith(stats_suffix):
+                        sample_uid = member.name.removesuffix(stats_suffix)
+                        record_key = "stats"
+                    elif member.name.endswith(".meta.json"):
+                        sample_uid = member.name.removesuffix(".meta.json")
+                        record_key = "sample"
+                    else:
+                        continue
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise ValueError(
+                            f"could not read {member.name} from {tar_path}"
+                        )
+                    record = records.setdefault(sample_uid, {})
+                    if record_key in record:
+                        raise ValueError(
+                            f"duplicate {member.name} for {sample_uid!r}"
+                        )
+                    payload = extracted.read()
+                    record[record_key] = (
+                        decode_bev_segmentation_stats(payload)
+                        if record_key == "stats"
+                        else _json_mapping(
+                            payload,
+                            member_name=f"{member.name} in {tar_path}",
+                        )
+                    )
+
+    positive_samples = np.zeros(class_count, dtype=np.int64)
+    positive_cells = np.zeros(class_count, dtype=np.int64)
+    positive_mass = np.zeros(class_count, dtype=np.float64)
+    valid_cells = np.zeros(class_count, dtype=np.int64)
+    exposure_records: list[tuple[str, int]] = []
+    for sample_uid, record in sorted(records.items()):
+        if set(record) != {"sample", "stats"}:
+            raise ValueError(
+                f"sample {sample_uid!r} lacks metadata or BEV statistics"
+            )
+        sample_metadata = record["sample"]
+        if not isinstance(sample_metadata, Mapping):
+            raise ValueError("sample metadata must be an object")
+        if sample_metadata.get("sample_uid") != sample_uid:
+            raise ValueError(
+                f"sample metadata UID differs for {sample_uid!r}"
+            )
+        group_uid = sample_metadata.get("split_group_uid")
+        if not isinstance(group_uid, str) or not group_uid:
+            raise ValueError(
+                f"sample {sample_uid!r} has no split_group_uid"
+            )
+        if _is_validation_group(group_uid, val_fraction):
+            continue
+        sample_stats = record["stats"]
+        if not isinstance(sample_stats, Mapping):
+            raise ValueError("BEV sample statistics must be a mapping")
+        sample_positive_cells = np.asarray(
+            sample_stats["positive_cell_count"],
+            dtype=np.int64,
+        )
+        sample_positive_mass = np.asarray(
+            sample_stats["positive_mass"],
+            dtype=np.float64,
+        )
+        sample_valid_cells = np.asarray(
+            sample_stats["valid_cell_count"],
+            dtype=np.int64,
+        )
+        present = sample_positive_cells > 0
+        repeat = max(
+            (
+                factors[index]
+                for index in np.flatnonzero(present)
+            ),
+            default=1,
+        )
+        positive_samples += present.astype(np.int64) * repeat
+        positive_cells += sample_positive_cells * repeat
+        positive_mass += sample_positive_mass * repeat
+        valid_cells += sample_valid_cells * repeat
+        exposure_records.append((sample_uid, repeat))
+
+    if not exposure_records:
+        raise ValueError("BEV statistics selected no training samples")
+    digest_payload = "".join(
+        f"{sample_uid}\t{repeat}\n"
+        for sample_uid, repeat in exposure_records
+    ).encode("utf-8")
+    return BEVTrainingStatistics(
+        sample_count=len(exposure_records),
+        effective_exposure_count=sum(
+            repeat for _, repeat in exposure_records
+        ),
+        positive_sample_count=tuple(
+            int(value) for value in positive_samples
+        ),
+        positive_cell_count=tuple(
+            int(value) for value in positive_cells
+        ),
+        positive_mass=tuple(float(value) for value in positive_mass),
+        valid_cell_count=tuple(int(value) for value in valid_cells),
+        exposure_digest=hashlib.sha256(digest_payload).hexdigest(),
+    )
+
+
+def derive_bev_repeat_factors(
+    statistics: BEVTrainingStatistics,
+    *,
+    frequency_threshold: float = 0.05,
+    max_repeat: int = 4,
+) -> tuple[int, ...]:
+    """Return deterministic integer repeat factors using repeat sampling."""
+    if not 0.0 < frequency_threshold <= 1.0:
+        raise ValueError("BEV repeat frequency threshold must be in (0,1]")
+    if max_repeat < 1:
+        raise ValueError("BEV max repeat must be positive")
+    factors = []
+    for positive_samples in statistics.positive_sample_count:
+        if positive_samples <= 0:
+            raise ValueError("every BEV class needs a positive train sample")
+        frequency = positive_samples / statistics.sample_count
+        repeat = math.ceil(math.sqrt(frequency_threshold / frequency))
+        factors.append(max(1, min(max_repeat, repeat)))
+    return tuple(factors)
+
+
+def derive_bev_pos_weights(
+    statistics: BEVTrainingStatistics,
+    *,
+    max_weight: float = 64.0,
+    min_positive_samples: int = 1,
+    min_positive_cells: int = 1,
+) -> tuple[float, ...]:
+    """Derive clipped BCE positive weights from effective valid-cell mass."""
+    if max_weight < 1.0:
+        raise ValueError("BEV maximum positive weight must be at least one")
+    if min_positive_samples <= 0 or min_positive_cells <= 0:
+        raise ValueError("BEV minimum support must be positive")
+    weights = []
+    for class_index, (
+        sample_count,
+        cell_count,
+        positive_mass,
+        valid_count,
+    ) in enumerate(zip(
+        statistics.positive_sample_count,
+        statistics.positive_cell_count,
+        statistics.positive_mass,
+        statistics.valid_cell_count,
+    )):
+        if (
+            sample_count < min_positive_samples
+            or cell_count < min_positive_cells
+            or positive_mass <= 0.0
+        ):
+            raise ValueError(
+                "BEV class has insufficient positive support: "
+                f"class_index={class_index} samples={sample_count} "
+                f"cells={cell_count}"
+            )
+        negative_mass = valid_count - positive_mass
+        ratio = negative_mass / positive_mass
+        weights.append(float(np.clip(ratio, 1.0, max_weight)))
+    return tuple(weights)
+
+
+@dataclass(frozen=True)
+class BEVClassRepeatPolicy:
+    """Repeat rare-positive samples before decode with importance evidence."""
+
+    repeat_factors: tuple[int, ...]
+    mean_repeat: float
+    version: str = BEV_CLASS_REPEAT_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        from data_processing.reactive_training_artifacts import (
+            BEV_SEGMENTATION_CLASSES,
+        )
+
+        if (
+            self.version != BEV_CLASS_REPEAT_POLICY_VERSION
+            or len(self.repeat_factors) != len(BEV_SEGMENTATION_CLASSES)
+            or any(value < 1 for value in self.repeat_factors)
+            or not math.isfinite(self.mean_repeat)
+            or self.mean_repeat < 1.0
+        ):
+            raise ValueError("invalid BEV class repeat policy")
+
+    def repeat_count(self, sample: Mapping[str, object]) -> int:
+        from data_processing.reactive_training_artifacts import (
+            BEV_SEGMENTATION_STATS_MEMBER,
+            decode_bev_segmentation_stats,
+        )
+
+        payload = sample.get(BEV_SEGMENTATION_STATS_MEMBER)
+        if not isinstance(payload, (bytes, bytearray)):
+            raise ValueError("sample lacks packed BEV statistics")
+        stats = decode_bev_segmentation_stats(bytes(payload))
+        present = stats["positive_cell_count"] > 0
+        return max(
+            (
+                self.repeat_factors[index]
+                for index in np.flatnonzero(present)
+            ),
+            default=1,
+        )
+
+    def __call__(self, source: Iterable[dict]):
+        for sample in source:
+            repeat = self.repeat_count(sample)
+            enriched = {
+                **sample,
+                "__bev_repeat_factor__": repeat,
+                "__bev_sampling_importance__": (
+                    self.mean_repeat / repeat
+                ),
+            }
+            for _ in range(repeat):
+                yield enriched
 
 
 def _decode_image(data) -> torch.Tensor:
@@ -700,6 +1046,14 @@ def _decode_sample(
         "bev_segmentation_target": bev_segmentation_target,
         "bev_segmentation_valid": bev_segmentation_valid,
         "bev_segmentation_available": bev_segmentation_available,
+        "bev_repeat_factor": torch.tensor(
+            int(sample.get("__bev_repeat_factor__", 1)),
+            dtype=torch.int64,
+        ),
+        "bev_sampling_importance": torch.tensor(
+            float(sample.get("__bev_sampling_importance__", 1.0)),
+            dtype=torch.float32,
+        ),
     }
     if camera_projection_matrix is not None:
         out["camera_projection_matrix"] = camera_projection_matrix
@@ -1236,6 +1590,7 @@ def make_pre_extracted_loader(
     decode_history_frames: bool = True,
     decode_future_frames: bool = True,
     navigation_repeat_policy: NavigationRepeatPolicy | None = None,
+    bev_repeat_policy: BEVClassRepeatPolicy | None = None,
     nodesplitter=None,
 ) -> wds.WebLoader:
     """Create a WebDataset DataLoader reading from local EBS shard cache.
@@ -1275,6 +1630,8 @@ def make_pre_extracted_loader(
             input batch; training keeps the default because JEPA needs them.
         navigation_repeat_policy: optional raw-sample repeat transform. Training
             applies it after split filtering and before shuffle/decode.
+        bev_repeat_policy: optional BEV rare-class repeat transform. It is
+            mutually exclusive with navigation repetition and train-only.
         nodesplitter: optional WebDataset node splitter. Distributed callers
             with explicit rank-owned shards use ``passthrough_nodesplitter``;
             the default rejects accidental multi-node iteration.
@@ -1342,6 +1699,16 @@ def make_pre_extracted_loader(
                 "navigation repeat policy is valid only for the train split"
             )
         dataset = dataset.compose(navigation_repeat_policy)
+    if bev_repeat_policy is not None:
+        if split != "train":
+            raise ValueError(
+                "BEV repeat policy is valid only for the train split"
+            )
+        if navigation_repeat_policy is not None:
+            raise ValueError(
+                "BEV and navigation repeat policies cannot be combined"
+            )
+        dataset = dataset.compose(bev_repeat_policy)
     if shuffle > 0:
         dataset = dataset.shuffle(shuffle, seed=shuffle_seed)
     # Frame-pool accessor for deduped WM windows (#121 §3.4d): a sibling pool/ dir
@@ -1525,6 +1892,7 @@ def make_multi_dataset_loader(
     decode_history_frames: bool = True,
     decode_future_frames: bool = True,
     navigation_repeat_policy: NavigationRepeatPolicy | None = None,
+    bev_repeat_policy: BEVClassRepeatPolicy | None = None,
     nodesplitter=None,
 ) -> MergedDatasetLoader:
     """Build a :class:`MergedDatasetLoader` over several shard directories.
@@ -1574,6 +1942,7 @@ def make_multi_dataset_loader(
             decode_history_frames=decode_history_frames,
             decode_future_frames=decode_future_frames,
             navigation_repeat_policy=navigation_repeat_policy,
+            bev_repeat_policy=bev_repeat_policy,
             nodesplitter=nodesplitter,
         )
         for index, d in enumerate(shard_dirs)
