@@ -54,7 +54,7 @@ RAY_TASK_ENVIRONMENT = {
     "RAY_TRAIN_V2_ENABLED": "1",
 }
 BEV_OVERFIT_SAMPLE_COUNT = 64
-BEV_OVERFIT_MIN_DYNAMIC_AP = 0.9
+BEV_OVERFIT_MIN_AP = 0.9
 BEV_OVERFIT_MIN_RECALL = 0.9
 
 
@@ -368,7 +368,7 @@ def _run_reactive_stage_task(
     bev_min_positive_samples: int,
     bev_min_positive_cells: int,
     overfit_sample_count: int,
-    overfit_min_dynamic_ap: float,
+    overfit_min_ap: float,
     overfit_min_recall: float,
     required_gate_dataset_manifest_sha256: str = "",
 ) -> ReactiveRayOutput:
@@ -416,7 +416,7 @@ def _run_reactive_stage_task(
         "local_cache_root": "/tmp/auto-e2e-reactive",
         "num_loader_workers": num_loader_workers,
         "num_workers": num_workers,
-        "overfit_min_dynamic_ap": overfit_min_dynamic_ap,
+        "overfit_min_ap": overfit_min_ap,
         "overfit_min_recall": overfit_min_recall,
         "overfit_sample_count": overfit_sample_count,
         "parent_checkpoint_uri": parent_uri,
@@ -508,20 +508,12 @@ def _validated_bev_overfit_gate_dataset(
                 f"BEV overfit gate history disagrees on {name}"
             )
 
-    dynamic_ap = float(metrics.get(
-        "validation_bev_dynamic_macro_average_precision",
-        float("nan"),
-    ))
-    if (
-        not math.isfinite(dynamic_ap)
-        or dynamic_ap < BEV_OVERFIT_MIN_DYNAMIC_AP
-    ):
-        raise ValueError(
-            "BEV overfit gate dynamic average precision is below 0.9"
-        )
-
     pos_weights = []
     for class_index, class_name in enumerate(BEV_SEGMENTATION_CLASSES):
+        average_precision = float(metrics.get(
+            f"validation_bev_{class_name}_average_precision",
+            float("nan"),
+        ))
         recall = float(metrics.get(
             f"validation_bev_{class_name}_recall",
             float("nan"),
@@ -530,6 +522,13 @@ def _validated_bev_overfit_gate_dataset(
             f"validation_bev_{class_name}_positive_cells",
             float("nan"),
         ))
+        if (
+            not math.isfinite(average_precision)
+            or average_precision < BEV_OVERFIT_MIN_AP
+        ):
+            raise ValueError(
+                f"BEV overfit gate average precision failed for {class_name}"
+            )
         if (
             not math.isfinite(recall)
             or recall < BEV_OVERFIT_MIN_RECALL
@@ -773,7 +772,7 @@ def train_reactive_stage_ray_2(
         bev_min_positive_samples=1,
         bev_min_positive_cells=1,
         overfit_sample_count=0,
-        overfit_min_dynamic_ap=0.9,
+        overfit_min_ap=0.9,
         overfit_min_recall=0.9,
     )
 
@@ -810,7 +809,7 @@ def train_reactive_stage_ray_4(
     route_weight: float = 1.0,
     corridor_pos_weight: float = 1.0,
     overfit_sample_count: int = 0,
-    overfit_min_dynamic_ap: float = 0.9,
+    overfit_min_ap: float = 0.9,
     overfit_min_recall: float = 0.9,
 ) -> ReactiveRayOutput:
     """Run a four-rank Reactive performance training stage."""
@@ -857,7 +856,7 @@ def train_reactive_stage_ray_4(
             1 if overfit_sample_count else 2000
         ),
         overfit_sample_count=overfit_sample_count,
-        overfit_min_dynamic_ap=overfit_min_dynamic_ap,
+        overfit_min_ap=overfit_min_ap,
         overfit_min_recall=overfit_min_recall,
         required_gate_dataset_manifest_sha256=required_gate_dataset,
     )
@@ -922,7 +921,7 @@ def train_reactive_stage_ray_8(
         bev_min_positive_samples=20,
         bev_min_positive_cells=2000,
         overfit_sample_count=0,
-        overfit_min_dynamic_ap=0.9,
+        overfit_min_ap=0.9,
         overfit_min_recall=0.9,
     )
 
@@ -960,7 +959,7 @@ def wf_overfit_reactive_nuplan_ray_4(
         bev_weight=1.0,
         route_weight=1.0,
         overfit_sample_count=sample_count,
-        overfit_min_dynamic_ap=BEV_OVERFIT_MIN_DYNAMIC_AP,
+        overfit_min_ap=BEV_OVERFIT_MIN_AP,
         overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
     )
 
@@ -995,7 +994,7 @@ def wf_train_reactive_nuplan_ray_4(
         bev_weight=bev_weight,
         route_weight=route_weight,
         overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
-        overfit_min_dynamic_ap=BEV_OVERFIT_MIN_DYNAMIC_AP,
+        overfit_min_ap=BEV_OVERFIT_MIN_AP,
         overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
     )
     return train_reactive_stage_ray_4(
