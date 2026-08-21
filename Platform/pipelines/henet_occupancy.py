@@ -7,7 +7,6 @@ when producing the Dashboard's 450 x 300 ASOC geometry.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 
 import numpy as np
