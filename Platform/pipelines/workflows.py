@@ -8562,6 +8562,344 @@ def precompute_bevformer_v2_occupancy_artifacts(
     )
 
 
+@task(
+    container_image=HENET_IMAGE,
+    requests=Resources(cpu="4", mem="40Gi", gpu="1"),
+    limits=Resources(cpu="4", mem="40Gi", gpu="1"),
+    pod_template=_large_shm_pod_template(),
+)
+def precompute_henet_occupancy_artifacts(
+    checkpoint: FlyteFile,
+    checkpoint_sha256: str,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    aws_region: str = "us-west-2",
+    repository_path: str = "/opt/HENet",
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish official HENet BEV segmentation for the Occupancy Dashboard."""
+    import hashlib
+    import json
+    import re
+    from pathlib import Path
+
+    import boto3
+    import numpy as np
+    import torch
+
+    from Platform.pipelines.henet_occupancy import (
+        HENET_ARTIFACT_KIND,
+        HENET_CODE_LICENSE_SPDX,
+        HENET_CONFIG_NAME,
+        HENET_HEAD_VERSION,
+        HENET_INPUT_HEIGHT,
+        HENET_INPUT_WIDTH,
+        HENET_LONGTERM_INPUT_HEIGHT,
+        HENET_LONGTERM_INPUT_WIDTH,
+        HENET_LONG_FRAME_OFFSETS,
+        HENET_REPOSITORY,
+        HENET_REVISION,
+        HENET_SHORT_FRAME_OFFSETS,
+        HENET_TRAINING_DATA_LICENSE_SPDX,
+        HENET_WEIGHT_LICENSE_SPDX,
+        HENET_WEIGHT_SOURCE_URL,
+        provenance,
+    )
+    from Platform.pipelines.henet_runtime import (
+        infer_henet_frame,
+        iter_packed_henet_frames,
+        load_official_henet,
+        remember_history_frame,
+        temporal_substitution_count,
+    )
+    from Platform.pipelines.occupancy_store import (
+        encode_occupancy_set_manifest,
+        occupancy_model_artifact_id,
+        occupancy_set_manifest,
+        occupancy_set_s3_key,
+    )
+    from Platform.pipelines.overlay_tasks import _put_s3_immutable
+    from Platform.pipelines.semantic_occupancy import (
+        SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        SEMANTIC_OCCUPANCY_SCHEMA,
+        SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        encode_semantic_occupancy,
+        quantize_semantic_occupancy,
+        semantic_occupancy_s3_key,
+    )
+
+    if dataset != "kitscenes":
+        raise ValueError("HENet occupancy supports only KITScenes")
+    if not re.fullmatch(r"v[1-9][0-9]*\.[0-9]+", dataset_version):
+        raise ValueError("dataset_version must match v<major>.<minor>")
+    for name, value in (
+        ("checkpoint_sha256", checkpoint_sha256),
+        ("dataset_manifest_sha256", dataset_manifest_sha256),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"{name} must be a lowercase SHA-256")
+    for name, value in (
+        ("artifacts_bucket", artifacts_bucket),
+        ("publication_timestamp", publication_timestamp),
+        ("aws_region", aws_region),
+        ("repository_path", repository_path),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+    if not shard_dirs:
+        raise ValueError("shard_dirs must not be empty")
+
+    packed_shards = []
+    seen_shards = set()
+    for shard_directory in shard_dirs:
+        local_directory = Path(shard_directory.download())
+        packed_manifest_path = local_directory / "manifest.json"
+        if not packed_manifest_path.is_file():
+            raise FileNotFoundError(
+                f"packed manifest missing: {local_directory}"
+            )
+        packed_manifest = json.loads(
+            packed_manifest_path.read_text(encoding="utf-8")
+        )
+        packed_dataset_version = packed_manifest.get(
+            "dataset_version",
+            packed_manifest.get("version"),
+        )
+        if (
+            packed_manifest.get("dataset") != dataset
+            or packed_dataset_version != dataset_version
+            or int(packed_manifest.get("num_views", 0)) != 6
+            or not packed_manifest.get("has_gps", False)
+        ):
+            raise ValueError(
+                "packed KITScenes manifest differs from the HENet input "
+                f"contract: {packed_manifest_path}"
+            )
+        for tar_path in sorted(local_directory.glob("*.tar")):
+            if tar_path.name in seen_shards:
+                raise ValueError(
+                    "semantic occupancy shard names are not unique: "
+                    f"{tar_path.name}"
+                )
+            seen_shards.add(tar_path.name)
+            packed_shards.append(tar_path)
+    if not packed_shards:
+        raise ValueError("packed directories contain no tar shards")
+    packed_shards.sort(key=lambda path: path.name)
+
+    model_source = {
+        "code_license_spdx": HENET_CODE_LICENSE_SPDX,
+        "config": HENET_CONFIG_NAME,
+        "license_spdx": HENET_WEIGHT_LICENSE_SPDX,
+        "repository": HENET_REPOSITORY,
+        "repository_revision": HENET_REVISION,
+        "training_data_license_spdx": HENET_TRAINING_DATA_LICENSE_SPDX,
+        "weight_sha256": checkpoint_sha256,
+        "weight_source_url": HENET_WEIGHT_SOURCE_URL,
+    }
+    input_contract = (
+        "kitscenes-packed-256-square-six-camera-to-henet-short-"
+        "640x1152-long-256x704-v1"
+    )
+    producer_config = {
+        "input_height": HENET_INPUT_HEIGHT,
+        "input_width": HENET_INPUT_WIDTH,
+        "longterm_input_height": HENET_LONGTERM_INPUT_HEIGHT,
+        "longterm_input_width": HENET_LONGTERM_INPUT_WIDTH,
+        "probability_encoding": "uint8-rint-gzip-level-6-v1",
+        "random_seed": 0,
+        "short_temporal_frame_offsets": list(HENET_SHORT_FRAME_OFFSETS),
+        "longterm_temporal_frame_offsets": list(HENET_LONG_FRAME_OFFSETS),
+        "temporal_boundary_policy": "repeat-current-frame-v1",
+    }
+    model_artifact_id = occupancy_model_artifact_id(
+        artifact_kind=HENET_ARTIFACT_KIND,
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=HENET_HEAD_VERSION,
+        input_contract=input_contract,
+        model_source=model_source,
+        producer_config=producer_config,
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+    )
+    manifest_key = occupancy_set_s3_key(
+        dataset,
+        dataset_version,
+        model_artifact_id,
+        dataset_manifest_sha256,
+    )
+
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+        torch.backends.cudnn.benchmark = False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = str(checkpoint.download())
+    model = load_official_henet(
+        repository_path=repository_path,
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=checkpoint_sha256,
+        device=device,
+    )
+
+    s3 = boto3.client("s3", region_name=aws_region)
+    entries = []
+    total_samples = 0
+    substituted_history_frames = 0
+    substituted_history_slots = 0
+    history = {}
+    active_episode = None
+    last_frame_index = None
+    for tar_path in packed_shards:
+        sample_uids = []
+        probabilities = []
+        for frame in iter_packed_henet_frames(tar_path):
+            if active_episode != frame.episode_id:
+                history.clear()
+                active_episode = frame.episode_id
+                last_frame_index = None
+            if (
+                last_frame_index is not None
+                and frame.frame_index <= last_frame_index
+            ):
+                raise ValueError(
+                    "packed KITScenes frames are not strictly increasing "
+                    f"within episode {frame.episode_id!r}"
+                )
+            missing_slots = temporal_substitution_count(
+                frame,
+                history,
+                frame_offsets=HENET_SHORT_FRAME_OFFSETS,
+            ) + temporal_substitution_count(
+                frame,
+                history,
+                frame_offsets=HENET_LONG_FRAME_OFFSETS,
+            )
+            if missing_slots:
+                substituted_history_frames += 1
+                substituted_history_slots += missing_slots
+            probability = infer_henet_frame(
+                model,
+                frame,
+                history,
+                device=device,
+            )
+            probabilities.append(quantize_semantic_occupancy(probability))
+            sample_uids.append(frame.sample_uid)
+            remember_history_frame(history, frame)
+            last_frame_index = frame.frame_index
+        if not sample_uids:
+            raise ValueError(f"packed shard is empty: {tar_path}")
+        payload = encode_semantic_occupancy(
+            sample_uids,
+            np.stack(probabilities),
+        )
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        key = semantic_occupancy_s3_key(
+            model_artifact_id,
+            dataset_manifest_sha256,
+            dataset,
+            tar_path.name,
+            head_version=HENET_HEAD_VERSION,
+        )
+        _put_s3_immutable(
+            s3,
+            bucket=artifacts_bucket,
+            key=key,
+            payload=payload,
+            metadata={
+                "artifact-kind": HENET_ARTIFACT_KIND,
+                "dataset-manifest-sha256": dataset_manifest_sha256,
+                "geometry-id": SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+                "head-version": HENET_HEAD_VERSION,
+                "model-artifact-id": model_artifact_id,
+                "payload-sha256": payload_sha256,
+                "sample-count": str(len(sample_uids)),
+                "schema": SEMANTIC_OCCUPANCY_SCHEMA,
+                "taxonomy-version": (
+                    SEMANTIC_OCCUPANCY_TAXONOMY_VERSION
+                ),
+                "weight-sha256": checkpoint_sha256,
+            },
+            content_type="application/vnd.auto-e2e.semantic-occupancy",
+            content_encoding="gzip",
+        )
+        entries.append({
+            "byte_size": len(payload),
+            "sample_count": len(sample_uids),
+            "s3_key": key,
+            "sha256": payload_sha256,
+            "shard": tar_path.name,
+            "teacher_present": False,
+        })
+        total_samples += len(sample_uids)
+
+    metadata = provenance(checkpoint_sha256)
+    limitations = list(metadata["limitations"])
+    limitations.append(
+        "The official weight is supplied at execution time and is not "
+        "redistributed in the AutoE2E container image."
+    )
+    if substituted_history_frames:
+        limitations.append(
+            f"{substituted_history_frames} of {total_samples} frames "
+            f"substituted {substituted_history_slots} unavailable HENet "
+            "history slots with the current frame at scene or packed-sequence "
+            "boundaries."
+        )
+    manifest = occupancy_set_manifest(
+        artifact_kind=HENET_ARTIFACT_KIND,
+        artifact_schema=SEMANTIC_OCCUPANCY_SCHEMA,
+        created_at=publication_timestamp,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        display_name="HENet BEV segmentation",
+        geometry_id=SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+        head_version=HENET_HEAD_VERSION,
+        input_contract=input_contract,
+        limitations=limitations,
+        model_artifact_id=model_artifact_id,
+        model_family="HENet",
+        model_source=model_source,
+        producer_config=producer_config,
+        shards=entries,
+        supported_classes=metadata["supported_semantic_classes"],
+        taxonomy_version=SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+        teacher_available=False,
+    )
+    manifest_payload, manifest_sha256 = encode_occupancy_set_manifest(
+        manifest
+    )
+    _put_s3_immutable(
+        s3,
+        bucket=artifacts_bucket,
+        key=manifest_key,
+        payload=manifest_payload,
+        metadata={
+            "artifact-kind": HENET_ARTIFACT_KIND,
+            "dataset-manifest-sha256": dataset_manifest_sha256,
+            "manifest-sha256": manifest_sha256,
+            "model-artifact-id": model_artifact_id,
+            "sample-count": str(total_samples),
+            "schema": manifest["schema_version"],
+            "weight-sha256": checkpoint_sha256,
+        },
+        content_type="application/json",
+    )
+    return SemanticOccupancyPrecomputeOutput(
+        manifest_key=manifest_key,
+        manifest_sha256=manifest_sha256,
+        checkpoint_sha256=checkpoint_sha256,
+        shard_count=len(entries),
+        sample_count=total_samples,
+    )
+
+
 # ============================================================
 # Task: Offline RL
 # ============================================================
