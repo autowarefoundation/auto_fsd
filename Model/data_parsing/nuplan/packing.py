@@ -40,7 +40,7 @@ NUPLAN_CAMERA_CHANNELS = (
     "CAM_B0",
 )
 NUPLAN_RECTIFICATION_POLICY_VERSION = "nuplan_rectified_pinhole_v1"
-NUPLAN_PACK_MANIFEST_VERSION = "nuplan_reactive_manifest_v1"
+NUPLAN_PACK_MANIFEST_VERSION = "nuplan_reactive_manifest_v2"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -717,7 +717,8 @@ def pack_nuplan_reactive_scenarios(
     }
     manifest: dict[str, object] = {
         "bev_segmentation_count": len(accepted),
-        "bev_taxonomy_version": "bev_segmentation_v1",
+        "bev_statistics_count": len(accepted),
+        "bev_taxonomy_version": "bev_segmentation_v2",
         "camera_order": list(NUPLAN_CAMERA_CHANNELS),
         "contracts": contract_versions(),
         "dataset": "nuplan/nuplan-v1.1",
