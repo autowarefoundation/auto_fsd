@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import random
@@ -88,17 +89,35 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
     override = int(config.get("steps_per_epoch", 0))
     if override < 0:
         raise ValueError("steps_per_epoch cannot be negative")
-    bev_weights = config.get("bev_pos_weights")
-    if (
-        not isinstance(bev_weights, list)
-        or len(bev_weights) != 8
-        or any(
-            not math.isfinite(float(value)) or float(value) <= 0.0
-            for value in bev_weights
-        )
-    ):
+    if "bev_pos_weights" in config:
         raise ValueError(
-            "bev_pos_weights must contain eight positive values"
+            "bev_pos_weights is derived from train statistics and cannot "
+            "be configured"
+        )
+    if float(config.get("bev_pos_weight_cap", 0.0)) < 1.0:
+        raise ValueError("bev_pos_weight_cap must be at least one")
+    repeat_threshold = float(
+        config.get("bev_repeat_frequency_threshold", 0.0)
+    )
+    if not 0.0 < repeat_threshold <= 1.0:
+        raise ValueError(
+            "bev_repeat_frequency_threshold must be in (0,1]"
+        )
+    if int(config.get("bev_max_repeat", 0)) < 1:
+        raise ValueError("bev_max_repeat must be positive")
+    if int(config.get("bev_min_positive_samples", 0)) < 1:
+        raise ValueError("bev_min_positive_samples must be positive")
+    if int(config.get("bev_min_positive_cells", 0)) < 1:
+        raise ValueError("bev_min_positive_cells must be positive")
+    if int(config.get("bev_ap_bins", 0)) < 256:
+        raise ValueError("bev_ap_bins must be at least 256")
+    if float(config.get("selection_ade_scale_m", 0.0)) <= 0.0:
+        raise ValueError("selection_ade_scale_m must be positive")
+    if float(
+        config.get("selection_ade_regression_margin_m", -1.0)
+    ) < 0.0:
+        raise ValueError(
+            "selection_ade_regression_margin_m must be non-negative"
         )
 
 
@@ -146,6 +165,72 @@ def _collective_true(value: bool, device) -> bool:
     )
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
+
+
+def _all_reduce_bev_statistics(local_statistics, device):
+    """Combine exact rank-local BEV counts into one global contract."""
+    import torch
+    import torch.distributed as dist
+
+    from data_parsing.pre_extracted import BEVTrainingStatistics
+
+    packed = torch.tensor(
+        [
+            float(local_statistics.sample_count),
+            float(local_statistics.effective_exposure_count),
+            *local_statistics.positive_sample_count,
+            *local_statistics.positive_cell_count,
+            *local_statistics.positive_mass,
+            *local_statistics.valid_cell_count,
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    class_count = 8
+    offset = 2
+
+    def take(count: int):
+        nonlocal offset
+        values = packed[offset:offset + count]
+        offset += count
+        return values
+
+    positive_samples = take(class_count)
+    positive_cells = take(class_count)
+    positive_mass = take(class_count)
+    valid_cells = take(class_count)
+    rank_digests: list[str | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        rank_digests,
+        local_statistics.exposure_digest,
+    )
+    exposure_digest = hashlib.sha256(
+        "\n".join(
+            f"{rank}:{digest}"
+            for rank, digest in enumerate(rank_digests)
+        ).encode("ascii")
+    ).hexdigest()
+    return BEVTrainingStatistics(
+        sample_count=int(round(float(packed[0].item()))),
+        effective_exposure_count=int(round(float(packed[1].item()))),
+        positive_sample_count=tuple(
+            int(round(float(value)))
+            for value in positive_samples.tolist()
+        ),
+        positive_cell_count=tuple(
+            int(round(float(value)))
+            for value in positive_cells.tolist()
+        ),
+        positive_mass=tuple(
+            float(value) for value in positive_mass.tolist()
+        ),
+        valid_cell_count=tuple(
+            int(round(float(value)))
+            for value in valid_cells.tolist()
+        ),
+        exposure_digest=exposure_digest,
+    )
 
 
 def _parameter_sample(model, *, sample_size: int = 2048):
@@ -434,10 +519,53 @@ def _train_fixed_steps(
     }
 
 
-def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
+def _histogram_average_precision(
+    positive_histogram,
+    negative_histogram,
+) -> float:
+    import torch
+
+    positive_total = positive_histogram.sum()
+    if float(positive_total.item()) <= 0.0:
+        raise ValueError("BEV validation class has no positive cells")
+    cumulative_positive = torch.cumsum(
+        positive_histogram.flip(0),
+        dim=0,
+    )
+    cumulative_negative = torch.cumsum(
+        negative_histogram.flip(0),
+        dim=0,
+    )
+    precision = cumulative_positive / (
+        cumulative_positive + cumulative_negative
+    ).clamp_min(1.0)
+    recall = cumulative_positive / positive_total
+    recall_delta = torch.diff(
+        torch.cat([recall.new_zeros(1), recall])
+    )
+    return float((recall_delta * precision).sum().item())
+
+
+def _metric_ratio(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator) if denominator > 0.0 else 0.0
+
+
+def _evaluate_global_reactive(
+    model,
+    loader,
+    objective,
+    *,
+    stage: ReactiveTrainingStage,
+    device,
+    probability_bins: int,
+    ade_scale_m: float,
+) -> dict[str, float]:
     import torch
     import torch.distributed as dist
 
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_CLASSES,
+    )
     from training.losses.control_rollout import integrate_controls_torch
     from training.reactive_stage_runner import (
         resolve_reactive_batch_projection,
@@ -449,6 +577,20 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
     ade_sum = 0.0
     fde_sum = 0.0
     sample_count = 0
+    class_count = len(BEV_SEGMENTATION_CLASSES)
+    bev_counts = torch.zeros(
+        (class_count, 5),
+        dtype=torch.float64,
+        device=device,
+    )
+    positive_histogram = torch.zeros(
+        (class_count, probability_bins),
+        dtype=torch.float64,
+        device=device,
+    )
+    negative_histogram = torch.zeros_like(positive_histogram)
+    bev_loss_sum = 0.0
+    bev_loss_batches = 0
     try:
         with torch.no_grad():
             for item in loader:
@@ -464,7 +606,7 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
                         device=device,
                     )
                 )
-                controls = base(
+                output = base(
                     batch["visual_tiles"],
                     batch["map_context"],
                     batch["visual_history"],
@@ -475,11 +617,19 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
                     projection=projection,
                     geometry_type=geometry_type,
                     mode="infer",
-                    compute_bev_segmentation=False,
+                    return_auxiliary=(
+                        stage is ReactiveTrainingStage.NUPLAN_FULL
+                    ),
+                    compute_bev_segmentation=(
+                        stage is ReactiveTrainingStage.NUPLAN_FULL
+                    ),
                     compute_route_reconstruction=False,
                 )
-                if isinstance(controls, tuple):
-                    controls = controls[0]
+                if isinstance(output, tuple):
+                    controls, auxiliary = output
+                else:
+                    controls = output
+                    auxiliary = {}
                 batch_size = int(controls.shape[0])
                 controls_3d = controls.reshape(batch_size, -1, 2)
                 finite_controls = torch.isfinite(controls_3d).all(
@@ -516,6 +666,80 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
                 )
                 fde_sum += float(errors[complete, -1].sum().item())
                 sample_count += int(complete.sum().item())
+
+                if stage is ReactiveTrainingStage.NUPLAN_FULL:
+                    bev_logits = auxiliary.get(
+                        "bev_segmentation_logits"
+                    )
+                    if not torch.is_tensor(bev_logits):
+                        raise RuntimeError(
+                            "Stage A validation omitted BEV logits"
+                        )
+                    target = batch["bev_segmentation_target"].to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    valid_mask = batch[
+                        "bev_segmentation_valid"
+                    ].to(device=device, dtype=torch.bool)
+                    if (
+                        target.shape != bev_logits.shape
+                        or valid_mask.shape != bev_logits.shape
+                    ):
+                        raise ValueError(
+                            "BEV validation target shape differs"
+                        )
+                    bev_loss_sum += float(objective.bev_loss(
+                        bev_logits,
+                        target,
+                        valid_mask,
+                    ).item())
+                    bev_loss_batches += 1
+                    probability = bev_logits.float().sigmoid()
+                    binary_target = target >= 0.5
+                    binary_prediction = probability >= 0.5
+                    for class_index in range(class_count):
+                        class_valid = valid_mask[:, class_index]
+                        if not bool(class_valid.any()):
+                            continue
+                        class_target = binary_target[
+                            :, class_index
+                        ][class_valid]
+                        class_prediction = binary_prediction[
+                            :, class_index
+                        ][class_valid]
+                        class_probability = probability[
+                            :, class_index
+                        ][class_valid]
+                        bev_counts[class_index, 0] += (
+                            class_prediction & class_target
+                        ).sum()
+                        bev_counts[class_index, 1] += (
+                            class_prediction & ~class_target
+                        ).sum()
+                        bev_counts[class_index, 2] += (
+                            ~class_prediction & class_target
+                        ).sum()
+                        bev_counts[class_index, 3] += class_target.sum()
+                        bev_counts[class_index, 4] += class_valid.sum()
+                        bins = torch.clamp(
+                            (
+                                class_probability * probability_bins
+                            ).to(torch.int64),
+                            max=probability_bins - 1,
+                        )
+                        positive_histogram[class_index] += (
+                            torch.bincount(
+                                bins[class_target],
+                                minlength=probability_bins,
+                            )
+                        )
+                        negative_histogram[class_index] += (
+                            torch.bincount(
+                                bins[~class_target],
+                                minlength=probability_bins,
+                            )
+                        )
     finally:
         base.train(was_training)
 
@@ -525,16 +749,95 @@ def _evaluate_global_trajectory(model, loader, *, device) -> dict[str, float]:
         device=device,
     )
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    dist.all_reduce(bev_counts, op=dist.ReduceOp.SUM)
+    dist.all_reduce(positive_histogram, op=dist.ReduceOp.SUM)
+    dist.all_reduce(negative_histogram, op=dist.ReduceOp.SUM)
+    bev_loss_values = torch.tensor(
+        [bev_loss_sum, float(bev_loss_batches)],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(bev_loss_values, op=dist.ReduceOp.SUM)
     global_count = int(values[2].item())
     if global_count <= 0:
         raise ValueError(
             "Reactive distributed validation has no complete trajectories"
         )
-    return {
+    metrics = {
         "ade_6p4s_m": float(values[0].item() / global_count),
         "fde_6p4s_m": float(values[1].item() / global_count),
         "complete_samples": float(global_count),
     }
+    trajectory_quality = math.exp(
+        -metrics["ade_6p4s_m"] / ade_scale_m
+    )
+    metrics["trajectory_quality"] = trajectory_quality
+    if stage is not ReactiveTrainingStage.NUPLAN_FULL:
+        metrics["selection_score"] = trajectory_quality
+        return metrics
+
+    if float(bev_loss_values[1].item()) <= 0.0:
+        raise ValueError("Stage A validation has no BEV batches")
+    metrics["bev_loss"] = float(
+        bev_loss_values[0].item() / bev_loss_values[1].item()
+    )
+    ap_lifts: list[float] = []
+    for class_index, class_name in enumerate(BEV_SEGMENTATION_CLASSES):
+        true_positive, false_positive, false_negative, positive, valid = (
+            float(value)
+            for value in bev_counts[class_index].tolist()
+        )
+        if positive <= 0.0 or valid <= 0.0:
+            raise ValueError(
+                f"BEV validation class {class_name!r} has no support"
+            )
+        average_precision = _histogram_average_precision(
+            positive_histogram[class_index],
+            negative_histogram[class_index],
+        )
+        prevalence = positive / valid
+        ap_lift = (
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (average_precision - prevalence)
+                    / (1.0 - prevalence),
+                ),
+            )
+            if prevalence < 1.0
+            else 0.0
+        )
+        ap_lifts.append(ap_lift)
+        prefix = f"bev_{class_name}"
+        metrics[f"{prefix}_iou"] = _metric_ratio(
+            true_positive,
+            true_positive + false_positive + false_negative,
+        )
+        metrics[f"{prefix}_precision"] = _metric_ratio(
+            true_positive,
+            true_positive + false_positive,
+        )
+        metrics[f"{prefix}_recall"] = _metric_ratio(
+            true_positive,
+            true_positive + false_negative,
+        )
+        metrics[f"{prefix}_average_precision"] = average_precision
+        metrics[f"{prefix}_ap_lift"] = ap_lift
+        metrics[f"{prefix}_positive_prevalence"] = prevalence
+        metrics[f"{prefix}_positive_cells"] = positive
+        metrics[f"{prefix}_valid_cells"] = valid
+
+    static_macro_ap_lift = float(np.mean(ap_lifts[:5]))
+    dynamic_macro_ap_lift = float(np.mean(ap_lifts[5:]))
+    metrics["bev_static_macro_ap_lift"] = static_macro_ap_lift
+    metrics["bev_dynamic_macro_ap_lift"] = dynamic_macro_ap_lift
+    metrics["selection_score"] = (
+        0.25 * trajectory_quality
+        + 0.25 * static_macro_ap_lift
+        + 0.50 * dynamic_macro_ap_lift
+    )
+    return metrics
 
 
 def _load_resume_checkpoint(
@@ -544,7 +847,7 @@ def _load_resume_checkpoint(
     optimizer,
     scheduler,
     expected: Mapping[str, Any],
-) -> tuple[int, float]:
+) -> tuple[int, float, float]:
     import torch
 
     payload = torch.load(
@@ -570,6 +873,7 @@ def _load_resume_checkpoint(
     training_state = payload.get("training_state") or {}
     return (
         int(payload["epoch"]) + 1,
+        float(training_state.get("best_selection_score", -float("inf"))),
         float(training_state.get("best_ade_6p4s_m", float("inf"))),
     )
 
@@ -583,6 +887,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     from ray.train.torch import get_device, prepare_model
 
     from data_parsing.pre_extracted import (
+        BEVClassRepeatPolicy,
+        derive_bev_pos_weights,
+        derive_bev_repeat_factors,
+        discover_bev_training_statistics,
         make_multi_dataset_loader,
         passthrough_nodesplitter,
     )
@@ -635,6 +943,61 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         rank_shards,
         cache_root=cache_root,
     )
+    bev_pos_weights = (1.0,) * 8
+    bev_repeat_factors = (1,) * 8
+    bev_repeat_policy = None
+    raw_bev_statistics = None
+    effective_bev_statistics = None
+    if stage is ReactiveTrainingStage.NUPLAN_FULL:
+        local_raw_statistics = discover_bev_training_statistics(
+            local_directories,
+            val_fraction=float(config["val_fraction"]),
+        )
+        raw_bev_statistics = _all_reduce_bev_statistics(
+            local_raw_statistics,
+            device,
+        )
+        # Validate support before repetition can inflate sample counts.
+        derive_bev_pos_weights(
+            raw_bev_statistics,
+            max_weight=float(config["bev_pos_weight_cap"]),
+            min_positive_samples=int(
+                config["bev_min_positive_samples"]
+            ),
+            min_positive_cells=int(
+                config["bev_min_positive_cells"]
+            ),
+        )
+        bev_repeat_factors = derive_bev_repeat_factors(
+            raw_bev_statistics,
+            frequency_threshold=float(
+                config["bev_repeat_frequency_threshold"]
+            ),
+            max_repeat=int(config["bev_max_repeat"]),
+        )
+        local_effective_statistics = (
+            discover_bev_training_statistics(
+                local_directories,
+                val_fraction=float(config["val_fraction"]),
+                repeat_factors=bev_repeat_factors,
+            )
+        )
+        effective_bev_statistics = _all_reduce_bev_statistics(
+            local_effective_statistics,
+            device,
+        )
+        bev_pos_weights = derive_bev_pos_weights(
+            effective_bev_statistics,
+            max_weight=float(config["bev_pos_weight_cap"]),
+        )
+        mean_repeat = (
+            effective_bev_statistics.effective_exposure_count
+            / effective_bev_statistics.sample_count
+        )
+        bev_repeat_policy = BEVClassRepeatPolicy(
+            repeat_factors=bev_repeat_factors,
+            mean_repeat=mean_repeat,
+        )
 
     seed = int(config["training_seed"])
     _seed_epoch(seed, rank, 0)
@@ -658,7 +1021,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     configure_model_for_stage(model, stage)
     objective = ReactiveMultitaskObjective(
         stage,
-        bev_pos_weight=list(config["bev_pos_weights"]),
+        bev_pos_weight=bev_pos_weights,
         bev_weight=float(config["bev_weight"]),
         route_weight=float(config["route_weight"]),
         corridor_pos_weight=float(config["corridor_pos_weight"]),
@@ -683,11 +1046,13 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",
+        mode="max",
         factor=0.5,
-        patience=1,
-        threshold=1e-4,
-        threshold_mode="abs",
+        patience=2,
+        threshold=1e-3,
+        threshold_mode="rel",
+        cooldown=1,
+        min_lr=1e-5,
     )
 
     calculated_steps = optimizer_steps_per_epoch(
@@ -712,13 +1077,21 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
         "training_stage": stage.value,
+        "bev_pos_weights": list(bev_pos_weights),
+        "bev_repeat_factors": list(bev_repeat_factors),
+        "bev_taxonomy_version": "bev_segmentation_v2",
     }
     start_epoch = 1
+    best_selection_score = -float("inf")
     best_ade = float("inf")
     restored = train.get_checkpoint()
     if restored is not None:
         with restored.as_directory() as checkpoint_directory:
-            start_epoch, best_ade = _load_resume_checkpoint(
+            (
+                start_epoch,
+                best_selection_score,
+                best_ade,
+            ) = _load_resume_checkpoint(
                 checkpoint_directory,
                 model=model,
                 optimizer=optimizer,
@@ -748,7 +1121,18 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_global_batch": global_batch,
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
+        "bev_pos_weights": list(bev_pos_weights),
+        "bev_repeat_factors": list(bev_repeat_factors),
+        "bev_taxonomy_version": "bev_segmentation_v2",
     }
+    if raw_bev_statistics is not None:
+        model_config["bev_raw_statistics"] = (
+            raw_bev_statistics.metadata()
+        )
+    if effective_bev_statistics is not None:
+        model_config["bev_effective_statistics"] = (
+            effective_bev_statistics.metadata()
+        )
     started = time.perf_counter()
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
         _seed_epoch(seed, rank, epoch)
@@ -762,6 +1146,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             shuffle_seed=seed + epoch,
             pin_memory=True,
             decode_future_frames=False,
+            bev_repeat_policy=bev_repeat_policy,
             nodesplitter=passthrough_nodesplitter,
         )
         train_metrics = _train_fixed_steps(
@@ -789,12 +1174,16 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             decode_future_frames=False,
             nodesplitter=passthrough_nodesplitter,
         )
-        validation = _evaluate_global_trajectory(
+        validation = _evaluate_global_reactive(
             model,
             validation_loader,
+            objective,
+            stage=stage,
             device=device,
+            probability_bins=int(config["bev_ap_bins"]),
+            ade_scale_m=float(config["selection_ade_scale_m"]),
         )
-        scheduler.step(validation["ade_6p4s_m"])
+        scheduler.step(validation["selection_score"])
         maximum_delta = _maximum_parameter_delta(
             model,
             world_size=world_size,
@@ -822,7 +1211,16 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "shards": [shard.identity for shard in rank_shards],
             },
         )
-        is_best = validation["ade_6p4s_m"] < best_ade
+        ade_within_guard = validation["ade_6p4s_m"] <= (
+            best_ade
+            + float(config["selection_ade_regression_margin_m"])
+        )
+        is_best = (
+            validation["selection_score"] > best_selection_score
+            and ade_within_guard
+        )
+        if is_best:
+            best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
         checkpoint_sha256: str | None = None
         with tempfile.TemporaryDirectory() as checkpoint_directory:
@@ -846,6 +1244,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                     training_state={
                         "assignment_sha256": assignment_sha256,
                         "best_ade_6p4s_m": best_ade,
+                        "best_selection_score": best_selection_score,
                         "global_batch": global_batch,
                         "optimizer_steps_per_epoch": optimizer_steps,
                         "rank_evidence": rank_evidence,
@@ -884,8 +1283,24 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                     "complete_samples"
                 ],
                 "validation_fde_6p4s_m": validation["fde_6p4s_m"],
+                "validation_selection_score": validation[
+                    "selection_score"
+                ],
                 "world_size": world_size,
             }
+            for name, value in validation.items():
+                if name not in {
+                    "ade_6p4s_m",
+                    "complete_samples",
+                    "fde_6p4s_m",
+                    "selection_score",
+                }:
+                    metrics[f"validation_{name}"] = value
+            for class_index, value in enumerate(bev_pos_weights):
+                metrics[f"bev_pos_weight_{class_index}"] = value
+                metrics[f"bev_repeat_factor_{class_index}"] = (
+                    bev_repeat_factors[class_index]
+                )
             train.report(metrics, checkpoint=checkpoint)
 
 
@@ -913,8 +1328,8 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
             failure_config=train.FailureConfig(max_failures=2),
             checkpoint_config=train.CheckpointConfig(
                 num_to_keep=3,
-                checkpoint_score_attribute="validation_ade_6p4s_m",
-                checkpoint_score_order="min",
+                checkpoint_score_attribute="validation_selection_score",
+                checkpoint_score_order="max",
             ),
         ),
     )
