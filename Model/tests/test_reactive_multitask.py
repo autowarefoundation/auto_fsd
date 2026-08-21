@@ -646,7 +646,12 @@ def test_stage_a_to_stage_b_to_semantic_artifact_smoke(
         stage=ReactiveTrainingStage.NUPLAN_FULL,
         dataset_manifest_sha256="a" * 64,
         epoch=1,
-        model_config={"num_views": 8},
+        model_config={
+            "num_views": 8,
+            "bev_pos_weights": [1.0] * 8,
+            "bev_repeat_factors": [1] * 8,
+            "bev_taxonomy_version": "bev_segmentation_v2",
+        },
         optimizer=stage_a_optimizer,
         metrics=stage_a_metrics,
     )
@@ -855,3 +860,26 @@ def test_checkpoint_selection_evaluation_skips_auxiliary_heads(
     assert metrics["ade_6p4s_m"] >= 0.0
     assert metrics["fde_6p4s_m"] >= 0.0
     assert calls == {"bev": 0, "route": 0}
+
+
+def test_stage_b_rejects_stage_a_without_bev_v2_lineage(
+    build_mock_model,
+    device,
+    tmp_path,
+):
+    model = _model(build_mock_model, device)
+    checkpoint_path = tmp_path / "legacy-stage-a.pt"
+    save_reactive_checkpoint(
+        checkpoint_path,
+        model,
+        stage=ReactiveTrainingStage.NUPLAN_FULL,
+        dataset_manifest_sha256="a" * 64,
+        epoch=1,
+        model_config={"num_views": 8},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Stage A parent checkpoint contract differs",
+    ):
+        load_stage_a_parent(model, checkpoint_path)
