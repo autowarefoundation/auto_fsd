@@ -974,7 +974,7 @@ def _load_resume_checkpoint(
     optimizer,
     scheduler,
     expected: Mapping[str, Any],
-) -> tuple[int, float, float]:
+) -> tuple[int, float, float, list[dict[str, Any]]]:
     import torch
 
     payload = torch.load(
@@ -998,10 +998,19 @@ def _load_resume_checkpoint(
     optimizer.load_state_dict(payload["optimizer_state_dict"])
     scheduler.load_state_dict(payload["scheduler_state_dict"])
     training_state = payload.get("training_state") or {}
+    history_path = Path(checkpoint_directory) / "history.json"
+    history = json.loads(history_path.read_text(encoding="ascii"))
+    if (
+        not isinstance(history, list)
+        or not history
+        or any(not isinstance(item, dict) for item in history)
+    ):
+        raise ValueError("Reactive DDP resume checkpoint has invalid history")
     return (
         int(payload["epoch"]) + 1,
         float(training_state.get("best_selection_score", -float("inf"))),
         float(training_state.get("best_ade_6p4s_m", float("inf"))),
+        history,
     )
 
 
@@ -1270,6 +1279,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     start_epoch = 1
     best_selection_score = -float("inf")
     best_ade = float("inf")
+    epoch_history: list[dict[str, Any]] = []
     restored = train.get_checkpoint()
     if overfit_sample_count and restored is not None:
         raise ValueError("BEV overfit mode cannot resume a checkpoint")
@@ -1279,6 +1289,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 start_epoch,
                 best_selection_score,
                 best_ade,
+                epoch_history,
             ) = _load_resume_checkpoint(
                 checkpoint_directory,
                 model=model,
@@ -1461,6 +1472,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             validation["selection_score"] > best_selection_score
             and ade_within_guard
         )
+        checkpoint_selection_score = (
+            validation["selection_score"]
+            if ade_within_guard
+            else -1.0
+        )
         if is_best:
             best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
@@ -1494,13 +1510,13 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                     },
                     lineage=lineage,
                 )
-                checkpoint = Checkpoint.from_directory(
-                    checkpoint_directory
-                )
             checkpoint_digest: list[str | None] = [checkpoint_sha256]
             dist.broadcast_object_list(checkpoint_digest, src=0)
             metrics = {
                 "checkpoint_sha256": str(checkpoint_digest[0]),
+                "checkpoint_selection_score": (
+                    checkpoint_selection_score
+                ),
                 "dataset_manifest_sha256": (
                     plan.dataset_manifest_sha256
                 ),
@@ -1551,7 +1567,85 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 metrics[f"bev_repeat_factor_{class_index}"] = (
                     bev_repeat_factors[class_index]
                 )
+            epoch_history.append(metrics)
+            if rank == 0:
+                history_path = (
+                    Path(checkpoint_directory) / "history.json"
+                )
+                history_path.write_text(
+                    json.dumps(
+                        epoch_history,
+                        allow_nan=False,
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n",
+                    encoding="ascii",
+                )
+                checkpoint = Checkpoint.from_directory(
+                    checkpoint_directory
+                )
             train.report(metrics, checkpoint=checkpoint)
+
+
+def _result_checkpoint_entry(entry) -> tuple[Any, dict[str, Any]]:
+    if isinstance(entry, tuple) and len(entry) == 2:
+        checkpoint, metrics = entry
+    else:
+        checkpoint = getattr(entry, "checkpoint", None)
+        metrics = getattr(entry, "metrics", None)
+    if checkpoint is None or not isinstance(metrics, Mapping):
+        raise ValueError("Ray best checkpoint entry is invalid")
+    return checkpoint, dict(metrics)
+
+
+def _select_result_checkpoint(
+    result,
+    *,
+    overfit_mode: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """Select the gated final checkpoint or the best ADE-guarded checkpoint."""
+    if result.checkpoint is None:
+        raise RuntimeError("Reactive Ray training returned no checkpoint")
+    final_metrics = dict(result.metrics)
+    if overfit_mode:
+        return result.checkpoint, final_metrics
+
+    candidates = []
+    for entry in getattr(result, "best_checkpoints", ()) or ():
+        checkpoint, metrics = _result_checkpoint_entry(entry)
+        if int(metrics.get("is_best", 0)) != 1:
+            continue
+        score = float(metrics.get("checkpoint_selection_score", -1.0))
+        if not math.isfinite(score) or score < 0.0:
+            continue
+        candidates.append((
+            score,
+            int(metrics.get("epoch", 0)),
+            checkpoint,
+            metrics,
+        ))
+    if not candidates:
+        raise RuntimeError(
+            "Reactive Ray training retained no ADE-guarded best checkpoint"
+        )
+    _, _, checkpoint, metrics = max(
+        candidates,
+        key=lambda item: (item[0], item[1]),
+    )
+    return checkpoint, metrics
+
+
+def _checkpoint_history(checkpoint) -> list[dict[str, Any]]:
+    with checkpoint.as_directory() as checkpoint_directory:
+        path = Path(checkpoint_directory) / "history.json"
+        history = json.loads(path.read_text(encoding="ascii"))
+    if (
+        not isinstance(history, list)
+        or not history
+        or any(not isinstance(item, dict) for item in history)
+    ):
+        raise ValueError("Reactive Ray checkpoint history is invalid")
+    return history
 
 
 def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -1578,10 +1672,14 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
         run_config=train.RunConfig(
             name=str(config["run_name"]),
             storage_path=str(config["storage_path"]),
-            failure_config=train.FailureConfig(max_failures=2),
+            failure_config=train.FailureConfig(
+                max_failures=(
+                    0 if int(config["overfit_sample_count"]) else 2
+                ),
+            ),
             checkpoint_config=train.CheckpointConfig(
                 num_to_keep=3,
-                checkpoint_score_attribute="validation_selection_score",
+                checkpoint_score_attribute="checkpoint_selection_score",
                 checkpoint_score_order="max",
             ),
         ),
@@ -1589,29 +1687,48 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
     result = trainer.fit()
     if result.checkpoint is None:
         raise RuntimeError("Reactive Ray training returned no checkpoint")
+    history = _checkpoint_history(result.checkpoint)
+    checkpoint, metrics = _select_result_checkpoint(
+        result,
+        overfit_mode=bool(int(config["overfit_sample_count"])),
+    )
     checkpoint_uri = normalize_ray_checkpoint_uri(
-        str(result.checkpoint.path),
+        str(checkpoint.path),
         str(config["storage_path"]),
     )
-    metrics = dict(result.metrics)
     if int(metrics.get("world_size", 0)) != int(config["num_workers"]):
         raise RuntimeError(
             f"Reactive Ray result has unexpected world size: {metrics}"
         )
-    history = []
-    metrics_dataframe = getattr(result, "metrics_dataframe", None)
-    if metrics_dataframe is not None:
-        history = json.loads(
-            metrics_dataframe.to_json(
-                orient="records",
-                double_precision=15,
-            )
+    selected_digest = str(metrics.get("checkpoint_sha256", ""))
+    selected_rows = [
+        row
+        for row in history
+        if str(row.get("checkpoint_sha256", "")) == selected_digest
+    ]
+    if (
+        len(selected_rows) != 1
+        or int(selected_rows[0].get("epoch", -1))
+        != int(metrics.get("epoch", -2))
+    ):
+        raise RuntimeError(
+            "selected Reactive checkpoint does not match epoch history"
+        )
+    final_metrics = dict(result.metrics)
+    if (
+        str(history[-1].get("checkpoint_sha256", ""))
+        != str(final_metrics.get("checkpoint_sha256", ""))
+    ):
+        raise RuntimeError(
+            "final Reactive checkpoint does not match epoch history"
         )
     return {
         "checkpoint_file_uri": f"{checkpoint_uri}/checkpoint.pt",
         "checkpoint_uri": checkpoint_uri,
+        "final_metrics": final_metrics,
         "history": history,
         "metrics": metrics,
+        "selected_epoch": int(metrics["epoch"]),
         "run_name": str(config["run_name"]),
         "storage_path": str(config["storage_path"]),
     }
