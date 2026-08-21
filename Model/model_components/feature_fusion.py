@@ -1,5 +1,8 @@
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .view_fusion import build_view_fusion
 
 
@@ -11,20 +14,38 @@ class FeatureFusion(nn.Module):
       2. Unify across camera views using the selected fusion strategy
     """
 
-    def __init__(self, num_views=8, backbone_channels=1440, embed_dim=256,
+    def __init__(self, num_views=8,
+                 backbone_channels: Sequence[int] = (96, 192, 384, 768),
+                 embed_dim=256,
                  fusion_mode="bev", image_feature_size=8, view_fusion_kwargs=None):
         super(FeatureFusion, self).__init__()
 
-        # Per-view pooled image-feature resolution (used as values for view fusion).
-        # This is independent of the BEV grid size; BEV fusion reprojects these
-        # values onto its own (bev_h, bev_w) grid.
-        self.image_feature_size = image_feature_size
-        self.pool = nn.AdaptiveMaxPool2d(image_feature_size)
-
-        # Channel reduction to achieve correct embedding dimension
-        self.channel_proj = nn.Sequential(
-            nn.Conv2d(backbone_channels, embed_dim, kernel_size=1),
-            nn.GELU()
+        channels = tuple(int(value) for value in backbone_channels)
+        if not channels or any(value <= 0 for value in channels):
+            raise ValueError(
+                "backbone_channels must contain positive stage widths"
+            )
+        if image_feature_size <= 0:
+            raise ValueError("image_feature_size must be positive")
+        self.backbone_channels = channels
+        self.image_feature_size = int(image_feature_size)
+        self.lateral_projections = nn.ModuleList(
+            nn.Conv2d(channel_count, embed_dim, kernel_size=1)
+            for channel_count in channels
+        )
+        self.scale_logits = nn.Parameter(torch.zeros(len(channels)))
+        self.refine = nn.Sequential(
+            nn.Conv2d(
+                embed_dim,
+                embed_dim,
+                kernel_size=3,
+                padding=1,
+                groups=embed_dim,
+                bias=False,
+            ),
+            nn.GroupNorm(32, embed_dim),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1),
         )
 
         # View fusion strategy (pluggable). Extra kwargs (bev_h, bev_w, pc_range,
@@ -36,12 +57,48 @@ class FeatureFusion(nn.Module):
     def forward(self, features, B, V, projection=None, geometry_type=None,
                 image_transform=None):
         # features: list of 4 multi-scale feature maps from backbone (channels-first)
-        for i in range(0, len(features)):
-            features[i] = self.pool(features[i])
-
-        # Concatenate scales along channels at image_feature_size resolution.
-        fused_per_view = torch.cat(features, dim=1)
-        fused_per_view = self.channel_proj(fused_per_view)
+        if len(features) != len(self.lateral_projections):
+            raise ValueError(
+                "backbone feature count differs from configured stages"
+            )
+        target_size = (self.image_feature_size, self.image_feature_size)
+        projected = []
+        for index, (feature, projection_layer) in enumerate(zip(
+            features,
+            self.lateral_projections,
+        )):
+            if (
+                feature.ndim != 4
+                or feature.shape[1] != self.backbone_channels[index]
+            ):
+                raise ValueError(
+                    f"backbone stage {index} shape differs from contract"
+                )
+            lateral = projection_layer(feature)
+            if lateral.shape[-2:] == target_size:
+                resized = lateral
+            elif (
+                lateral.shape[-2] >= self.image_feature_size
+                and lateral.shape[-1] >= self.image_feature_size
+            ):
+                resized = F.adaptive_max_pool2d(lateral, target_size)
+            else:
+                resized = F.interpolate(
+                    lateral,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            projected.append(resized)
+        scale_weights = self.scale_logits.softmax(dim=0)
+        fused_per_view = torch.stack(
+            [
+                weight * feature
+                for weight, feature in zip(scale_weights, projected)
+            ],
+            dim=0,
+        ).sum(dim=0)
+        fused_per_view = self.refine(fused_per_view)
 
         # Unify across views. BEV fusion output spatial size is (bev_h, bev_w).
         # Geometry (projection operator / geometry_type / image_transform) is
