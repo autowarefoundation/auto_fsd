@@ -1582,6 +1582,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             if ade_within_guard
             else -1.0
         )
+        checkpoint_retention_score = checkpoint_selection_score
+        if epoch == int(config["epochs"]):
+            checkpoint_retention_score = (
+                2.0 + validation["selection_score"]
+            )
         if is_best:
             best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
@@ -1621,6 +1626,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "checkpoint_sha256": str(checkpoint_digest[0]),
                 "checkpoint_selection_score": (
                     checkpoint_selection_score
+                ),
+                "checkpoint_retention_score": (
+                    checkpoint_retention_score
                 ),
                 "dataset_manifest_sha256": (
                     plan.dataset_manifest_sha256
@@ -1794,7 +1802,7 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
             ),
             checkpoint_config=train.CheckpointConfig(
                 num_to_keep=3,
-                checkpoint_score_attribute="checkpoint_selection_score",
+                checkpoint_score_attribute="checkpoint_retention_score",
                 checkpoint_score_order="max",
             ),
         ),
