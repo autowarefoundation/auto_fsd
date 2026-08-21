@@ -702,7 +702,12 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
       document.documentElement.clientWidth,
   }));
   expect(layout.horizontalOverflow).toBe(0);
-  await region.screenshot({
+  await canvas.evaluate((element) =>
+    element.scrollIntoView({ block: "center", inline: "nearest" }),
+  );
+  await page.waitForTimeout(1_000);
+  await page.screenshot({
+    animations: "disabled",
     path: testInfo.outputPath("occupancy-dashboard-desktop.png"),
   });
   expect(errors).toEqual([]);
