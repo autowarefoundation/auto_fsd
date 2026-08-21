@@ -189,15 +189,14 @@ def _loader_item(item: Any) -> tuple[Mapping[str, Any], Any, str]:
     return item, None, "pseudo"
 
 
-def _collective_true(value: bool, device) -> bool:
+def _collective_true(value, device) -> bool:
     import torch
     import torch.distributed as dist
 
-    flag = torch.tensor(
-        int(value),
-        dtype=torch.int32,
-        device=device,
-    )
+    flag = torch.as_tensor(value, device=device)
+    if flag.numel() != 1:
+        raise ValueError("collective boolean flag must be scalar")
+    flag = flag.to(dtype=torch.int32)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
 
@@ -464,33 +463,39 @@ def clip_finite_gradients_float64(
         if parameter.grad is not None
     ]
     if not gradients:
-        return torch.zeros((), dtype=torch.float64), True
+        return (
+            torch.zeros((), dtype=torch.float64),
+            torch.ones((), dtype=torch.bool),
+        )
     device = gradients[0].device
-    norm_squared = torch.zeros(
-        (),
-        dtype=torch.float64,
-        device=device,
-    )
-    finite = True
     for gradient in gradients:
         if gradient.device != device:
             raise ValueError("all gradients must be on the same device")
-        finite = finite and bool(torch.isfinite(gradient).all().item())
-        norm_squared += gradient.detach().to(torch.float64).square().sum()
-    gradient_norm = torch.sqrt(norm_squared)
-    finite = finite and bool(torch.isfinite(gradient_norm).item())
-    if finite:
-        scale = torch.clamp(
-            torch.as_tensor(
-                max_norm,
-                dtype=torch.float64,
-                device=device,
-            )
-            / gradient_norm.clamp_min(torch.finfo(torch.float64).tiny),
-            max=1.0,
+    per_tensor_norms = [
+        torch.linalg.vector_norm(
+            gradient.detach(),
+            ord=2,
+            dtype=torch.float64,
         )
-        for gradient in gradients:
-            gradient.mul_(scale.to(dtype=gradient.dtype))
+        for gradient in gradients
+    ]
+    gradient_norm = torch.linalg.vector_norm(torch.stack([
+        value.detach()
+        for value in per_tensor_norms
+    ]))
+    finite = torch.isfinite(gradient_norm)
+    scale = torch.clamp(
+        torch.as_tensor(
+            max_norm,
+            dtype=torch.float64,
+            device=device,
+        )
+        / gradient_norm.clamp_min(torch.finfo(torch.float64).tiny),
+        max=1.0,
+    )
+    scale = torch.where(finite, scale, torch.ones_like(scale))
+    for gradient in gradients:
+        gradient.mul_(scale.to(dtype=gradient.dtype))
     return gradient_norm, finite
 
 
@@ -515,16 +520,22 @@ def _train_fixed_steps(
 
     model.train()
     iterator = RestartingIterator(loader)
-    totals = {
-        "total": 0.0,
-        "trajectory": 0.0,
-        "bev_segmentation": 0.0,
-        "route_reconstruction": 0.0,
-    }
+    term_names = (
+        "total",
+        "trajectory",
+        "bev_segmentation",
+        "route_reconstruction",
+    )
+    totals = torch.zeros(
+        len(term_names),
+        dtype=torch.float64,
+        device=device,
+    )
     consumed_samples = 0
     micro_steps = optimizer_steps * gradient_accumulation_steps
     for _ in range(optimizer_steps):
         optimizer.zero_grad(set_to_none=True)
+        finite_step = torch.ones((), dtype=torch.bool, device=device)
         for accumulation_index in range(gradient_accumulation_steps):
             raw_batch, fallback_projection, fallback_geometry_type = (
                 _loader_item(next(iterator))
@@ -580,20 +591,18 @@ def _train_fixed_steps(
                         auxiliary,
                         batch,
                     )
-                    finite_loss = bool(
-                        torch.isfinite(terms["total"]).item()
+                    finite_step.logical_and_(
+                        torch.isfinite(terms["total"].detach())
                     )
-                    if not _collective_true(finite_loss, device):
-                        raise FloatingPointError(
-                            "a Reactive DDP rank produced non-finite loss"
-                        )
                     scaled_loss = (
                         terms["total"]
                         / gradient_accumulation_steps
                     )
                 scaled_loss.backward()
-            for name in totals:
-                totals[name] += float(terms[name].detach().item())
+            totals += torch.stack([
+                terms[name].detach().to(torch.float64)
+                for name in term_names
+            ])
 
         trainable = [
             parameter
@@ -604,24 +613,21 @@ def _train_fixed_steps(
             trainable,
             grad_clip,
         )
-        if not _collective_true(finite_gradient, device):
+        finite_step.logical_and_(finite_gradient)
+        if not _collective_true(finite_step, device):
             raise FloatingPointError(
-                "a Reactive DDP rank produced non-finite gradients"
+                "a Reactive DDP rank produced non-finite loss or gradients"
             )
         optimizer.step()
 
-    packed = torch.tensor(
-        [
-            totals["total"],
-            totals["trajectory"],
-            totals["bev_segmentation"],
-            totals["route_reconstruction"],
-            float(consumed_samples),
-            float(iterator.restarts),
-        ],
-        dtype=torch.float64,
-        device=device,
-    )
+    packed = torch.cat([
+        totals,
+        torch.tensor(
+            [float(consumed_samples), float(iterator.restarts)],
+            dtype=torch.float64,
+            device=device,
+        ),
+    ])
     dist.all_reduce(packed, op=dist.ReduceOp.SUM)
     denominator = dist.get_world_size() * micro_steps
     return {
