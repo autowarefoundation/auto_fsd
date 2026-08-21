@@ -68,6 +68,10 @@ BEVFORMER_V2_IMAGE = _os.environ.get(
     "AUTO_E2E_BEVFORMER_V2_IMAGE",
     f"{ECR_PREFIX}/auto-e2e/bevformer-v2:latest",
 )
+HENET_IMAGE = _os.environ.get(
+    "AUTO_E2E_HENET_IMAGE",
+    f"{ECR_PREFIX}/auto-e2e/henet:latest",
+)
 
 MLFLOW_URI = "http://mlflow.mlflow.svc.cluster.local:5000"
 DATASET_PACK_VERSION = "v2.2"
