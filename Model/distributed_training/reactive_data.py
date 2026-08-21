@@ -180,6 +180,17 @@ def _validate_reactive_manifest(
         raise ValueError("Reactive DDP requires two route channels")
     if int(manifest.get("num_views", 0)) <= 0:
         raise ValueError("Reactive DDP manifest has no camera views")
+    if stage is ReactiveTrainingStage.NUPLAN_FULL:
+        if manifest.get("bev_taxonomy_version") != "bev_segmentation_v2":
+            raise ValueError(
+                "Stage A requires the corrected BEV v2 taxonomy"
+            )
+        if int(manifest.get("bev_statistics_count", 0)) != int(
+            manifest.get("total_samples", 0)
+        ):
+            raise ValueError(
+                "Stage A requires BEV statistics for every sample"
+            )
 
 
 def build_reactive_dataset_plan(
