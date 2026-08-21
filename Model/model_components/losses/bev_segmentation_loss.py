@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class BEVSegmentationAuxiliaryLoss(nn.Module):
-    """Equal mixture of class-balanced BCE and Soft Dice."""
+    """FP32 mixture of class-balanced BCE and per-sample Soft Dice."""
 
     pos_weight: torch.Tensor
 
@@ -18,7 +18,7 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
         self,
         pos_weight: Sequence[float] | torch.Tensor,
         *,
-        dice_epsilon: float = 1e-6,
+        dice_epsilon: float = 1.0,
     ) -> None:
         super().__init__()
         weights = torch.as_tensor(pos_weight, dtype=torch.float32)
@@ -43,31 +43,36 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
             raise ValueError("target and valid_mask must match logits")
         if logits.shape[1] != self.pos_weight.numel():
             raise ValueError("logit channels differ from pos_weight")
-        target = target.to(device=logits.device, dtype=logits.dtype)
+        logits_fp32 = logits.to(dtype=torch.float32)
+        target_fp32 = target.to(device=logits.device, dtype=torch.float32)
         valid = valid_mask.to(device=logits.device, dtype=torch.bool)
-        active = valid.any(dim=(0, 2, 3))
+        active = valid.any(dim=(2, 3))
         if not bool(active.any()):
-            return logits.sum() * 0.0
+            return logits_fp32.sum() * 0.0
 
-        mask = valid.to(logits.dtype)
-        bce = F.binary_cross_entropy_with_logits(
-            logits,
-            target,
-            pos_weight=self.pos_weight.view(1, -1, 1, 1),
-            reduction="none",
-        )
-        valid_counts = mask.sum(dim=(0, 2, 3)).clamp_min(1.0)
-        class_bce = (bce * mask).sum(dim=(0, 2, 3)) / valid_counts
+        with torch.autocast(
+            device_type=logits.device.type,
+            enabled=False,
+        ):
+            mask = valid.to(torch.float32)
+            bce = F.binary_cross_entropy_with_logits(
+                logits_fp32,
+                target_fp32,
+                pos_weight=self.pos_weight.view(1, -1, 1, 1),
+                reduction="none",
+            )
+            valid_counts = mask.sum(dim=(2, 3)).clamp_min(1.0)
+            sample_bce = (bce * mask).sum(dim=(2, 3)) / valid_counts
 
-        probabilities = logits.sigmoid()
-        intersection = (probabilities * target * mask).sum(
-            dim=(0, 2, 3)
-        )
-        denominator = ((probabilities + target) * mask).sum(
-            dim=(0, 2, 3)
-        )
-        class_dice = 1.0 - (
-            2.0 * intersection + self.dice_epsilon
-        ) / (denominator + self.dice_epsilon)
-        class_loss = 0.5 * class_bce + 0.5 * class_dice
-        return class_loss[active].mean()
+            probabilities = logits_fp32.sigmoid()
+            intersection = (
+                probabilities * target_fp32 * mask
+            ).sum(dim=(2, 3))
+            denominator = (
+                (probabilities + target_fp32) * mask
+            ).sum(dim=(2, 3))
+            sample_dice = 1.0 - (
+                2.0 * intersection + self.dice_epsilon
+            ) / (denominator + self.dice_epsilon)
+            sample_loss = 0.5 * sample_bce + 0.5 * sample_dice
+            return sample_loss[active].mean()
