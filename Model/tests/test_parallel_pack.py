@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import io
 import json
+import sys
+import types
 
 import numpy as np
 import torch
@@ -378,6 +380,65 @@ def _install_row_worker_globals(ds, calib_bytes):
     pp._CALIB_BYTES = calib_bytes
     pp._TO_PIL = transforms.ToPILImage()
     pp._RESIZE = transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))
+
+
+def test_init_row_worker_preserves_kitscenes_source_contract(monkeypatch):
+    captured = {}
+
+    class _FakeKitScenesDataset:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_module = types.ModuleType("data_parsing.kit_scenes")
+    fake_module.KitScenesDataset = _FakeKitScenesDataset
+    monkeypatch.setitem(
+        sys.modules,
+        "data_parsing.kit_scenes",
+        fake_module,
+    )
+
+    pp.init_row_worker(
+        "KIT-MRT/KITScenes-Multimodal",
+        ["scene-held-out"],
+        "/raw",
+        IMAGE_SIZE,
+        "overlap_train_val",
+        "revision-held-out",
+        True,
+    )
+
+    assert captured["split"] == "overlap_train_val"
+    assert captured["source_revision"] == "revision-held-out"
+    assert captured["scene_ids"] == ["scene-held-out"]
+    assert captured["benchmark_protocol"] is True
+
+
+def test_init_row_worker_preserves_l2d_source_revision(monkeypatch):
+    captured = {}
+
+    class _FakeL2DDataset:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_module = types.ModuleType("data_parsing.l2d")
+    fake_module.L2DDataset = _FakeL2DDataset
+    monkeypatch.setitem(
+        sys.modules,
+        "data_parsing.l2d",
+        fake_module,
+    )
+
+    pp.init_row_worker(
+        "yaak-ai/L2D",
+        [185],
+        "/raw",
+        IMAGE_SIZE,
+        "train",
+        "revision-l2d",
+    )
+
+    assert captured["revision"] == "revision-l2d"
+    assert captured["episodes"] == [185]
 
 
 def test_decode_row_returns_correct_frame_ids():

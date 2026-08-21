@@ -21,6 +21,7 @@ from data_parsing.kit_scenes.dataset import (
     _local_xy_to_absolute_utm,
     _utm32_to_wgs84,
 )
+from data_parsing.kit_scenes.egomotion import load_egomotion
 from data_parsing.kit_scenes import dataset as dataset_module
 from data_parsing.kit_scenes import map as map_module
 
@@ -30,6 +31,8 @@ def _dataset_stub(samples):
     dataset._samples = list(samples)
     dataset._wm_num_frames = 4
     dataset._wm_stride = 10
+    dataset._sampling_history_steps = 64
+    dataset._sampling_future_steps = 64
     dataset.camera_names = ["front", "left"]
     dataset._scene_egomotion = {
         scene_id: np.zeros((200, 4), dtype=np.float32)
@@ -316,6 +319,76 @@ def test_numeric_contract_emits_current_plus_64_gps_points():
     assert pose["latitude_deg"] == pytest.approx(gps[0, 0])
     assert pose["longitude_deg"] == pytest.approx(gps[0, 1])
     assert pose["heading_deg_cw_from_north"] == pytest.approx(90.0)
+
+
+def test_benchmark_egomotion_padding_preserves_fixed_abi():
+    signals = np.arange(100 * 4, dtype=np.float32).reshape(100, 4)
+
+    ego, target = load_egomotion(
+        signals,
+        frame_idx=40,
+        history_steps=40,
+        future_steps=50,
+    )
+
+    history = ego.numpy().reshape(64, 4)
+    trajectory = target.numpy().reshape(64, 2)
+    np.testing.assert_array_equal(history[:24], 0.0)
+    np.testing.assert_array_equal(history[24:], signals[:40])
+    np.testing.assert_array_equal(
+        trajectory[:50],
+        signals[41:91][:, [1, 3]],
+    )
+    np.testing.assert_array_equal(trajectory[50:], 0.0)
+
+
+def test_default_egomotion_contract_remains_64_by_64():
+    signals = np.arange(150 * 4, dtype=np.float32).reshape(150, 4)
+
+    ego, target = load_egomotion(signals, frame_idx=64)
+
+    np.testing.assert_array_equal(
+        ego.numpy().reshape(64, 4),
+        signals[:64],
+    )
+    np.testing.assert_array_equal(
+        target.numpy().reshape(64, 2),
+        signals[65:129][:, [1, 3]],
+    )
+
+
+def test_benchmark_numeric_contract_repeats_gps_after_paper_horizon():
+    scene = "fd1d1b6b-59bf-4292-8295-5028aa6aa5e3"
+    dataset = _dataset_stub([(scene, 40)])
+    dataset._sampling_history_steps = 40
+    dataset._sampling_future_steps = 50
+    signals = np.arange(120 * 4, dtype=np.float32).reshape(120, 4)
+    dataset._scene_egomotion[scene] = signals
+    latlon = np.column_stack([
+        49.0 + np.arange(120) / 100000,
+        8.0 + np.arange(120) / 100000,
+    ])
+    dataset._scene_latlon = {scene: latlon}
+    dataset._scene_yaws = {scene: np.zeros(120, dtype=np.float64)}
+    dataset._scene_timestamps_ns = {
+        scene: np.arange(120, dtype=np.int64) * 100_000_000
+    }
+
+    ego, target, _, gps = dataset.numeric_for(0)
+
+    np.testing.assert_array_equal(
+        ego.numpy().reshape(64, 4)[:24],
+        0.0,
+    )
+    np.testing.assert_array_equal(
+        target.numpy().reshape(64, 2)[50:],
+        0.0,
+    )
+    np.testing.assert_array_equal(gps[:51], latlon[40:91])
+    np.testing.assert_array_equal(
+        gps[51:],
+        np.repeat(latlon[90][None, :], 14, axis=0),
+    )
 
 
 def test_dataset_geo_iterators_preserve_scene_and_sample_identity():

@@ -42,6 +42,7 @@ else:  # Python 3.10 (local dev venv); CI runs 3.12
     from typing_extensions import NotRequired
 
 from data_processing.contract_versions import UID_SCHEMA_VERSION
+from data_processing.source_revisions import L2D_DATA_REVISION
 
 from .camera import CAMERA_NAMES, MAP_VIEW_NAME
 from .egomotion import (
@@ -67,6 +68,7 @@ class L2DSample(TypedDict):
     frame_index: int
     pose_current: dict[str, float | int]
     gps_future: np.ndarray           # (65, 2) float64: current + 64 future
+    route_waypoints_lon_lat: np.ndarray  # (10, 2), route intent
     # Present only when include_world_model_windows=True (#16, enables JEPA #13):
     # the 1 Hz multi-view past/future windows, each (N, 6, 3, H, W), oldest->newest.
     history_frames: NotRequired[torch.Tensor]
@@ -85,6 +87,7 @@ class L2DDataset(Dataset):
 
     Args:
         repo_id: HuggingFace repo ID for the dataset.
+        revision: Immutable HuggingFace dataset commit SHA.
         episodes: Optional list of episode indices to load. If None, all
             episodes are used.
         local_files_only: Accepted for backward compatibility; lerobot 0.5.x
@@ -100,6 +103,7 @@ class L2DDataset(Dataset):
     def __init__(
         self,
         repo_id: str = "yaak-ai/L2D",
+        revision: str = L2D_DATA_REVISION,
         episodes: list[int] | None = None,
         local_files_only: bool = False,
         include_world_model_windows: bool = False,
@@ -165,17 +169,17 @@ class L2DDataset(Dataset):
         # legacy flag onto that: local_files_only=True means "don't force a
         # remote sync", which is already the default, so it is simply not passed.
         #
-        # revision="main" forces lerobot to fetch from the ACTIVE branch instead of
-        # the CODEBASE_VERSION tag (v3.0 for lerobot 0.5.0). The `v3.0` tag on
+        # The pinned revision resolves the audited active branch instead of the
+        # CODEBASE_VERSION tag (v3.0 for lerobot 0.5.0). The `v3.0` tag on
         # yaak-ai/L2D points to a stale/broken snapshot (2026-07-14 audit:
         # tasks.parquet is 1485 bytes / 1 row at v3.0 vs 135484 bytes / 4219 rows
         # on main; data parquet 59MB vs 62MB). Reading v3.0 blows up in the label
         # pod: iloc[task_idx].name → IndexError, and _absolute_to_relative_idx →
         # KeyError, because meta.tasks + episodes.parquet on the tag are shorter
-        # than the actual dataset. Pin to main so we always get the live L2D
-        # revision — the entire pipeline was authored against main.
+        # than the actual dataset. The immutable commit prevents later changes to
+        # main from silently changing an experiment.
         _kwargs: dict[str, Any] = {"repo_id": repo_id, "episodes": episodes,
-                                    "revision": "main"}
+                                    "revision": revision}
         if root is not None:
             # Point lerobot at the partition's materialized raw dir so it loads
             # from there instead of re-downloading to the shared HF cache (#121
@@ -395,6 +399,23 @@ class L2DDataset(Dataset):
         )
         return ego_history, trajectory_target, pose_current, gps_future
 
+    def route_waypoints_for(self, idx: int) -> np.ndarray:
+        """Return the current row's OSM-snapped [longitude, latitude] route."""
+        _ep_idx, row = self._samples[idx]
+        hf = self.lerobot_dataset.hf_dataset
+        column = hf.select_columns(["observation.state.waypoints"])
+        waypoints = np.asarray(
+            column[row]["observation.state.waypoints"],
+            dtype=np.float64,
+        )
+        if waypoints.shape != (10, 2):
+            raise ValueError(
+                "L2D route waypoints must have shape [10,2]"
+            )
+        if not np.isfinite(waypoints).all():
+            raise ValueError("L2D route waypoints contain non-finite values")
+        return waypoints
+
     def _get_vehicle_states_window(self, ep_start: int, ep_end: int) -> np.ndarray:
         """Load vehicle state vectors for one episode (local row range).
 
@@ -571,6 +592,7 @@ class L2DDataset(Dataset):
             frame_index=sample_idx_in_episode,
             pose_current=pose_current,
             gps_future=gps_future,
+            route_waypoints_lon_lat=self.route_waypoints_for(idx),
         )
         if self._wm_enabled:
             sample["history_frames"] = history_frames

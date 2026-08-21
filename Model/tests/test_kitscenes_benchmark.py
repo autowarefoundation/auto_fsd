@@ -11,14 +11,19 @@ import torch
 
 from evaluation.kitscenes_benchmark import (
     EVALUATOR_VERSION,
+    KITScenesBenchmarkCandidate,
     MANIFEST_SCHEMA_VERSION,
+    PAPER_APPROXIMATION_SELECTION_SEED,
+    PAPER_APPROXIMATION_SELECTION_VERSION,
     PAPER_PROTOCOL_SOURCE,
+    PAPER_WINDOW_STEPS,
     PROTOCOL_ID,
     compute_displacement_metrics,
     limit_egomotion_history,
     load_benchmark_manifest,
     parse_benchmark_manifest,
     sample_uid_digest,
+    select_paper_approximation_samples,
     wgs84_trajectory_to_ego_xy,
 )
 
@@ -153,6 +158,81 @@ def test_official_status_requires_authority_and_200_samples():
                 sample_uids=sample_uids,
             )
         )
+
+
+def test_paper_approximation_selection_is_non_overlapping_and_deterministic():
+    candidates = {}
+    for split, scene_prefix in (
+        ("val", "01234567-89ab-cdef-0123"),
+        ("overlap-train-val", "fedcba98-7654-3210-fedc"),
+    ):
+        records = []
+        for scene_index in range(20):
+            scene_id = (
+                f"{scene_prefix}-{scene_index:012x}"
+            )
+            for frame_index in range(64, 64 + 10 * 90):
+                records.append(
+                    KITScenesBenchmarkCandidate(
+                        sample_uid=(
+                            f"kitscenes-v1-{scene_id}-"
+                            f"f{frame_index:06d}"
+                        ),
+                        source_split=split,
+                        scene_id=scene_id,
+                        frame_index=frame_index,
+                    )
+                )
+        candidates[split] = records
+
+    first_uids, first_metadata = select_paper_approximation_samples(
+        candidates
+    )
+    second_uids, second_metadata = select_paper_approximation_samples(
+        candidates
+    )
+
+    assert len(first_uids) == len(set(first_uids)) == 200
+    assert first_uids == second_uids
+    assert first_metadata == second_metadata
+    assert first_metadata["candidate_count"] == 400
+    assert set(first_metadata["selected_count_by_split"]) == {
+        "val",
+        "overlap-train-val",
+    }
+    assert first_metadata["non_overlap_window_steps"] == PAPER_WINDOW_STEPS
+    assert (
+        first_metadata["selection_seed"]
+        == PAPER_APPROXIMATION_SELECTION_SEED
+    )
+    assert (
+        first_metadata["selection_version"]
+        == PAPER_APPROXIMATION_SELECTION_VERSION
+    )
+
+
+def test_paper_approximation_selection_rejects_too_few_windows():
+    candidates = {
+        "val": [
+            KITScenesBenchmarkCandidate(
+                sample_uid=_uid(64),
+                source_split="val",
+                scene_id="scene-val",
+                frame_index=64,
+            )
+        ],
+        "overlap-train-val": [
+            KITScenesBenchmarkCandidate(
+                sample_uid=_uid(154),
+                source_split="overlap-train-val",
+                scene_id="scene-overlap",
+                frame_index=154,
+            )
+        ],
+    }
+
+    with pytest.raises(ValueError, match="too few non-overlapping"):
+        select_paper_approximation_samples(candidates)
 
 
 def test_history_adapter_masks_only_context_older_than_four_seconds():

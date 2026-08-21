@@ -512,6 +512,21 @@ class TestDecodeWorldModelWindows:
         assert accessed
         assert future_ids.isdisjoint(accessed)
 
+    def test_current_frame_only_mode_does_not_require_frame_pool(self):
+        sample, _ = self._pool_sample_and_accessor(
+            n_cams=6, T=4, F=4
+        )
+
+        out = _decode_sample(
+            sample,
+            pool=None,
+            decode_history_frames=False,
+            decode_future_frames=False,
+        )
+
+        assert "history_frames" not in out
+        assert "future_frames" not in out
+
     def test_pool_window_equals_legacy_layout(self):
         """THE byte-equality guarantee: the pool path rebuilds the SAME tensors the
         legacy hist_/fut_ layout would, for the same underlying jpeg bytes."""
