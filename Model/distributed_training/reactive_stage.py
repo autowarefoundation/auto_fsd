@@ -101,6 +101,15 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         and stage is not ReactiveTrainingStage.NUPLAN_FULL
     ):
         raise ValueError("BEV overfit mode is valid only for Stage A")
+    if overfit_sample_count and overfit_sample_count % world_size:
+        raise ValueError(
+            "overfit_sample_count must be divisible by num_workers"
+        )
+    overfit_shard_limit = int(config.get("overfit_shard_limit", 0))
+    if overfit_shard_limit and overfit_shard_limit < world_size:
+        raise ValueError(
+            "overfit_shard_limit must be zero or at least num_workers"
+        )
     for name in ("overfit_min_ap", "overfit_min_recall"):
         threshold = float(config.get(name, -1.0))
         if not 0.0 < threshold <= 1.0:
@@ -264,13 +273,22 @@ def _select_bev_overfit_subset(
     *,
     sample_count: int,
 ) -> tuple[str, ...]:
-    """Choose a deterministic class-complete subset with every rank present."""
+    """Choose a deterministic class-complete subset balanced across ranks."""
     if not 64 <= sample_count <= 128:
         raise ValueError("BEV overfit subset must contain 64 to 128 samples")
+    rank_count = len(rank_summaries)
+    if rank_count <= 0 or sample_count % rank_count:
+        raise ValueError(
+            "BEV overfit subset must divide evenly across ranks"
+        )
+    per_rank_count = sample_count // rank_count
     candidates: list[tuple[str, int, frozenset[int]]] = []
     for rank, summaries in enumerate(rank_summaries):
-        if not summaries:
-            raise ValueError(f"BEV overfit rank {rank} has no train samples")
+        if len(summaries) < per_rank_count:
+            raise ValueError(
+                f"BEV overfit rank {rank} has fewer than "
+                f"{per_rank_count} train samples"
+            )
         for sample_uid, positive_classes in summaries:
             classes = frozenset(int(value) for value in positive_classes)
             if any(value < 0 or value >= 8 for value in classes):
@@ -285,22 +303,8 @@ def _select_bev_overfit_subset(
         raise ValueError("BEV overfit candidates contain duplicate samples")
 
     selected: dict[str, tuple[str, int, frozenset[int]]] = {}
-    for rank in range(len(rank_summaries)):
-        rank_candidates = [
-            candidate for candidate in candidates if candidate[1] == rank
-        ]
-        chosen = min(
-            rank_candidates,
-            key=lambda candidate: (
-                -len(candidate[2]),
-                candidate[0],
-            ),
-        )
-        selected[chosen[0]] = chosen
-
-    covered = set().union(
-        *(candidate[2] for candidate in selected.values())
-    )
+    selected_per_rank = [0] * rank_count
+    covered: set[int] = set()
     while covered != set(range(8)):
         remaining_classes = set(range(8)) - covered
         eligible = [
@@ -308,6 +312,7 @@ def _select_bev_overfit_subset(
             for candidate in candidates
             if candidate[0] not in selected
             and candidate[2].intersection(remaining_classes)
+            and selected_per_rank[candidate[1]] < per_rank_count
         ]
         if not eligible:
             raise ValueError(
@@ -317,18 +322,33 @@ def _select_bev_overfit_subset(
             eligible,
             key=lambda candidate: (
                 -len(candidate[2].intersection(remaining_classes)),
+                selected_per_rank[candidate[1]],
                 candidate[0],
             ),
         )
         selected[chosen[0]] = chosen
+        selected_per_rank[chosen[1]] += 1
         covered.update(chosen[2])
 
-    for candidate in sorted(candidates, key=lambda value: value[0]):
-        if len(selected) >= sample_count:
-            break
-        selected.setdefault(candidate[0], candidate)
+    for rank in range(rank_count):
+        for candidate in sorted(
+            (
+                candidate
+                for candidate in candidates
+                if candidate[1] == rank
+            ),
+            key=lambda value: value[0],
+        ):
+            if selected_per_rank[rank] >= per_rank_count:
+                break
+            if candidate[0] in selected:
+                continue
+            selected[candidate[0]] = candidate
+            selected_per_rank[rank] += 1
     if len(selected) != sample_count:
         raise ValueError("BEV overfit subset construction is incomplete")
+    if selected_per_rank != [per_rank_count] * rank_count:
+        raise ValueError("BEV overfit subset is not rank balanced")
     return tuple(sorted(selected))
 
 
