@@ -340,6 +340,7 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
         f"validation_bev_{class_name}_{suffix}": value
         for class_name in BEV_SEGMENTATION_CLASSES
         for suffix, value in (
+            ("average_precision", 0.95),
             ("positive_cells", 10.0),
             ("recall", 0.95),
         )
@@ -365,7 +366,7 @@ def test_bev_overfit_gate_validates_final_evidence(tmp_path):
     ("override_name", "override_value", "match"),
     [
         (
-            "validation_bev_dynamic_macro_average_precision",
+            "validation_bev_lane_boundary_average_precision",
             0.89,
             "average precision",
         ),
