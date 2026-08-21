@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import zipfile
 from typing import Final
@@ -19,13 +20,15 @@ from navigation.geometry import (
 
 
 TRAJECTORY_XY_ARTIFACT_VERSION: Final = "trajectory_xy_v1"
-BEV_SEGMENTATION_ARTIFACT_VERSION: Final = "bev_segmentation_v1"
+BEV_SEGMENTATION_ARTIFACT_VERSION: Final = "bev_segmentation_v2"
+BEV_SEGMENTATION_STATS_VERSION: Final = "bev_segmentation_stats_v1"
 REACTIVE_NAVIGATION_ARTIFACT_VERSION: Final = "sample_navigation_v3"
 TRAJECTORY_XY_MEMBER: Final = "trajectory_xy.npz"
 BEV_SEGMENTATION_MEMBER: Final = "bev_segmentation.npz"
+BEV_SEGMENTATION_STATS_MEMBER: Final = "bev_segmentation_stats.json"
 BEV_SEGMENTATION_CLASSES: Final[tuple[str, ...]] = (
     "drivable_area",
-    "lane_area",
+    "lane_boundary",
     "intersection",
     "crosswalk",
     "stop_line",
@@ -271,6 +274,98 @@ def encode_bev_segmentation(
         "target_u8": target_u8,
         "valid_bits": valid_bits,
     })
+
+
+def encode_bev_segmentation_stats(
+    target: np.ndarray,
+    valid_mask: np.ndarray,
+) -> bytes:
+    """Encode small per-class statistics used before image decoding."""
+    target_f32 = np.asarray(target, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=np.bool_)
+    if (
+        target_f32.ndim != 3
+        or target_f32.shape[0] != len(BEV_SEGMENTATION_CLASSES)
+        or valid.shape != target_f32.shape
+    ):
+        raise ValueError("BEV statistics inputs must have shape [8,H,W]")
+    if (
+        not np.isfinite(target_f32).all()
+        or float(target_f32.min(initial=0.0)) < 0.0
+        or float(target_f32.max(initial=0.0)) > 1.0
+    ):
+        raise ValueError("BEV statistics target must be finite and in [0,1]")
+
+    quantized = np.rint(target_f32 * 255.0) / 255.0
+    valid_cells = valid.sum(axis=(1, 2), dtype=np.int64)
+    positive_cells = (
+        (quantized >= 0.5) & valid
+    ).sum(axis=(1, 2), dtype=np.int64)
+    positive_mass = (quantized * valid).sum(
+        axis=(1, 2),
+        dtype=np.float64,
+    )
+    return canonical_json_bytes({
+        "classes": list(BEV_SEGMENTATION_CLASSES),
+        "positive_cell_count": positive_cells.tolist(),
+        "positive_mass": positive_mass.tolist(),
+        "schema_version": BEV_SEGMENTATION_STATS_VERSION,
+        "valid_cell_count": valid_cells.tolist(),
+    })
+
+
+def decode_bev_segmentation_stats(
+    payload: bytes,
+) -> dict[str, np.ndarray]:
+    """Validate and decode packed BEV class statistics."""
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("invalid BEV segmentation statistics") from error
+    if not isinstance(decoded, dict):
+        raise ValueError("BEV segmentation statistics must be an object")
+    if decoded.get("schema_version") != BEV_SEGMENTATION_STATS_VERSION:
+        raise ValueError("unsupported BEV segmentation statistics version")
+    if decoded.get("classes") != list(BEV_SEGMENTATION_CLASSES):
+        raise ValueError("BEV segmentation statistics taxonomy differs")
+
+    arrays = {
+        "positive_cell_count": np.asarray(
+            decoded.get("positive_cell_count"),
+            dtype=np.int64,
+        ),
+        "positive_mass": np.asarray(
+            decoded.get("positive_mass"),
+            dtype=np.float64,
+        ),
+        "valid_cell_count": np.asarray(
+            decoded.get("valid_cell_count"),
+            dtype=np.int64,
+        ),
+    }
+    expected_shape = (len(BEV_SEGMENTATION_CLASSES),)
+    if any(value.shape != expected_shape for value in arrays.values()):
+        raise ValueError("BEV segmentation statistics have invalid shape")
+    if (
+        bool((arrays["positive_cell_count"] < 0).any())
+        or bool((arrays["valid_cell_count"] < 0).any())
+        or bool(
+            (
+                arrays["positive_cell_count"]
+                > arrays["valid_cell_count"]
+            ).any()
+        )
+        or not np.isfinite(arrays["positive_mass"]).all()
+        or bool((arrays["positive_mass"] < 0.0).any())
+        or bool(
+            (
+                arrays["positive_mass"]
+                > arrays["valid_cell_count"] + 1e-6
+            ).any()
+        )
+    ):
+        raise ValueError("BEV segmentation statistics are inconsistent")
+    return arrays
 
 
 def decode_bev_segmentation(
