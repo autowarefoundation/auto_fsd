@@ -14,7 +14,10 @@ from PIL import Image
 
 from data_processing.dataset_snapshot import split_bucket
 from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_MEMBER,
+    BEV_SEGMENTATION_STATS_MEMBER,
     encode_bev_segmentation,
+    encode_bev_segmentation_stats,
     encode_reactive_navigation,
     encode_trajectory_xy,
 )
@@ -27,7 +30,7 @@ from training.dataset_policy import (
 from training.reactive_multitask import ReactiveTrainingStage
 
 
-REACTIVE_CANARY_SCHEMA_VERSION = "reactive_ddp_canary_v1"
+REACTIVE_CANARY_SCHEMA_VERSION = "reactive_ddp_canary_v2"
 
 
 def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
@@ -71,6 +74,7 @@ def _add_member(
 def _sample_members(
     *,
     stage: ReactiveTrainingStage,
+    sample_uid: str,
     sample_index: int,
     split_group_uid: str,
 ) -> dict[str, bytes]:
@@ -121,6 +125,7 @@ def _sample_members(
             "canary": True,
             "dataset": dataset,
             "frame_idx": sample_index,
+            "sample_uid": sample_uid,
             "split_group_uid": split_group_uid,
         }),
         "trajectory_xy.npz": encode_trajectory_xy(
@@ -133,10 +138,23 @@ def _sample_members(
     if stage is ReactiveTrainingStage.NUPLAN_FULL:
         bev = np.zeros((8, height, width), dtype=np.float32)
         bev[0] = map_context[0]
-        bev[1] = map_context[1]
-        members["bev_segmentation.npz"] = encode_bev_segmentation(
+        bev[1, 100:350:20, 110:190] = 1.0
+        bev[2, 180:260, 110:190] = 1.0
+        bev[3, 240:260, 125:175] = 1.0
+        bev[4, 278:282, 110:190] = 1.0
+        bev[5, 210:230, 140:160] = 1.0
+        bev[6, 190:198, 130:138] = 1.0
+        bev[7, 165:177, 158:170] = 1.0
+        valid = np.ones_like(bev, dtype=np.bool_)
+        members[BEV_SEGMENTATION_MEMBER] = encode_bev_segmentation(
             bev,
-            np.ones_like(bev, dtype=np.bool_),
+            valid,
+        )
+        members[BEV_SEGMENTATION_STATS_MEMBER] = (
+            encode_bev_segmentation_stats(
+                bev,
+                valid,
+            )
         )
     return members
 
@@ -179,6 +197,7 @@ def write_reactive_canary_dataset(
                 )
                 members = _sample_members(
                     stage=stage,
+                    sample_uid=sample_uid,
                     sample_index=sample_index,
                     split_group_uid=split_group_uid,
                 )
@@ -205,6 +224,16 @@ def write_reactive_canary_dataset(
             sample_index
             if stage is ReactiveTrainingStage.NUPLAN_FULL
             else 0
+        ),
+        "bev_statistics_count": (
+            sample_index
+            if stage is ReactiveTrainingStage.NUPLAN_FULL
+            else 0
+        ),
+        "bev_taxonomy_version": (
+            "bev_segmentation_v2"
+            if stage is ReactiveTrainingStage.NUPLAN_FULL
+            else None
         ),
         "dataset": dataset,
         "dataset_version": REACTIVE_CANARY_SCHEMA_VERSION,
