@@ -135,6 +135,16 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "selection_ade_regression_margin_m must be non-negative"
         )
+    gate_dataset_digest = str(
+        config.get("required_gate_dataset_manifest_sha256", "")
+    )
+    if gate_dataset_digest and re.fullmatch(
+        r"[0-9a-f]{64}",
+        gate_dataset_digest,
+    ) is None:
+        raise ValueError(
+            "required_gate_dataset_manifest_sha256 must be empty or SHA-256"
+        )
 
 
 def _base_model(model):
@@ -1023,6 +1033,17 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         list(config["source_uris"]),
         stage=stage,
     )
+    required_gate_dataset_digest = str(
+        config.get("required_gate_dataset_manifest_sha256", "")
+    )
+    if (
+        required_gate_dataset_digest
+        and plan.dataset_manifest_sha256
+        != required_gate_dataset_digest
+    ):
+        raise ValueError(
+            "BEV overfit gate dataset differs from the full training dataset"
+        )
     assignments = assign_reactive_shards(
         plan.shards,
         world_size=world_size,
@@ -1043,6 +1064,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     )
     overfit_sample_count = int(config["overfit_sample_count"])
     overfit_sample_uids: tuple[str, ...] | None = None
+    overfit_sample_uid_sha256 = ""
     if overfit_sample_count:
         local_summaries = discover_bev_positive_samples(
             local_directories,
@@ -1054,6 +1076,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             rank_summaries,
             sample_count=overfit_sample_count,
         )
+        overfit_sample_uid_sha256 = hashlib.sha256(
+            "\n".join(overfit_sample_uids).encode("utf-8")
+        ).hexdigest()
     bev_pos_weights = (1.0,) * 8
     bev_repeat_factors = (1,) * 8
     bev_repeat_policy = None
@@ -1263,9 +1288,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             overfit_sample_uids
         )
         model_config["bev_overfit_sample_uid_sha256"] = (
-            hashlib.sha256(
-                "\n".join(overfit_sample_uids).encode("utf-8")
-            ).hexdigest()
+            overfit_sample_uid_sha256
         )
     started = time.perf_counter()
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
@@ -1423,6 +1446,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             dist.broadcast_object_list(checkpoint_digest, src=0)
             metrics = {
                 "checkpoint_sha256": str(checkpoint_digest[0]),
+                "dataset_manifest_sha256": (
+                    plan.dataset_manifest_sha256
+                ),
                 "elapsed_seconds": time.perf_counter() - started,
                 "epoch": epoch,
                 "is_best": int(is_best),
@@ -1432,6 +1458,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "maximum_parameter_delta": maximum_delta,
                 "optimizer_steps_per_epoch": optimizer_steps,
                 "overfit_gate_pass": int(overfit_gate_pass),
+                "overfit_sample_count": overfit_sample_count,
+                "overfit_sample_uid_sha256": (
+                    overfit_sample_uid_sha256
+                ),
                 "train_bev_segmentation": train_metrics[
                     "bev_segmentation"
                 ],
