@@ -291,7 +291,7 @@ def _stage_config(stage: str) -> dict[str, object]:
         "learning_rate": 1e-4,
         "num_loader_workers": 1,
         "num_workers": 8,
-        "overfit_min_dynamic_ap": 0.9,
+        "overfit_min_ap": 0.9,
         "overfit_min_recall": 0.9,
         "overfit_sample_count": 0,
         "parent_checkpoint_uri": (
@@ -376,6 +376,14 @@ def test_validate_stage_config_rejects_missing_worker_cpu_contract():
     config.pop("worker_cpus")
 
     with pytest.raises(ValueError, match="worker_cpus"):
+        validate_reactive_stage_config(config)
+
+
+def test_validate_stage_config_rejects_invalid_gate_dataset_digest():
+    config = _stage_config("nuplan_full")
+    config["required_gate_dataset_manifest_sha256"] = "not-a-digest"
+
+    with pytest.raises(ValueError, match="required_gate_dataset"):
         validate_reactive_stage_config(config)
 
 
