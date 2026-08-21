@@ -498,10 +498,14 @@ async function openOccupancy(
       timeout: 30_000,
     })
     .toBeGreaterThan(500);
-  await expect(page.locator('img[alt^="cam_"]')).toHaveCount(6);
+  const cameraEvidence = page.getByRole("group", {
+    name: "Camera evidence mosaic",
+  });
+  await cameraEvidence.scrollIntoViewIfNeeded();
+  await expect(cameraEvidence.locator('img[alt^="cam_"]')).toHaveCount(6);
   await expect
     .poll(() =>
-      page.locator('img[alt^="cam_"]').evaluateAll((images) =>
+      cameraEvidence.locator('img[alt^="cam_"]').evaluateAll((images) =>
         images.every(
           (image) => (image as HTMLImageElement).naturalWidth > 0,
         ),
