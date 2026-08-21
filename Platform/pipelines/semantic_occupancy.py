@@ -15,15 +15,31 @@ from typing import Any
 import numpy as np
 import torch
 
-from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
+from navigation.geometry import NavigationRasterGeometry
 
 SEMANTIC_OCCUPANCY_SCHEMA = "v1"
 SEMANTIC_OCCUPANCY_FORMAT_VERSION = 1
 SEMANTIC_OCCUPANCY_MAGIC = b"ASOC"
 SEMANTIC_OCCUPANCY_TAXONOMY_VERSION = "autoe2e-bev-semantic-v1"
-SEMANTIC_OCCUPANCY_GEOMETRY_ID = (
-    AUTOE2E_NAVIGATION_GEOMETRY.geometry_id
+SEMANTIC_OCCUPANCY_GEOMETRY = NavigationRasterGeometry(
+    geometry_id="autoe2e-bev-450x300-0p4m-v1",
+    height_px=450,
+    width_px=300,
+    meters_per_pixel=0.4,
+    x_min_m=-60.0,
+    x_max_m=120.0,
+    y_min_m=-60.0,
+    y_max_m=60.0,
+    ego_anchor_row=299.5,
+    ego_anchor_col=149.5,
+    matching_pc_range=(-60.0, -60.0, -5.0, 120.0, 60.0, 3.0),
+    matching_bev_h=450,
+    matching_bev_w=300,
+    route_corridor_width_m=3.5,
+    destination_marker_radius_m=2.0,
+    route_rear_clip_m=10.0,
 )
+SEMANTIC_OCCUPANCY_GEOMETRY_ID = SEMANTIC_OCCUPANCY_GEOMETRY.geometry_id
 SEMANTIC_OCCUPANCY_HEAD_VERSION = "bev-segmentation-head-v1"
 SEMANTIC_OCCUPANCY_CLASS_NAMES = (
     "drivable_area",
