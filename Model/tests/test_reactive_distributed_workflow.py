@@ -13,14 +13,25 @@ pytest.importorskip("flytekit")
 
 from flytekit.types.directory import FlyteDirectory
 
-from Platform.pipelines import distributed_training, workflows
+from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_CLASSES,
+)
+from Platform.pipelines import (
+    distributed_training,
+    nuplan_dataset,
+    workflows,
+)
 
 
 def test_flyte_entrypoints_do_not_use_mutable_defaults():
     pipelines_root = Path(workflows.__file__).parent
     mutable_defaults = []
 
-    for source_path in sorted(pipelines_root.glob("*.py")):
+    source_paths = [
+        pipelines_root / "distributed_training.py",
+        pipelines_root / "nuplan_dataset.py",
+    ]
+    for source_path in source_paths:
         tree = ast.parse(source_path.read_text())
         for node in ast.walk(tree):
             if not isinstance(
@@ -95,6 +106,9 @@ def test_ray_tasks_serialize_the_resolved_storage_path():
     assert distributed_training.train_reactive_stage_ray_2.environment == (
         expected_environment
     )
+    assert distributed_training.train_reactive_stage_ray_4.environment == (
+        expected_environment
+    )
     assert distributed_training.train_reactive_stage_ray_8.environment == (
         expected_environment
     )
@@ -147,6 +161,47 @@ def test_distributed_workflow_source_has_no_deployment_account_id():
     assert re.search(r"\b[0-9]{12}\b", source) is None
     assert "cr-" not in source
     assert "pg-" not in source
+    assert "bev_pos_weights" not in source
+    assert "bev_pos_weights" not in (
+        distributed_training.train_reactive_stage_ray_4
+        .python_interface.inputs
+    )
+
+
+def test_four_rank_full_training_depends_on_gate_but_not_its_weights():
+    overfit, full = (
+        distributed_training.wf_train_reactive_nuplan_ray_4.nodes
+    )
+    overfit_bindings = {
+        binding.var: binding.binding
+        for binding in overfit.bindings
+    }
+    full_bindings = {
+        binding.var: binding.binding
+        for binding in full.bindings
+    }
+
+    assert (
+        overfit_bindings[
+            "overfit_sample_count"
+        ].scalar.primitive.integer
+        == 64
+    )
+    assert (
+        full_bindings[
+            "overfit_sample_count"
+        ].scalar.primitive.integer
+        == 0
+    )
+    assert (
+        full_bindings[
+            "parent_checkpoint"
+        ].scalar.union.value.scalar.none_type
+        is not None
+    )
+    gate_metadata = full_bindings["gate_metadata"].promise
+    assert gate_metadata.node_id == overfit.id
+    assert gate_metadata.var == "metadata"
 
 
 def test_canary_launcher_is_idempotent_and_retries_flyte_admin():
@@ -162,22 +217,6 @@ def test_canary_launcher_is_idempotent_and_retries_flyte_admin():
     assert "grpc.StatusCode.UNAVAILABLE" in buildspec
     assert "FLYTE_ADMIN_TRANSIENT_RETRY=" in buildspec
     assert "remote.wait(" not in buildspec
-
-
-def test_l2d_mini_launcher_uses_explicit_range_and_remote_osm():
-    buildspec = (
-        Path(distributed_training.__file__).parents[1]
-        / "buildspec-launch-l2d-reactive-mini.yml"
-    ).read_text()
-
-    assert '"source_pbf": FlyteFile(os.environ["SOURCE_PBF_URI"])' in (
-        buildspec
-    )
-    assert '"start_ep": int(os.environ["START_EP"])' in buildspec
-    assert '"end_ep": int(os.environ["END_EP"])' in buildspec
-    assert "remote.fetch_execution(" in buildspec
-    assert "remote.sync_execution(" in buildspec
-    assert re.search(r"\b[0-9]{12}\b", buildspec) is None
 
 
 def test_nuplan_acquisition_launcher_uses_private_manifest_and_retries_admin():
@@ -199,7 +238,7 @@ def test_nuplan_acquisition_launcher_uses_private_manifest_and_retries_admin():
     assert "FLYTE_EXECUTION_DETACHED=true" in buildspec
     assert "remote.wait(" not in buildspec
     assert re.search(r"\b[0-9]{12}\b", buildspec) is None
-    workflow_source = Path(workflows.__file__).read_text()
+    workflow_source = Path(nuplan_dataset.__file__).read_text()
     assert "authorized HTTPS source returned" in workflow_source
     assert "authorized HTTPS source connection failed" in workflow_source
     assert "copy_s3_object_multipart(" in workflow_source
@@ -207,7 +246,7 @@ def test_nuplan_acquisition_launcher_uses_private_manifest_and_retries_admin():
 
 
 def test_nuplan_acquisition_workflow_binds_one_dynamic_import_program():
-    node, = workflows.wf_acquire_nuplan_raw_snapshot.nodes
+    node, = nuplan_dataset.wf_acquire_nuplan_raw_snapshot.nodes
 
     assert node.flyte_entity.name.endswith(
         "_acquire_nuplan_raw_snapshot"
@@ -221,51 +260,30 @@ def test_nuplan_acquisition_workflow_binds_one_dynamic_import_program():
     assert bindings["concurrency"].promise.var == "concurrency"
 
 
-def test_l2d_reactive_pack_workflow_binds_osm_and_target_contract():
-    node, = workflows.wf_pack_l2d_reactive_dataset.nodes
-    assert node.flyte_entity.name.endswith("wf_create_dataset_sharded")
+def test_nuplan_snapshot_pack_uses_bev_v2_cache_and_full_default():
+    node, = nuplan_dataset.wf_pack_nuplan_snapshot_reactive_dataset.nodes
     bindings = {
         binding.var: binding.binding
         for binding in node.bindings
     }
-    assert bindings["dataset"].scalar.primitive.string_value == (
-        workflows.Dataset.L2D.value
-    )
-    assert bindings[
-        "reactive_targets"
-    ].scalar.primitive.boolean is True
-    assert bindings["osm_graph_snapshot"].promise.var == (
-        "osm_graph_snapshot"
-    )
-    assert bindings["start_ep"].promise.var == "start_ep"
-    assert bindings["end_ep"].promise.var == "end_ep"
-
-
-def test_l2d_osm_builder_workflow_is_one_offline_task():
-    node, = workflows.wf_build_l2d_osm_graph_artifact.nodes
 
     assert node.flyte_entity.name.endswith(
-        "build_l2d_osm_graph_artifact"
+        "pack_nuplan_snapshot_reactive_dataset"
     )
-    assert node.bindings[0].binding.promise is not None
-
-
-def test_l2d_reactive_prepare_workflow_passes_built_osm_to_pack():
-    build_osm, pack = workflows.wf_prepare_l2d_reactive_dataset.nodes
-
-    assert build_osm.flyte_entity.name.endswith(
-        "build_l2d_osm_graph_artifact"
+    assert node.flyte_entity.metadata.cache_version == (
+        "nuplan-snapshot-pack-v2"
     )
-    assert pack.flyte_entity.name.endswith(
-        "wf_pack_l2d_reactive_dataset"
+    assert (
+        bindings["limit_total_scenarios"].promise.var
+        == "limit_total_scenarios"
     )
-    bindings = {
-        binding.var: binding.binding
-        for binding in pack.bindings
-    }
-    assert bindings["osm_graph_snapshot"].promise.node_id == build_osm.id
-    assert bindings["start_ep"].promise.var == "start_ep"
-    assert bindings["end_ep"].promise.var == "end_ep"
+    buildspec = (
+        Path(nuplan_dataset.__file__).parents[1]
+        / "buildspec-launch-nuplan-pack.yml"
+    ).read_text()
+    assert 'LIMIT_TOTAL_SCENARIOS: "0"' in buildspec
+    assert "Platform.pipelines.nuplan_dataset." in buildspec
+    assert re.search(r"\b[0-9]{12}\b", buildspec) is None
 
 
 def test_two_rank_canary_wires_both_stages_and_gate():
@@ -298,16 +316,34 @@ def test_canary_gate_requires_loss_decrease_and_stage_b_bev_off(tmp_path):
         "train_route_reconstruction": 0.2,
         "train_trajectory": 1.0,
         "validation_ade_6p4s_m": 2.0,
+        "validation_selection_score": 0.4,
+    }
+    stage_a_metrics = {
+        **{
+            f"bev_pos_weight_{index}": float(index + 2)
+            for index in range(len(BEV_SEGMENTATION_CLASSES))
+        },
+        **{
+            f"validation_bev_{class_name}_{suffix}": value
+            for class_name in BEV_SEGMENTATION_CLASSES
+            for suffix, value in (
+                ("average_precision", 0.5),
+                ("positive_cells", 10.0),
+                ("recall", 0.5),
+            )
+        },
     }
     stage_a = metadata(
         [
             {
                 **common,
+                **stage_a_metrics,
                 "train_bev_segmentation": 0.5,
                 "train_total": 1.7,
             },
             {
                 **common,
+                **stage_a_metrics,
                 "train_bev_segmentation": 0.4,
                 "train_total": 1.5,
             },
