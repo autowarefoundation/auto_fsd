@@ -89,6 +89,20 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
     override = int(config.get("steps_per_epoch", 0))
     if override < 0:
         raise ValueError("steps_per_epoch cannot be negative")
+    overfit_sample_count = int(config.get("overfit_sample_count", 0))
+    if overfit_sample_count not in (0, *range(64, 129)):
+        raise ValueError(
+            "overfit_sample_count must be zero or between 64 and 128"
+        )
+    if (
+        overfit_sample_count
+        and stage is not ReactiveTrainingStage.NUPLAN_FULL
+    ):
+        raise ValueError("BEV overfit mode is valid only for Stage A")
+    for name in ("overfit_min_dynamic_ap", "overfit_min_recall"):
+        threshold = float(config.get(name, -1.0))
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError(f"{name} must be in (0,1]")
     if "bev_pos_weights" in config:
         raise ValueError(
             "bev_pos_weights is derived from train statistics and cannot "
@@ -231,6 +245,79 @@ def _all_reduce_bev_statistics(local_statistics, device):
         ),
         exposure_digest=exposure_digest,
     )
+
+
+def _select_bev_overfit_subset(
+    rank_summaries,
+    *,
+    sample_count: int,
+) -> tuple[str, ...]:
+    """Choose a deterministic class-complete subset with every rank present."""
+    if not 64 <= sample_count <= 128:
+        raise ValueError("BEV overfit subset must contain 64 to 128 samples")
+    candidates: list[tuple[str, int, frozenset[int]]] = []
+    for rank, summaries in enumerate(rank_summaries):
+        if not summaries:
+            raise ValueError(f"BEV overfit rank {rank} has no train samples")
+        for sample_uid, positive_classes in summaries:
+            classes = frozenset(int(value) for value in positive_classes)
+            if any(value < 0 or value >= 8 for value in classes):
+                raise ValueError("BEV overfit summary has invalid class index")
+            candidates.append((str(sample_uid), rank, classes))
+    if len(candidates) < sample_count:
+        raise ValueError(
+            "BEV overfit request exceeds available train samples"
+        )
+    identities = [candidate[0] for candidate in candidates]
+    if len(set(identities)) != len(identities):
+        raise ValueError("BEV overfit candidates contain duplicate samples")
+
+    selected: dict[str, tuple[str, int, frozenset[int]]] = {}
+    for rank in range(len(rank_summaries)):
+        rank_candidates = [
+            candidate for candidate in candidates if candidate[1] == rank
+        ]
+        chosen = min(
+            rank_candidates,
+            key=lambda candidate: (
+                -len(candidate[2]),
+                candidate[0],
+            ),
+        )
+        selected[chosen[0]] = chosen
+
+    covered = set().union(
+        *(candidate[2] for candidate in selected.values())
+    )
+    while covered != set(range(8)):
+        remaining_classes = set(range(8)) - covered
+        eligible = [
+            candidate
+            for candidate in candidates
+            if candidate[0] not in selected
+            and candidate[2].intersection(remaining_classes)
+        ]
+        if not eligible:
+            raise ValueError(
+                "BEV overfit candidates do not cover every class"
+            )
+        chosen = min(
+            eligible,
+            key=lambda candidate: (
+                -len(candidate[2].intersection(remaining_classes)),
+                candidate[0],
+            ),
+        )
+        selected[chosen[0]] = chosen
+        covered.update(chosen[2])
+
+    for candidate in sorted(candidates, key=lambda value: value[0]):
+        if len(selected) >= sample_count:
+            break
+        selected.setdefault(candidate[0], candidate)
+    if len(selected) != sample_count:
+        raise ValueError("BEV overfit subset construction is incomplete")
+    return tuple(sorted(selected))
 
 
 def _parameter_sample(model, *, sample_size: int = 2048):
@@ -781,6 +868,7 @@ def _evaluate_global_reactive(
     metrics["bev_loss"] = float(
         bev_loss_values[0].item() / bev_loss_values[1].item()
     )
+    average_precisions: list[float] = []
     ap_lifts: list[float] = []
     for class_index, class_name in enumerate(BEV_SEGMENTATION_CLASSES):
         true_positive, false_positive, false_negative, positive, valid = (
@@ -809,6 +897,7 @@ def _evaluate_global_reactive(
             else 0.0
         )
         ap_lifts.append(ap_lift)
+        average_precisions.append(average_precision)
         prefix = f"bev_{class_name}"
         metrics[f"{prefix}_iou"] = _metric_ratio(
             true_positive,
@@ -830,6 +919,12 @@ def _evaluate_global_reactive(
 
     static_macro_ap_lift = float(np.mean(ap_lifts[:5]))
     dynamic_macro_ap_lift = float(np.mean(ap_lifts[5:]))
+    metrics["bev_static_macro_average_precision"] = float(
+        np.mean(average_precisions[:5])
+    )
+    metrics["bev_dynamic_macro_average_precision"] = float(
+        np.mean(average_precisions[5:])
+    )
     metrics["bev_static_macro_ap_lift"] = static_macro_ap_lift
     metrics["bev_dynamic_macro_ap_lift"] = dynamic_macro_ap_lift
     metrics["selection_score"] = (
@@ -890,6 +985,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         BEVClassRepeatPolicy,
         derive_bev_pos_weights,
         derive_bev_repeat_factors,
+        discover_bev_positive_samples,
         discover_bev_training_statistics,
         make_multi_dataset_loader,
         passthrough_nodesplitter,
@@ -943,6 +1039,19 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         rank_shards,
         cache_root=cache_root,
     )
+    overfit_sample_count = int(config["overfit_sample_count"])
+    overfit_sample_uids: tuple[str, ...] | None = None
+    if overfit_sample_count:
+        local_summaries = discover_bev_positive_samples(
+            local_directories,
+            val_fraction=float(config["val_fraction"]),
+        )
+        rank_summaries: list[Any] = [None] * world_size
+        dist.all_gather_object(rank_summaries, local_summaries)
+        overfit_sample_uids = _select_bev_overfit_subset(
+            rank_summaries,
+            sample_count=overfit_sample_count,
+        )
     bev_pos_weights = (1.0,) * 8
     bev_repeat_factors = (1,) * 8
     bev_repeat_policy = None
@@ -952,6 +1061,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         local_raw_statistics = discover_bev_training_statistics(
             local_directories,
             val_fraction=float(config["val_fraction"]),
+            sample_uids=overfit_sample_uids,
         )
         raw_bev_statistics = _all_reduce_bev_statistics(
             local_raw_statistics,
@@ -980,6 +1090,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 local_directories,
                 val_fraction=float(config["val_fraction"]),
                 repeat_factors=bev_repeat_factors,
+                sample_uids=overfit_sample_uids,
             )
         )
         effective_bev_statistics = _all_reduce_bev_statistics(
@@ -1055,15 +1166,25 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         min_lr=1e-5,
     )
 
-    calculated_steps = optimizer_steps_per_epoch(
-        total_samples=plan.total_samples,
-        val_fraction=float(config["val_fraction"]),
-        world_size=world_size,
-        per_rank_batch_size=int(config["per_rank_batch_size"]),
-        gradient_accumulation_steps=int(
-            config["gradient_accumulation_steps"]
-        ),
-    )
+    if overfit_sample_count:
+        calculated_steps = max(1, math.ceil(
+            overfit_sample_count
+            / (
+                world_size
+                * int(config["per_rank_batch_size"])
+                * int(config["gradient_accumulation_steps"])
+            )
+        ))
+    else:
+        calculated_steps = optimizer_steps_per_epoch(
+            total_samples=plan.total_samples,
+            val_fraction=float(config["val_fraction"]),
+            world_size=world_size,
+            per_rank_batch_size=int(config["per_rank_batch_size"]),
+            gradient_accumulation_steps=int(
+                config["gradient_accumulation_steps"]
+            ),
+        )
     optimizer_steps = int(config["steps_per_epoch"]) or calculated_steps
     global_batch = (
         world_size
@@ -1085,6 +1206,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     best_selection_score = -float("inf")
     best_ade = float("inf")
     restored = train.get_checkpoint()
+    if overfit_sample_count and restored is not None:
+        raise ValueError("BEV overfit mode cannot resume a checkpoint")
     if restored is not None:
         with restored.as_directory() as checkpoint_directory:
             (
@@ -1133,6 +1256,15 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         model_config["bev_effective_statistics"] = (
             effective_bev_statistics.metadata()
         )
+    if overfit_sample_uids is not None:
+        model_config["bev_overfit_sample_count"] = len(
+            overfit_sample_uids
+        )
+        model_config["bev_overfit_sample_uid_sha256"] = (
+            hashlib.sha256(
+                "\n".join(overfit_sample_uids).encode("utf-8")
+            ).hexdigest()
+        )
     started = time.perf_counter()
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
         _seed_epoch(seed, rank, epoch)
@@ -1145,6 +1277,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             shuffle=int(config["shuffle_buffer"]),
             shuffle_seed=seed + epoch,
             pin_memory=True,
+            sample_uids=overfit_sample_uids,
             decode_future_frames=False,
             bev_repeat_policy=bev_repeat_policy,
             nodesplitter=passthrough_nodesplitter,
@@ -1166,11 +1299,12 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             local_directories,
             batch_size=int(config["per_rank_batch_size"]),
             num_workers=min(int(config["num_loader_workers"]), 1),
-            split="val",
+            split=("train" if overfit_sample_count else "val"),
             val_fraction=float(config["val_fraction"]),
             shuffle=0,
             pin_memory=True,
             max_active_loaders=1,
+            sample_uids=overfit_sample_uids,
             decode_future_frames=False,
             nodesplitter=passthrough_nodesplitter,
         )
@@ -1184,6 +1318,34 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             ade_scale_m=float(config["selection_ade_scale_m"]),
         )
         scheduler.step(validation["selection_score"])
+        overfit_gate_pass = False
+        if (
+            overfit_sample_count
+            and epoch == int(config["epochs"])
+        ):
+            from data_processing.reactive_training_artifacts import (
+                BEV_SEGMENTATION_CLASSES,
+            )
+
+            minimum_recall = min(
+                validation[f"bev_{class_name}_recall"]
+                for class_name in BEV_SEGMENTATION_CLASSES
+            )
+            dynamic_ap = validation[
+                "bev_dynamic_macro_average_precision"
+            ]
+            overfit_gate_pass = (
+                dynamic_ap
+                >= float(config["overfit_min_dynamic_ap"])
+                and minimum_recall
+                >= float(config["overfit_min_recall"])
+            )
+            if not overfit_gate_pass:
+                raise RuntimeError(
+                    "BEV overfit gate failed: "
+                    f"dynamic_macro_ap={dynamic_ap:.6f} "
+                    f"minimum_recall={minimum_recall:.6f}"
+                )
         maximum_delta = _maximum_parameter_delta(
             model,
             world_size=world_size,
@@ -1267,6 +1429,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 ),
                 "maximum_parameter_delta": maximum_delta,
                 "optimizer_steps_per_epoch": optimizer_steps,
+                "overfit_gate_pass": int(overfit_gate_pass),
                 "train_bev_segmentation": train_metrics[
                     "bev_segmentation"
                 ],
