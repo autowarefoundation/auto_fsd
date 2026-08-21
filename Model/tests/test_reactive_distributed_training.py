@@ -6,13 +6,21 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from data_parsing.pre_extracted import (
+    BEVClassRepeatPolicy,
+    BEVTrainingStatistics,
     derive_bev_pos_weights,
+    derive_bev_repeat_factors,
     discover_bev_training_statistics,
     make_pre_extracted_loader,
     passthrough_nodesplitter,
+)
+from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_STATS_MEMBER,
+    encode_bev_segmentation_stats,
 )
 from distributed_training.reactive_canary_data import (
     write_reactive_canary_dataset,
@@ -478,3 +486,49 @@ def test_overfit_subset_is_class_complete_and_covers_every_rank():
         any(uid.startswith(f"rank-{rank}-") for uid in selected)
         for rank in range(4)
     )
+
+
+def test_bev_repeat_factors_are_frequency_aware_and_clipped():
+    positive_samples = (100, 25, 4, 1, 100, 25, 4, 1)
+    statistics = BEVTrainingStatistics(
+        sample_count=100,
+        effective_exposure_count=100,
+        positive_sample_count=positive_samples,
+        positive_cell_count=positive_samples,
+        positive_mass=tuple(float(value) for value in positive_samples),
+        valid_cell_count=(100,) * 8,
+        exposure_digest="a" * 64,
+    )
+
+    assert derive_bev_repeat_factors(
+        statistics,
+        frequency_threshold=0.25,
+        max_repeat=4,
+    ) == (1, 1, 3, 4, 1, 1, 3, 4)
+
+
+def test_bev_repeat_policy_preserves_non_bev_importance_mass():
+    target = np.zeros((8, 2, 2), dtype=np.float32)
+    target[3, 0, 0] = 1.0
+    payload = encode_bev_segmentation_stats(
+        target,
+        np.ones_like(target, dtype=np.bool_),
+    )
+    policy = BEVClassRepeatPolicy(
+        repeat_factors=(1, 1, 1, 4, 1, 1, 1, 1),
+        mean_repeat=2.0,
+    )
+
+    repeated = list(policy([{
+        BEV_SEGMENTATION_STATS_MEMBER: payload,
+        "sample": "rare",
+    }]))
+
+    assert len(repeated) == 4
+    assert {
+        item["__bev_repeat_factor__"] for item in repeated
+    } == {4}
+    assert sum(
+        float(item["__bev_sampling_importance__"])
+        for item in repeated
+    ) == pytest.approx(2.0)
