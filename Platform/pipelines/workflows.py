@@ -32,9 +32,6 @@ from data_processing.contract_versions import (
     SHARD_SCHEMA_VERSION as _SHARD_V,
     UID_SCHEMA_VERSION as _UID_V,
 )
-from data_parsing.kit_scenes.temporal_contract import (
-    kitscenes_temporal_contract,
-)
 from Platform.pipelines.dataset_publication import DatasetPublication
 from Platform.pipelines.overlay_tasks import (
     register_selected_overlay_checkpoint,
@@ -86,6 +83,30 @@ ROLLOUT_ALIGNED_CONTROL_OBJECTIVE_VERSION = "rollout_aligned_control_v1"
 SIMPLE_XY_IMITATION_OBJECTIVE_VERSION = "simple_xy_imitation_v1"
 L2D_SOURCE_REVISION = "1e7578b183c1cabd3b0f1061828b4cc76a323bd2"
 KITSCENES_SOURCE_REVISION = "6fde0034446669e2ed7235e4c7fe323cd23d599d"
+
+
+def kitscenes_temporal_contract(
+    *,
+    benchmark_protocol: bool,
+) -> dict[str, int | str]:
+    """Return KITScenes sampling margins and the unchanged tensor ABI."""
+    history_steps = 40 if benchmark_protocol else 64
+    future_steps = 50 if benchmark_protocol else 64
+    return {
+        "mode": (
+            "paper_protocol_approximation"
+            if benchmark_protocol
+            else "training"
+        ),
+        "sampling_history_steps": history_steps,
+        "sampling_future_steps": future_steps,
+        "abi_history_steps": 64,
+        "abi_future_steps": 64,
+        "history_padding": "left_zero",
+        "future_control_padding": "right_zero",
+        "future_gps_padding": "repeat_last",
+    }
+
 
 # The per-sample S3 label cache is REMOVED (#121 §3.4): at full L2D it was ~10M
 # tiny JSON objects (inode/quota/copy-rate blowup). The teacher is now called once
