@@ -624,6 +624,8 @@ def verify_reactive_canary_training(
             )
         required = (
             "train_bev_segmentation",
+            "train_bev_segmentation_bce",
+            "train_bev_segmentation_dice",
             "train_route_reconstruction",
             "train_total",
             "train_trajectory",
@@ -702,11 +704,29 @@ def verify_reactive_canary_training(
             "Stage A canary BEV loss did not decrease: "
             f"initial={initial_bev} later_min={minimum_later_bev}"
         )
+    initial_bev_bce = float(
+        stage_a[0]["train_bev_segmentation_bce"]
+    )
+    minimum_later_bev_bce = min(
+        float(epoch["train_bev_segmentation_bce"])
+        for epoch in stage_a[1:]
+    )
+    initial_bev_dice = float(
+        stage_a[0]["train_bev_segmentation_dice"]
+    )
+    minimum_later_bev_dice = min(
+        float(epoch["train_bev_segmentation_dice"])
+        for epoch in stage_a[1:]
+    )
 
     report = {
         "schema_version": "reactive_ddp_canary_report_v2",
         "stage_a_initial_bev": initial_bev,
+        "stage_a_initial_bev_bce": initial_bev_bce,
+        "stage_a_initial_bev_dice": initial_bev_dice,
         "stage_a_minimum_later_bev": minimum_later_bev,
+        "stage_a_minimum_later_bev_bce": minimum_later_bev_bce,
+        "stage_a_minimum_later_bev_dice": minimum_later_bev_dice,
         "stage_a_initial_total": initial_total,
         "stage_a_minimum_later_total": minimum_later_total,
         "stage_a_epochs": len(stage_a),
