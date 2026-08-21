@@ -534,6 +534,13 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
   expect(orbitPaint.height).toBeGreaterThan(500);
   expect(orbitPaint.colorfulSamples).toBeGreaterThan(300);
   expect(orbitPaint.variance).toBeGreaterThan(12);
+  await expect(
+    region.getByRole("slider", {
+      name: "Semantic confidence threshold",
+    }),
+  ).toHaveValue("0.2");
+  await expect(region).toContainText("4 objects");
+  await expect(region).not.toContainText("/56 objects");
 
   await region.getByRole("button", { name: "Top view" }).click();
   await page.waitForTimeout(850);

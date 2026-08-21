@@ -516,7 +516,7 @@ export function SemanticOccupancyView({
   const [mode, setMode] =
     useState<SemanticOccupancyDisplayMode>("prediction");
   const [cameraPreset, setCameraPreset] = useState<CameraPreset>("orbit");
-  const [threshold, setThreshold] = useState(0.5);
+  const [threshold, setThreshold] = useState(0.2);
   const [opacity, setOpacity] = useState(0.8);
   const [enabled, setEnabled] = useState(
     SEMANTIC_OCCUPANCY_CLASS_NAMES.map(() => true),
@@ -614,7 +614,7 @@ export function SemanticOccupancyView({
           </p>
         </div>
         <span className="font-mono text-[9px] uppercase text-slate-500">
-          {components.length}/{MAX_SCENE_OBJECTS} objects
+          {components.length} {components.length === 1 ? "object" : "objects"}
         </span>
       </div>
 
