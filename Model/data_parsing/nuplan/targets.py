@@ -268,7 +268,6 @@ def _map_layer_polygons(
         drivable_layers += (carpark_layer,)
     layer_map = {
         "drivable_area": drivable_layers,
-        "lane_boundary": (SemanticMapLayer.LANE,),
         "intersection": (SemanticMapLayer.INTERSECTION,),
         "crosswalk": (SemanticMapLayer.CROSSWALK,),
         "stop_line": (SemanticMapLayer.STOP_LINE,),
@@ -301,6 +300,13 @@ def _map_layer_polygons(
     }
     validity["drivable_area"] = all(
         layer in available for layer in required_drivable_layers
+    )
+    validity["lane_boundary"] = all(
+        layer in available
+        for layer in (
+            SemanticMapLayer.LANE,
+            SemanticMapLayer.LANE_CONNECTOR,
+        )
     )
     return polygons, validity
 
@@ -585,7 +591,7 @@ def build_nuplan_reactive_targets(
         scenario,
         reference_pose,
         geometry,
-        include_connectors=False,
+        include_connectors=True,
     )
     sources = {
         **map_polygons,
