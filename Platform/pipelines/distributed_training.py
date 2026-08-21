@@ -53,6 +53,9 @@ RAY_TASK_ENVIRONMENT = {
     "AUTO_E2E_RAY_STORAGE_PATH": RAY_STORAGE_PATH,
     "RAY_TRAIN_V2_ENABLED": "1",
 }
+BEV_OVERFIT_SAMPLE_COUNT = 64
+BEV_OVERFIT_MIN_DYNAMIC_AP = 0.9
+BEV_OVERFIT_MIN_RECALL = 0.9
 
 
 class RaySmokeOutput(NamedTuple):
@@ -367,6 +370,7 @@ def _run_reactive_stage_task(
     overfit_sample_count: int,
     overfit_min_dynamic_ap: float,
     overfit_min_recall: float,
+    required_gate_dataset_manifest_sha256: str = "",
 ) -> ReactiveRayOutput:
     from distributed_training.reactive_stage import run_reactive_stage
 
@@ -420,6 +424,9 @@ def _run_reactive_stage_task(
         "precision": precision,
         "route_weight": route_weight,
         "run_name": run_name,
+        "required_gate_dataset_manifest_sha256": (
+            required_gate_dataset_manifest_sha256
+        ),
         "selection_ade_regression_margin_m": 0.5,
         "selection_ade_scale_m": 5.0,
         "shuffle_buffer": shuffle_buffer,
@@ -450,6 +457,106 @@ def _run_reactive_stage_task(
         checkpoint_uri=str(result["checkpoint_file_uri"]),
         checkpoint_sha256=str(metrics["checkpoint_sha256"]),
     )
+
+
+def _validated_bev_overfit_gate_dataset(
+    source: FlyteFile,
+) -> str:
+    """Return the gated dataset digest after validating all overfit evidence."""
+    import math
+
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_CLASSES,
+    )
+
+    payload = json.loads(Path(source.download()).read_text())
+    metrics = payload.get("metrics")
+    history = payload.get("history")
+    if not isinstance(metrics, dict):
+        raise ValueError("BEV overfit gate metadata omitted final metrics")
+    if not isinstance(history, list) or not history:
+        raise ValueError("BEV overfit gate metadata omitted epoch history")
+    final_history = history[-1]
+    if not isinstance(final_history, dict):
+        raise ValueError("BEV overfit gate final history is invalid")
+
+    integer_contract = {
+        "overfit_gate_pass": 1,
+        "overfit_sample_count": BEV_OVERFIT_SAMPLE_COUNT,
+        "world_size": 4,
+    }
+    for name, expected in integer_contract.items():
+        if int(metrics.get(name, -1)) != expected:
+            raise ValueError(
+                f"BEV overfit gate has invalid {name}: {metrics.get(name)!r}"
+            )
+        if int(final_history.get(name, -1)) != expected:
+            raise ValueError(
+                f"BEV overfit gate history has invalid {name}"
+            )
+
+    for name in (
+        "checkpoint_sha256",
+        "dataset_manifest_sha256",
+        "overfit_sample_uid_sha256",
+    ):
+        value = str(metrics.get(name, ""))
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"BEV overfit gate has invalid {name}")
+        if str(final_history.get(name, "")) != value:
+            raise ValueError(
+                f"BEV overfit gate history disagrees on {name}"
+            )
+
+    dynamic_ap = float(metrics.get(
+        "validation_bev_dynamic_macro_average_precision",
+        float("nan"),
+    ))
+    if (
+        not math.isfinite(dynamic_ap)
+        or dynamic_ap < BEV_OVERFIT_MIN_DYNAMIC_AP
+    ):
+        raise ValueError(
+            "BEV overfit gate dynamic average precision is below 0.9"
+        )
+
+    pos_weights = []
+    for class_index, class_name in enumerate(BEV_SEGMENTATION_CLASSES):
+        recall = float(metrics.get(
+            f"validation_bev_{class_name}_recall",
+            float("nan"),
+        ))
+        positive_cells = float(metrics.get(
+            f"validation_bev_{class_name}_positive_cells",
+            float("nan"),
+        ))
+        if (
+            not math.isfinite(recall)
+            or recall < BEV_OVERFIT_MIN_RECALL
+        ):
+            raise ValueError(
+                f"BEV overfit gate recall failed for {class_name}"
+            )
+        if (
+            not math.isfinite(positive_cells)
+            or positive_cells <= 0.0
+        ):
+            raise ValueError(
+                f"BEV overfit gate has no positives for {class_name}"
+            )
+        weight = float(metrics.get(
+            f"bev_pos_weight_{class_index}",
+            float("nan"),
+        ))
+        if not math.isfinite(weight) or weight < 1.0:
+            raise ValueError(
+                f"BEV overfit gate has invalid weight for {class_name}"
+            )
+        pos_weights.append(weight)
+    if all(abs(weight - 1.0) <= 1e-12 for weight in pos_weights):
+        raise ValueError("BEV overfit gate derived only unit pos weights")
+
+    return str(metrics["dataset_manifest_sha256"])
 
 
 @task(
@@ -707,7 +814,18 @@ def train_reactive_stage_ray_4(
     overfit_min_recall: float = 0.9,
 ) -> ReactiveRayOutput:
     """Run a four-rank Reactive performance training stage."""
-    _ = gate_metadata
+    if overfit_sample_count:
+        if gate_metadata is not None:
+            raise ValueError("BEV overfit runs cannot consume gate metadata")
+        required_gate_dataset = ""
+    else:
+        if gate_metadata is None:
+            raise ValueError(
+                "four-rank full training requires BEV overfit gate metadata"
+            )
+        required_gate_dataset = _validated_bev_overfit_gate_dataset(
+            gate_metadata
+        )
     return _run_reactive_stage_task(
         shards=shards,
         stage=stage,
@@ -741,6 +859,7 @@ def train_reactive_stage_ray_4(
         overfit_sample_count=overfit_sample_count,
         overfit_min_dynamic_ap=overfit_min_dynamic_ap,
         overfit_min_recall=overfit_min_recall,
+        required_gate_dataset_manifest_sha256=required_gate_dataset,
     )
 
 
@@ -816,7 +935,7 @@ def wf_ray_ddp_smoke_4(steps: int = 4) -> FlyteFile:
 @workflow
 def wf_overfit_reactive_nuplan_ray_4(
     nuplan_shards: List[FlyteDirectory],
-    sample_count: int = 64,
+    sample_count: int = BEV_OVERFIT_SAMPLE_COUNT,
     epochs: int = 50,
     learning_rate: float = 3e-4,
     val_fraction: float = 0.2,
@@ -841,8 +960,8 @@ def wf_overfit_reactive_nuplan_ray_4(
         bev_weight=1.0,
         route_weight=1.0,
         overfit_sample_count=sample_count,
-        overfit_min_dynamic_ap=0.9,
-        overfit_min_recall=0.9,
+        overfit_min_dynamic_ap=BEV_OVERFIT_MIN_DYNAMIC_AP,
+        overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
     )
 
 
@@ -875,9 +994,9 @@ def wf_train_reactive_nuplan_ray_4(
         is_pretrained=True,
         bev_weight=bev_weight,
         route_weight=route_weight,
-        overfit_sample_count=64,
-        overfit_min_dynamic_ap=0.9,
-        overfit_min_recall=0.9,
+        overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
+        overfit_min_dynamic_ap=BEV_OVERFIT_MIN_DYNAMIC_AP,
+        overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
     )
     return train_reactive_stage_ray_4(
         shards=nuplan_shards,
