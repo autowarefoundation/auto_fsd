@@ -356,14 +356,67 @@ def test_bev_loss_stays_fp32_and_handles_empty_targets():
     )
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        negative_loss = loss_fn(negative_logits, target, valid)
+        negative_components = loss_fn.components(
+            negative_logits,
+            target,
+            valid,
+        )
+        negative_loss = negative_components["total"]
         positive_loss = loss_fn(positive_logits, target, valid)
     negative_loss.backward()
 
     assert negative_loss.dtype == torch.float32
     assert negative_loss.item() < 1e-5
+    assert negative_components["dice"].item() == 0.0
+    assert negative_loss.item() == pytest.approx(
+        0.5 * negative_components["bce"].item()
+    )
     assert positive_loss.item() > 1.0
     assert torch.isfinite(negative_logits.grad).all()
+
+
+def test_repeat_importance_preserves_non_bev_objective_mean():
+    objective = ReactiveMultitaskObjective(
+        ReactiveTrainingStage.L2D_CONTINUATION,
+        bev_pos_weight=[1.0] * 8,
+    )
+    predicted_controls = torch.zeros(1, 128)
+    auxiliary = {
+        "route_reconstruction_logits": torch.zeros(1, 2, 4, 4),
+    }
+    batch = {
+        "trajectory_xy_m": torch.ones(1, 64, 2),
+        "trajectory_valid": torch.ones(1, 64, dtype=torch.bool),
+        "initial_speed_mps": torch.zeros(1),
+        "route_mask": torch.zeros(1, 2, 4, 4),
+        "route_channel_valid": torch.ones(1, 2, dtype=torch.bool),
+    }
+    baseline = objective(
+        predicted_controls,
+        auxiliary,
+        batch,
+    )
+
+    weighted_terms = []
+    for repeat, importance in ((1, 2.0), (3, 2.0 / 3.0)):
+        weighted_batch = {
+            **batch,
+            "bev_sampling_importance": torch.tensor([importance]),
+        }
+        terms = objective(
+            predicted_controls,
+            auxiliary,
+            weighted_batch,
+        )
+        weighted_terms.extend([terms] * repeat)
+
+    for name in ("trajectory", "route_reconstruction"):
+        weighted_mean = torch.stack([
+            terms[name] for terms in weighted_terms
+        ]).mean()
+        assert weighted_mean.item() == pytest.approx(
+            baseline[name].item()
+        )
 
 
 def test_perfect_multitask_predictions_approach_zero():
