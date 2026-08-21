@@ -6,7 +6,7 @@ env:
     FLYTE_PROJECT: auto-e2e
     FLYTE_DOMAIN: development
     WORKFLOW_NAME: >-
-      Platform.pipelines.workflows.wf_acquire_nuplan_raw_snapshot
+      Platform.pipelines.nuplan_dataset.wf_acquire_nuplan_raw_snapshot
     FLYTE_VERSION: ""
     EXECUTION_NAME: ""
     SOURCE_MANIFEST_URI: ""
