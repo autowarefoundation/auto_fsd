@@ -368,8 +368,10 @@ def _run_reactive_stage_task(
     bev_min_positive_samples: int,
     bev_min_positive_cells: int,
     overfit_sample_count: int,
+    overfit_shard_limit: int,
     overfit_min_ap: float,
     overfit_min_recall: float,
+    validation_sample_limit: int,
     required_gate_dataset_manifest_sha256: str = "",
 ) -> ReactiveRayOutput:
     from distributed_training.reactive_stage import run_reactive_stage
@@ -419,6 +421,7 @@ def _run_reactive_stage_task(
         "overfit_min_ap": overfit_min_ap,
         "overfit_min_recall": overfit_min_recall,
         "overfit_sample_count": overfit_sample_count,
+        "overfit_shard_limit": overfit_shard_limit,
         "parent_checkpoint_uri": parent_uri,
         "per_rank_batch_size": 1,
         "precision": precision,
@@ -437,6 +440,7 @@ def _run_reactive_stage_task(
         "training_seed": training_seed,
         "use_gpu": True,
         "val_fraction": val_fraction,
+        "validation_sample_limit": validation_sample_limit,
         "weight_decay": weight_decay,
         "worker_cpus": _reactive_worker_cpus(num_workers),
     })
@@ -482,7 +486,6 @@ def _validated_bev_overfit_gate_dataset(
 
     integer_contract = {
         "overfit_gate_pass": 1,
-        "overfit_sample_count": BEV_OVERFIT_SAMPLE_COUNT,
         "world_size": 4,
     }
     for name, expected in integer_contract.items():
@@ -494,6 +497,15 @@ def _validated_bev_overfit_gate_dataset(
             raise ValueError(
                 f"BEV overfit gate history has invalid {name}"
             )
+    sample_count = int(metrics.get("overfit_sample_count", -1))
+    if not BEV_OVERFIT_SAMPLE_COUNT <= sample_count <= 128:
+        raise ValueError(
+            "BEV overfit gate sample count must be between 64 and 128"
+        )
+    if int(final_history.get("overfit_sample_count", -1)) != sample_count:
+        raise ValueError(
+            "BEV overfit gate history has invalid overfit_sample_count"
+        )
 
     for name in (
         "checkpoint_sha256",
@@ -772,15 +784,17 @@ def train_reactive_stage_ray_2(
         bev_min_positive_samples=1,
         bev_min_positive_cells=1,
         overfit_sample_count=0,
+        overfit_shard_limit=0,
         overfit_min_ap=0.9,
         overfit_min_recall=0.9,
+        validation_sample_limit=256,
     )
 
 
 @task(
     task_config=RAY_REACTIVE_4,
     container_image=TRAINING_IMAGE,
-    retries=1,
+    retries=0,
     labels={
         "kueue.x-k8s.io/queue-name": "gpu-performance",
         "kueue.x-k8s.io/priority-class": "research-low",
@@ -856,9 +870,11 @@ def train_reactive_stage_ray_4(
             1 if overfit_sample_count else 2000
         ),
         overfit_sample_count=overfit_sample_count,
+        overfit_shard_limit=(32 if overfit_sample_count else 0),
         overfit_min_ap=overfit_min_ap,
         overfit_min_recall=overfit_min_recall,
         required_gate_dataset_manifest_sha256=required_gate_dataset,
+        validation_sample_limit=1024,
     )
 
 
@@ -876,6 +892,7 @@ def train_reactive_stage_ray_8(
     shards: List[FlyteDirectory],
     stage: str,
     parent_checkpoint: Optional[FlyteFile] = None,
+    gate_metadata: Optional[FlyteFile] = None,
     backbone: str = "swin_v2_tiny",
     epochs: int = 3,
     learning_rate: float = 1e-4,
@@ -894,6 +911,20 @@ def train_reactive_stage_ray_8(
     corridor_pos_weight: float = 1.0,
 ) -> ReactiveRayOutput:
     """Run one production-size Reactive DDP stage."""
+    if stage == "nuplan_full":
+        if gate_metadata is None:
+            raise ValueError(
+                "eight-rank Stage A requires BEV overfit gate metadata"
+            )
+        required_gate_dataset = _validated_bev_overfit_gate_dataset(
+            gate_metadata
+        )
+    else:
+        if gate_metadata is not None:
+            raise ValueError(
+                "Stage B cannot consume BEV overfit gate metadata"
+            )
+        required_gate_dataset = ""
     return _run_reactive_stage_task(
         shards=shards,
         stage=stage,
@@ -921,8 +952,11 @@ def train_reactive_stage_ray_8(
         bev_min_positive_samples=20,
         bev_min_positive_cells=2000,
         overfit_sample_count=0,
+        overfit_shard_limit=0,
         overfit_min_ap=0.9,
         overfit_min_recall=0.9,
+        required_gate_dataset_manifest_sha256=required_gate_dataset,
+        validation_sample_limit=1024,
     )
 
 
@@ -1032,10 +1066,31 @@ def wf_train_reactive_nuplan_l2d_ray_8(
     route_weight: float = 1.0,
 ) -> ReactiveDistributedProgramOutput:
     """Train Stage A and Stage B as separate eight-rank RayJobs."""
+    overfit = train_reactive_stage_ray_4(
+        shards=nuplan_shards,
+        stage="nuplan_full",
+        parent_checkpoint=None,
+        gate_metadata=None,
+        epochs=50,
+        learning_rate=3e-4,
+        val_fraction=val_fraction,
+        num_loader_workers=num_loader_workers,
+        training_seed=training_seed,
+        precision=precision,
+        steps_per_epoch=0,
+        shuffle_buffer=256,
+        is_pretrained=True,
+        bev_weight=bev_weight,
+        route_weight=route_weight,
+        overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
+        overfit_min_ap=BEV_OVERFIT_MIN_AP,
+        overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
+    )
     stage_a = train_reactive_stage_ray_8(
         shards=nuplan_shards,
         stage="nuplan_full",
         parent_checkpoint=None,
+        gate_metadata=overfit.metadata,
         epochs=stage_a_epochs,
         learning_rate=stage_a_learning_rate,
         val_fraction=val_fraction,
@@ -1049,6 +1104,7 @@ def wf_train_reactive_nuplan_l2d_ray_8(
         shards=l2d_shards,
         stage="l2d_continuation",
         parent_checkpoint=stage_a.checkpoint,
+        gate_metadata=None,
         epochs=stage_b_epochs,
         learning_rate=stage_b_learning_rate,
         val_fraction=val_fraction,
