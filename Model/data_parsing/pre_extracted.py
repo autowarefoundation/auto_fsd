@@ -675,6 +675,79 @@ def summarize_bev_positive_samples(
     return summaries
 
 
+def select_bev_validation_sample_uids(
+    records: Sequence[BEVSampleStatistics],
+    *,
+    val_fraction: float,
+    sample_limit: int,
+) -> tuple[str, ...]:
+    """Choose a deterministic class-aware validation subset."""
+    if sample_limit <= 0:
+        raise ValueError("BEV validation sample limit must be positive")
+    candidates = sorted(
+        (
+            record
+            for record in records
+            if _is_validation_group(
+                record.split_group_uid,
+                val_fraction,
+            )
+        ),
+        key=lambda record: record.sample_uid,
+    )
+    if not candidates:
+        raise ValueError("BEV sample discovery selected no validation samples")
+
+    selected: dict[str, BEVSampleStatistics] = {}
+    covered: set[int] = set()
+    while len(selected) < sample_limit and covered != set(range(8)):
+        remaining = set(range(8)) - covered
+        eligible = [
+            record
+            for record in candidates
+            if record.sample_uid not in selected
+            and set(record.positive_classes).intersection(remaining)
+        ]
+        if not eligible:
+            break
+        chosen = min(
+            eligible,
+            key=lambda record: (
+                -len(set(record.positive_classes).intersection(remaining)),
+                record.sample_uid,
+            ),
+        )
+        selected[chosen.sample_uid] = chosen
+        covered.update(chosen.positive_classes)
+
+    for record in candidates:
+        if len(selected) >= sample_limit:
+            break
+        selected.setdefault(record.sample_uid, record)
+    return tuple(sorted(selected))
+
+
+def discover_validation_sample_uids(
+    shard_dirs: Sequence[str | Path],
+    *,
+    val_fraction: float,
+    sample_limit: int,
+) -> tuple[str, ...]:
+    """Choose a deterministic validation subset from packed metadata."""
+    if sample_limit <= 0:
+        raise ValueError("validation sample limit must be positive")
+    inventory = discover_split_inventory(shard_dirs)
+    selected = sorted(
+        sample_uid
+        for group_uid, sample_uids in inventory.sample_uids_by_group
+        if _is_validation_group(group_uid, val_fraction)
+        for sample_uid in sample_uids
+    )[:sample_limit]
+    if not selected:
+        raise ValueError("sample discovery selected no validation samples")
+    return tuple(selected)
+
+
 def discover_bev_positive_samples(
     shard_dirs: Sequence[str | Path],
     *,
