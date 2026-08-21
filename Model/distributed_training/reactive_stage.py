@@ -45,6 +45,8 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             f"num_workers must be one of {sorted(SUPPORTED_WORLD_SIZES)}"
         )
+    if int(config.get("worker_cpus", 0)) <= 0:
+        raise ValueError("worker_cpus must be positive")
     if int(config.get("epochs", 0)) <= 0:
         raise ValueError("epochs must be positive")
     if int(config.get("per_rank_batch_size", 0)) != 1:
@@ -1482,7 +1484,10 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
         scaling_config=train.ScalingConfig(
             num_workers=int(config["num_workers"]),
             use_gpu=True,
-            resources_per_worker={"CPU": 4, "GPU": 1},
+            resources_per_worker={
+                "CPU": int(config["worker_cpus"]),
+                "GPU": 1,
+            },
             placement_strategy="SPREAD",
         ),
         run_config=train.RunConfig(
