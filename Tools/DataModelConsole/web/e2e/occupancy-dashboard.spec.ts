@@ -675,8 +675,11 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
     .getByLabel("Occupancy model", { exact: true })
     .selectOption(HENET_MODEL);
   await expect(region.getByText("Lane divider", { exact: true })).toBeVisible();
-  await expect(region.getByText("VRU", { exact: true })).toHaveCount(0);
-  await expect(region.getByText("Obstacle", { exact: true })).toHaveCount(0);
+  await expect(region.locator("fieldset label")).toHaveText([
+    "Drivable",
+    "Lane divider",
+    "Vehicle",
+  ]);
   await expect(
     page.getByText(
       "HENet is only free for academic research purposes and needs author authorization for commerce.",
