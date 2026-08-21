@@ -490,12 +490,18 @@ export default function OccupancyPage() {
       )}
       <SemanticOccupancyView
         artifact={artifact}
+        laneLabel={
+          selectedModel?.model_family === "HENet"
+            ? "Lane divider"
+            : undefined
+        }
         row={row}
         status={
           occupancyStatus === "ready" && row === undefined
             ? "unavailable"
             : occupancyStatus
         }
+        supportedClasses={selectedModel?.supported_classes}
       />
 
       {selectedModel && (
