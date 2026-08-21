@@ -43,11 +43,22 @@ class TestFeatureFusionWithSwinChannels:
     def test_dynamic_backbone_channels_with_swin_sizes(self, device):
         """FeatureFusion should accept Swin's per-stage channels (96, 192, 384, 768)
         at their natural spatial resolutions and produce the expected fused shape."""
-        backbone_channels = 96 + 192 + 384 + 768  # 1440
+        backbone_channels = (96, 192, 384, 768)
         fusion = FeatureFusion(
-            num_views=8, backbone_channels=backbone_channels, fusion_mode="bev",
+            num_views=8,
+            backbone_channels=backbone_channels,
+            fusion_mode="bev",
+            image_feature_size=32,
             view_fusion_kwargs={"bev_h": 8, "bev_w": 8},
         ).to(device)
+        observed = {}
+
+        def record_source_resolution(_module, args):
+            observed["shape"] = tuple(args[0].shape)
+
+        handle = fusion.view_fusion.register_forward_pre_hook(
+            record_source_resolution
+        )
 
         # Per-stage Swin spatial dims for a 256x256 input
         features = [
@@ -56,6 +67,10 @@ class TestFeatureFusionWithSwinChannels:
             torch.randn(16, 384, 16, 16, device=device),
             torch.randn(16, 768, 8, 8, device=device),
         ]
-        out = fusion(features, B=2, V=8)
+        try:
+            out = fusion(features, B=2, V=8)
+        finally:
+            handle.remove()
         assert out.shape == (2, 256, 8, 8)
+        assert observed["shape"] == (16, 256, 32, 32)
         assert torch.isfinite(out).all()
