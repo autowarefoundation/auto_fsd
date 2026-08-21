@@ -13,9 +13,9 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from navigation.geometry import (
-    AUTOE2E_NAVIGATION_GEOMETRY,
-    NavigationRasterGeometry,
+from navigation.geometry import NavigationRasterGeometry
+from Platform.pipelines.semantic_occupancy import (
+    SEMANTIC_OCCUPANCY_GEOMETRY,
 )
 
 BEVFORMER_V2_REPOSITORY = "https://github.com/fundamentalvision/BEVFormer"
@@ -252,7 +252,7 @@ def scale_packed_projection(
 def rasterize_detection_boxes(
     detections: Sequence[DetectionBox],
     *,
-    geometry: NavigationRasterGeometry = AUTOE2E_NAVIGATION_GEOMETRY,
+    geometry: NavigationRasterGeometry = SEMANTIC_OCCUPANCY_GEOMETRY,
     score_threshold: float = 0.2,
     max_detections: int = 300,
 ) -> np.ndarray:
