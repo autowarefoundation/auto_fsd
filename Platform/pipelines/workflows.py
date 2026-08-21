@@ -32,7 +32,6 @@ from data_processing.contract_versions import (
     SHARD_SCHEMA_VERSION as _SHARD_V,
     UID_SCHEMA_VERSION as _UID_V,
 )
-from data_processing.source_revisions import L2D_DATA_REVISION
 from data_parsing.kit_scenes.temporal_contract import (
     kitscenes_temporal_contract,
 )
@@ -85,7 +84,7 @@ KITSCENES_NAVIGATION_OBJECTIVE_VERSION = (
 ROLLOUT_ALIGNED_OBJECTIVE_VERSION = "rollout_aligned_planner_v1"
 ROLLOUT_ALIGNED_CONTROL_OBJECTIVE_VERSION = "rollout_aligned_control_v1"
 SIMPLE_XY_IMITATION_OBJECTIVE_VERSION = "simple_xy_imitation_v1"
-L2D_SOURCE_REVISION = L2D_DATA_REVISION
+L2D_SOURCE_REVISION = "1e7578b183c1cabd3b0f1061828b4cc76a323bd2"
 KITSCENES_SOURCE_REVISION = "6fde0034446669e2ed7235e4c7fe323cd23d599d"
 
 # The per-sample S3 label cache is REMOVED (#121 §3.4): at full L2D it was ~10M
