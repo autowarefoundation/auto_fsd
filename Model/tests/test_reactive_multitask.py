@@ -338,6 +338,34 @@ def test_all_invalid_losses_are_differentiable_zero():
     assert controls.grad is not None
 
 
+def test_bev_loss_stays_fp32_and_handles_empty_targets():
+    loss_fn = BEVSegmentationAuxiliaryLoss([64.0])
+    target = torch.zeros(1, 1, 16, 16)
+    valid = torch.ones_like(target, dtype=torch.bool)
+    negative_logits = torch.full(
+        target.shape,
+        -20.0,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    positive_logits = torch.full(
+        target.shape,
+        20.0,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        negative_loss = loss_fn(negative_logits, target, valid)
+        positive_loss = loss_fn(positive_logits, target, valid)
+    negative_loss.backward()
+
+    assert negative_loss.dtype == torch.float32
+    assert negative_loss.item() < 1e-5
+    assert positive_loss.item() > 1.0
+    assert torch.isfinite(negative_logits.grad).all()
+
+
 def test_perfect_multitask_predictions_approach_zero():
     bev_target = torch.zeros(1, 8, 4, 4)
     bev_target[:, :, 1:3, 1:3] = 1.0
@@ -730,7 +758,7 @@ def test_multitask_evaluator_reports_partial_horizons_and_route_use(
     assert report["bev_segmentation"]["available"] is True
     assert set(report["bev_segmentation"]["per_class"]) == {
         "drivable_area",
-        "lane_area",
+        "lane_boundary",
         "intersection",
         "crosswalk",
         "stop_line",
