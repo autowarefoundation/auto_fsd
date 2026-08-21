@@ -11506,6 +11506,32 @@ def wf_precompute_bevformer_v2_occupancy(
 
 
 @workflow
+def wf_precompute_henet_occupancy(
+    checkpoint: FlyteFile,
+    checkpoint_sha256: str,
+    shard_dirs: List[FlyteDirectory],
+    dataset: str,
+    dataset_version: str,
+    dataset_manifest_sha256: str,
+    artifacts_bucket: str,
+    publication_timestamp: str,
+    aws_region: str = "us-west-2",
+) -> SemanticOccupancyPrecomputeOutput:
+    """Publish official HENet segmentation for the Occupancy Dashboard."""
+    return precompute_henet_occupancy_artifacts(
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        shard_dirs=shard_dirs,
+        dataset=dataset,
+        dataset_version=dataset_version,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        artifacts_bucket=artifacts_bucket,
+        publication_timestamp=publication_timestamp,
+        aws_region=aws_region,
+    )
+
+
+@workflow
 def wf_evaluate_kitscenes_benchmark(
     checkpoint: FlyteFile,
     benchmark_shards: List[FlyteDirectory],
