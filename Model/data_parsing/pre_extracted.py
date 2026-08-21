@@ -566,14 +566,19 @@ def summarize_bev_training_statistics(
         or any(value < 1 for value in factors)
     ):
         raise ValueError("BEV repeat factors must be positive per class")
-    allowed_samples = (
-        frozenset(str(value) for value in sample_uids)
+    requested_samples = (
+        tuple(str(value) for value in sample_uids)
         if sample_uids is not None
+        else None
+    )
+    allowed_samples = (
+        frozenset(requested_samples)
+        if requested_samples is not None
         else None
     )
     if allowed_samples is not None and (
         not allowed_samples
-        or len(allowed_samples) != len(sample_uids)
+        or len(allowed_samples) != len(requested_samples)
     ):
         raise ValueError("BEV sample subset must be non-empty and unique")
 
