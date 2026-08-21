@@ -240,18 +240,27 @@ class ReactiveE2E(nn.Module):
         reasoning_pred = None
         reasoning_latent = None
         reasoning_horizon_tokens = None
+        reasoning_confidence = None
         if self.ReasoningHead is not None:
             reasoning_pred = self.ReasoningHead(
                 visual_ctx, ego_ctx,
             )
             reasoning_latent = reasoning_pred.reasoning_latent
             reasoning_horizon_tokens = reasoning_pred.horizon_tokens
+            # Pool per-horizon confidence logits → [B] probabilities for the gate (#110).
+            from model_components.trajectory_planning.reasoning_coupling import (
+                pool_reasoning_confidence,
+            )
+            reasoning_confidence = pool_reasoning_confidence(
+                reasoning_pred.confidence_logits, from_logits=True
+            )
 
         # --- Trajectory Prediction ---
         trajectory = self.TrajectoryPlanner(
             feature_vector, visual_ctx, ego_ctx,
             reasoning_latent=reasoning_latent,
             reasoning_horizon_tokens=reasoning_horizon_tokens,
+            reasoning_confidence=reasoning_confidence,
             **kwargs,
         )
 

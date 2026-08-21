@@ -11,6 +11,7 @@ Synthetic tensors, no GPU / network. Covers, for both Bezier and Flow-matching:
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -158,3 +159,62 @@ def test_flow_matching_is_horizon_aware_not_pooled():
         b = planner(bev, vis, ego, generator=g2, reasoning_horizon_tokens=tokens_b)
     assert not torch.allclose(a, b, atol=1e-5), \
         "zeroing one horizon left the trajectory unchanged — timing info is lost"
+
+
+def test_confidence_scales_residual_and_preserves_zero_init():
+    """#110: low confidence → weaker residual; any confidence is still no-op at init."""
+    from model_components.trajectory_planning.reasoning_coupling import (
+        pool_reasoning_confidence,
+    )
+
+    torch.manual_seed(0)
+    c = ReasoningCoupling(EMBED, mode="pooled_latent")
+    ctx = torch.randn(B, EMBED)
+    latent = torch.randn(B, EMBED)
+    high = torch.ones(B)
+    low = torch.full((B,), 0.1)
+
+    # Strict no-op at init for any confidence.
+    with torch.no_grad():
+        out_high = c(ctx, reasoning_latent=latent, confidence=high)
+        out_low = c(ctx, reasoning_latent=latent, confidence=low)
+    assert torch.allclose(out_high, ctx, atol=1e-6)
+    assert torch.allclose(out_low, ctx, atol=1e-6)
+
+    # Open the gate: high confidence should move context more than low.
+    with torch.no_grad():
+        c.alpha.fill_(1.0)
+        c.reason_proj[-1].weight.normal_()
+        moved_high = c(ctx, reasoning_latent=latent, confidence=high)
+        moved_low = c(ctx, reasoning_latent=latent, confidence=low)
+    dist_high = (moved_high - ctx).norm()
+    dist_low = (moved_low - ctx).norm()
+    assert dist_high > dist_low
+
+    pooled = pool_reasoning_confidence(torch.tensor([[0.2, 0.4, 0.6, 0.8, 1.0]]))
+    assert pooled.shape == (1,)
+    assert float(pooled) == pytest.approx(0.6)
+
+
+def test_confidence_coupling_ab_reports_ade(build_mock_model, device):
+    from evaluation.confidence_coupling_ab import run_confidence_coupling_ab
+
+    report = run_confidence_coupling_ab(
+        build_mock_model, device=device, steps=6, seed=0,
+    )
+    assert report["scaled"]["loss_last"] < report["scaled"]["loss_first"]
+    assert np.isfinite(report["scaled"]["ADE@3s"])
+    assert np.isfinite(report["unscaled"]["ADE@3s"])
+    assert np.isfinite(report["scaled_conf0"]["ADE@3s"])
+    assert np.isfinite(report["scaled_conf1"]["ADE@3s"])
+
+
+def test_expected_calibration_error_perfect_and_bad():
+    from evaluation.confidence_calibration import expected_calibration_error
+
+    conf = torch.tensor([0.1, 0.2, 0.8, 0.9])
+    perfect = expected_calibration_error(conf, conf)
+    assert perfect["ece"] == pytest.approx(0.0, abs=1e-6)
+
+    bad = expected_calibration_error(conf, 1.0 - conf)
+    assert bad["ece"] > 0.3

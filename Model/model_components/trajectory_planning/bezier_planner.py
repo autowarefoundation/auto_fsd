@@ -109,6 +109,7 @@ class BezierPlanner(BasePlanner):
 
     def forward(self, bev_features, visual_history, egomotion_history,
                 reasoning_latent=None, reasoning_horizon_tokens=None,
+                reasoning_confidence=None,
                 **kwargs):
         """
         Args:
@@ -119,6 +120,8 @@ class BezierPlanner(BasePlanner):
                 (used by reasoning_mode="pooled_latent").
             reasoning_horizon_tokens: optional [B, 5, embed_dim] per-horizon
                 reasoning tokens (used by reasoning_mode="horizon_cross_attention").
+            reasoning_confidence: optional [B] (or [B,5] / logits) confidence
+                that scales the reasoning residual (#110).
 
         Returns:
             trajectory: [B, num_timesteps * num_signals]
@@ -146,6 +149,7 @@ class BezierPlanner(BasePlanner):
             context,
             reasoning_latent=reasoning_latent,
             horizon_tokens=reasoning_horizon_tokens,
+            confidence=reasoning_confidence,
         )
 
         bezier_feature = self.context_mlp(context)                          # [B, C]
