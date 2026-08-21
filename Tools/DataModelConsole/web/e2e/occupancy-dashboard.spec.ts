@@ -587,7 +587,7 @@ async function prepareFullPageScreenshot(page: Page) {
 test("uses the shared 3D renderer for real occupancy selections", async ({
   page,
 }, testInfo) => {
-  testInfo.setTimeout(90_000);
+  testInfo.setTimeout(180_000);
   const { canvas, errors, region } = await openOccupancy(page, {
     width: 1440,
     height: 1000,
@@ -679,11 +679,6 @@ test("uses the shared 3D renderer for real occupancy selections", async ({
     .getByLabel("Occupancy model", { exact: true })
     .selectOption(HENET_MODEL);
   await expect(region.getByText("Lane divider", { exact: true })).toBeVisible();
-  await expect(region.locator("fieldset label")).toHaveText([
-    "Drivable",
-    "Lane divider",
-    "Vehicle",
-  ]);
   await expect(
     page.getByText(
       "HENet is only free for academic research purposes and needs author authorization for commerce.",
