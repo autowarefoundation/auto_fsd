@@ -900,36 +900,35 @@ def _evaluate_global_reactive(
     metrics["bev_loss"] = float(
         bev_loss_values[0].item() / bev_loss_values[1].item()
     )
-    average_precisions: list[float] = []
-    ap_lifts: list[float] = []
+    average_precisions = [0.0] * class_count
+    ap_lifts = [0.0] * class_count
+    class_support = [False] * class_count
     for class_index, class_name in enumerate(BEV_SEGMENTATION_CLASSES):
         true_positive, false_positive, false_negative, positive, valid = (
             float(value)
             for value in bev_counts[class_index].tolist()
         )
-        if positive <= 0.0 or valid <= 0.0:
-            raise ValueError(
-                f"BEV validation class {class_name!r} has no support"
+        supported = positive > 0.0 and valid > 0.0
+        prevalence = _metric_ratio(positive, valid)
+        average_precision = 0.0
+        ap_lift = 0.0
+        if supported:
+            average_precision = _histogram_average_precision(
+                positive_histogram[class_index],
+                negative_histogram[class_index],
             )
-        average_precision = _histogram_average_precision(
-            positive_histogram[class_index],
-            negative_histogram[class_index],
-        )
-        prevalence = positive / valid
-        ap_lift = (
-            max(
-                0.0,
-                min(
-                    1.0,
-                    (average_precision - prevalence)
-                    / (1.0 - prevalence),
-                ),
-            )
-            if prevalence < 1.0
-            else 0.0
-        )
-        ap_lifts.append(ap_lift)
-        average_precisions.append(average_precision)
+            if prevalence < 1.0:
+                ap_lift = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (average_precision - prevalence)
+                        / (1.0 - prevalence),
+                    ),
+                )
+        class_support[class_index] = supported
+        ap_lifts[class_index] = ap_lift
+        average_precisions[class_index] = average_precision
         prefix = f"bev_{class_name}"
         metrics[f"{prefix}_iou"] = _metric_ratio(
             true_positive,
@@ -947,18 +946,33 @@ def _evaluate_global_reactive(
         metrics[f"{prefix}_ap_lift"] = ap_lift
         metrics[f"{prefix}_positive_prevalence"] = prevalence
         metrics[f"{prefix}_positive_cells"] = positive
+        metrics[f"{prefix}_supported"] = float(supported)
         metrics[f"{prefix}_valid_cells"] = valid
 
-    static_macro_ap_lift = float(np.mean(ap_lifts[:5]))
-    dynamic_macro_ap_lift = float(np.mean(ap_lifts[5:]))
-    metrics["bev_static_macro_average_precision"] = float(
-        np.mean(average_precisions[:5])
+    def supported_mean(values, indices) -> float:
+        selected = [
+            values[index]
+            for index in indices
+            if class_support[index]
+        ]
+        return float(np.mean(selected)) if selected else 0.0
+
+    static_indices = range(5)
+    dynamic_indices = range(5, class_count)
+    static_macro_ap_lift = supported_mean(ap_lifts, static_indices)
+    dynamic_macro_ap_lift = supported_mean(ap_lifts, dynamic_indices)
+    metrics["bev_static_macro_average_precision"] = supported_mean(
+        average_precisions,
+        static_indices,
     )
-    metrics["bev_dynamic_macro_average_precision"] = float(
-        np.mean(average_precisions[5:])
+    metrics["bev_dynamic_macro_average_precision"] = supported_mean(
+        average_precisions,
+        dynamic_indices,
     )
     metrics["bev_static_macro_ap_lift"] = static_macro_ap_lift
     metrics["bev_dynamic_macro_ap_lift"] = dynamic_macro_ap_lift
+    metrics["bev_supported_class_count"] = float(sum(class_support))
+    metrics["bev_all_classes_supported"] = float(all(class_support))
     metrics["selection_score"] = (
         0.25 * trajectory_quality
         + 0.25 * static_macro_ap_lift
