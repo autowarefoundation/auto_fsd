@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytest.importorskip("flytekit")
 
@@ -83,12 +84,129 @@ def test_reviewed_ray_topologies_have_fixed_worker_groups():
     for config in (
         distributed_training.RAY_2,
         distributed_training.RAY_4,
+        distributed_training.RAY_REACTIVE_4,
         distributed_training.RAY_8,
     ):
         workers = config.worker_node_config[0]
         assert workers.min_replicas == workers.replicas
         assert workers.max_replicas == workers.replicas
         assert config.enable_autoscaling is False
+
+
+def test_four_rank_performance_capacity_matches_ray_contract():
+    worker = distributed_training.RAY_REACTIVE_4.worker_node_config[0]
+    worker_spec = worker.pod_template.pod_spec
+    assert worker.replicas == 4
+    assert worker.ray_start_params["num-cpus"] == "3"
+    assert worker_spec.node_selector == {
+        "workload-type": "gpu-performance"
+    }
+    assert worker_spec.containers[0].resources.requests == {
+        "cpu": "3",
+        "memory": "12Gi",
+        "nvidia.com/gpu": "1",
+    }
+    assert (
+        distributed_training.train_reactive_stage_ray_4.metadata.labels[
+            "kueue.x-k8s.io/queue-name"
+        ]
+        == "gpu-performance"
+    )
+
+    platform_root = Path(distributed_training.__file__).parents[1]
+    node_classes = {
+        item["metadata"]["name"]: item
+        for item in yaml.safe_load_all(
+            (
+                platform_root
+                / "k8s/karpenter-nodepools/gpu-nodeclass.yaml"
+            ).read_text()
+        )
+    }
+    reserved_class = node_classes[
+        "auto-e2e-gpu-performance-reserved"
+    ]["spec"]
+    assert reserved_class["capacityReservationSelectorTerms"] == [
+        {
+            "ownerID": "REPLACE_WITH_AWS_ACCOUNT_ID",
+            "tags": {"Name": "auto-e2e-gpu-canary"},
+        }
+    ]
+    assert reserved_class["placementGroupSelector"] == {
+        "name": "auto-e2e-distributed-training-pg"
+    }
+    assert "capacityReservationSelectorTerms" not in node_classes[
+        "auto-e2e-gpu-performance-ondemand"
+    ]["spec"]
+
+    node_pools = {
+        item["metadata"]["name"]: item
+        for item in yaml.safe_load_all(
+            (
+                platform_root
+                / "k8s/karpenter-nodepools/gpu-nodepool.yaml"
+            ).read_text()
+        )
+    }
+    reserved_pool = node_pools["gpu-performance-reserved"]["spec"]
+    assert reserved_pool["weight"] == 100
+    assert reserved_pool["limits"] == {
+        "cpu": "32",
+        "memory": "256Gi",
+        "nodes": "4",
+        "nvidia.com/gpu": "4",
+    }
+    assert reserved_pool["template"]["metadata"]["labels"] == {
+        "workload-type": "gpu-performance"
+    }
+    requirements = {
+        item["key"]: item["values"]
+        for item in reserved_pool["template"]["spec"]["requirements"]
+    }
+    assert requirements["node.kubernetes.io/instance-type"] == [
+        "g6.2xlarge"
+    ]
+    assert requirements["karpenter.sh/capacity-type"] == ["reserved"]
+
+    queue_objects = {
+        (
+            item["kind"],
+            item["metadata"]["name"],
+            item["metadata"].get("namespace"),
+        ): item
+        for item in yaml.safe_load_all(
+            (
+                platform_root
+                / "k8s/kueue-config/kueue-objects.yaml"
+            ).read_text()
+        )
+    }
+    performance_queue = queue_objects[
+        ("ClusterQueue", "gpu-performance-queue", None)
+    ]["spec"]
+    gpu_group = next(
+        group
+        for group in performance_queue["resourceGroups"]
+        if group["coveredResources"] == ["nvidia.com/gpu"]
+    )
+    assert gpu_group["flavors"][0]["resources"] == [
+        {"name": "nvidia.com/gpu", "nominalQuota": "4"}
+    ]
+    assert (
+        "LocalQueue",
+        "gpu-performance",
+        "auto-e2e-development",
+    ) in queue_objects
+
+    deploy_script = (platform_root / "infra/post-apply.sh").read_text()
+    render_index = deploy_script.index(
+        "s/REPLACE_WITH_AWS_ACCOUNT_ID/${ACCOUNT}/g"
+    )
+    node_pool_index = deploy_script.index(
+        "karpenter-nodepools/gpu-nodepool.yaml"
+    )
+    assert render_index < node_pool_index
+    assert re.search(r"\b[0-9]{12}\b", deploy_script) is None
 
 
 def test_ray_tasks_serialize_the_resolved_storage_path():
