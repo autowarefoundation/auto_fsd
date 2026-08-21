@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,7 @@ from distributed_training.reactive_stage import (
     _select_bev_overfit_subset,
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
+    run_reactive_stage,
     validate_reactive_stage_config,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
@@ -308,6 +310,7 @@ def _stage_config(stage: str) -> dict[str, object]:
         "storage_path": "s3://checkpoints/ray-train",
         "val_fraction": 0.1,
         "weight_decay": 0.01,
+        "worker_cpus": 3,
     }
 
 
@@ -331,6 +334,49 @@ def test_validate_stage_config_rejects_parent_and_batch_contract_changes():
     caller_weighted["bev_pos_weights"] = [1.0] * 8
     with pytest.raises(ValueError, match="derived"):
         validate_reactive_stage_config(caller_weighted)
+
+
+def test_ray_actor_cpu_reservation_matches_worker_config(monkeypatch):
+    ray = pytest.importorskip("ray")
+    from ray.train import torch as ray_train_torch
+
+    captured = {}
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def fit(self):
+            return SimpleNamespace(
+                checkpoint=SimpleNamespace(
+                    path=(
+                        "s3://checkpoints/ray-train/"
+                        "reactive-stage-test/checkpoint_0001"
+                    ),
+                ),
+                metrics={"world_size": 4},
+            )
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray_train_torch, "TorchTrainer", FakeTrainer)
+    config = _stage_config("nuplan_full")
+    config["num_workers"] = 4
+    config["worker_cpus"] = 3
+
+    run_reactive_stage(config)
+
+    assert captured["scaling_config"].resources_per_worker == {
+        "CPU": 3,
+        "GPU": 1,
+    }
+
+
+def test_validate_stage_config_rejects_missing_worker_cpu_contract():
+    config = _stage_config("nuplan_full")
+    config.pop("worker_cpus")
+
+    with pytest.raises(ValueError, match="worker_cpus"):
+        validate_reactive_stage_config(config)
 
 
 @pytest.mark.parametrize(
