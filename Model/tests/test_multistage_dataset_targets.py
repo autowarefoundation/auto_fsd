@@ -30,7 +30,9 @@ from data_parsing.nuplan.packing import (
 )
 import data_parsing.nuplan.targets as nuplan_targets
 from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_CLASSES,
     decode_bev_segmentation,
+    decode_bev_segmentation_stats,
     decode_trajectory_xy,
 )
 from navigation.artifacts import decode_array
@@ -148,14 +150,14 @@ def test_nuplan_full_target_builder_uses_current_annotations(
     )
     map_polygons = {
         "drivable_area": [static_polygon],
-        "lane_area": [static_polygon],
+        "lane_boundary": [],
         "intersection": [],
         "crosswalk": [],
         "stop_line": [],
     }
     map_available = {
         "drivable_area": True,
-        "lane_area": True,
+        "lane_boundary": True,
         "intersection": True,
         "crosswalk": True,
         "stop_line": True,
@@ -164,6 +166,18 @@ def test_nuplan_full_target_builder_uses_current_annotations(
         nuplan_targets,
         "_map_layer_polygons",
         lambda *_args: (map_polygons, map_available),
+    )
+    lane_boundary = np.asarray(
+        [[-5.0, -2.0], [25.0, -2.0]],
+        dtype=np.float64,
+    )
+    monkeypatch.setattr(
+        nuplan_targets,
+        "_lane_features",
+        lambda *_args, **_kwargs: (
+            [lane_boundary],
+            [lane_boundary],
+        ),
     )
     monkeypatch.setattr(
         nuplan_targets,
@@ -184,6 +198,11 @@ def test_nuplan_full_target_builder_uses_current_annotations(
 
     assert targets.bev_segmentation.shape == (8, 40, 20)
     assert targets.bev_segmentation[0].max() == pytest.approx(1.0)
+    assert targets.bev_segmentation[1].max() == pytest.approx(1.0)
+    assert not np.array_equal(
+        targets.bev_segmentation[0],
+        targets.bev_segmentation[1],
+    )
     assert targets.bev_segmentation[5].max() == pytest.approx(1.0)
     assert targets.route_target.shape == (2, 40, 20)
     assert targets.route_channel_valid.tolist() == [True, True]
@@ -201,6 +220,9 @@ def test_nuplan_full_target_builder_uses_current_annotations(
     bev_target, bev_valid = decode_bev_segmentation(
         members["bev_segmentation.npz"]
     )
+    bev_stats = decode_bev_segmentation_stats(
+        members["bev_segmentation_stats.json"]
+    )
     navigation_metadata = json.loads(
         members["navigation_meta.json"]
     )
@@ -208,6 +230,19 @@ def test_nuplan_full_target_builder_uses_current_annotations(
     assert trajectory_valid.all()
     assert bev_target.shape == (8, 40, 20)
     assert bev_valid.shape == bev_target.shape
+    assert tuple(BEV_SEGMENTATION_CLASSES) == (
+        "drivable_area",
+        "lane_boundary",
+        "intersection",
+        "crosswalk",
+        "stop_line",
+        "vehicle",
+        "vulnerable_road_user",
+        "other_obstacle",
+    )
+    assert bev_stats["positive_cell_count"][0] > (
+        bev_stats["positive_cell_count"][1]
+    )
     assert decode_array(members["map_semantic.npz"]).shape == (14, 40, 20)
     assert decode_array(members["route_mask.npz"]).shape == (2, 40, 20)
     assert navigation_metadata["map_source"] == "nuplan_native"
@@ -607,6 +642,8 @@ def test_nuplan_packer_emits_log_grouped_immutable_shards(
     )
 
     assert manifest["total_samples"] == 1
+    assert manifest["bev_statistics_count"] == 1
+    assert manifest["bev_taxonomy_version"] == "bev_segmentation_v2"
     assert manifest["split_policy"] == "log_level_hash_bucket"
     assert manifest["navigation_geometry"] == geometry.contract()
     tar_path = tmp_path / manifest["shard_names"][0]
