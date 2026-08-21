@@ -101,7 +101,7 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         and stage is not ReactiveTrainingStage.NUPLAN_FULL
     ):
         raise ValueError("BEV overfit mode is valid only for Stage A")
-    for name in ("overfit_min_dynamic_ap", "overfit_min_recall"):
+    for name in ("overfit_min_ap", "overfit_min_recall"):
         threshold = float(config.get(name, -1.0))
         if not 0.0 < threshold <= 1.0:
             raise ValueError(f"{name} must be in (0,1]")
@@ -1352,24 +1352,38 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 BEV_SEGMENTATION_CLASSES,
             )
 
-            minimum_recall = min(
-                validation[f"bev_{class_name}_recall"]
+            class_average_precisions = {
+                class_name: validation[
+                    f"bev_{class_name}_average_precision"
+                ]
                 for class_name in BEV_SEGMENTATION_CLASSES
+            }
+            class_recalls = {
+                class_name: validation[f"bev_{class_name}_recall"]
+                for class_name in BEV_SEGMENTATION_CLASSES
+            }
+            minimum_ap_class = min(
+                class_average_precisions,
+                key=class_average_precisions.__getitem__,
             )
-            dynamic_ap = validation[
-                "bev_dynamic_macro_average_precision"
-            ]
+            minimum_recall_class = min(
+                class_recalls,
+                key=class_recalls.__getitem__,
+            )
+            minimum_ap = class_average_precisions[minimum_ap_class]
+            minimum_recall = class_recalls[minimum_recall_class]
             overfit_gate_pass = (
-                dynamic_ap
-                >= float(config["overfit_min_dynamic_ap"])
+                minimum_ap >= float(config["overfit_min_ap"])
                 and minimum_recall
                 >= float(config["overfit_min_recall"])
             )
             if not overfit_gate_pass:
                 raise RuntimeError(
                     "BEV overfit gate failed: "
-                    f"dynamic_macro_ap={dynamic_ap:.6f} "
-                    f"minimum_recall={minimum_recall:.6f}"
+                    f"minimum_ap={minimum_ap:.6f} "
+                    f"class={minimum_ap_class} "
+                    f"minimum_recall={minimum_recall:.6f} "
+                    f"class={minimum_recall_class}"
                 )
         maximum_delta = _maximum_parameter_delta(
             model,
