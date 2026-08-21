@@ -71,6 +71,10 @@ const ERROR_COLORS = { fp: "#ff365f", fn: "#35dff4" } as const;
 
 type CameraPreset = "orbit" | "top" | "ego";
 
+function classLabel(classIndex: number, laneLabel: string): string {
+  return classIndex === 1 ? laneLabel : CLASS_LABELS[classIndex];
+}
+
 interface PointerReading {
   rasterRow: number;
   rasterCol: number;
@@ -505,13 +509,17 @@ function CameraButton({
 export function SemanticOccupancyView({
   artifact,
   demoEnvironment = false,
+  laneLabel = "Lane",
   row,
   status,
+  supportedClasses,
 }: {
   artifact: SemanticOccupancyArtifact | null;
   demoEnvironment?: boolean;
+  laneLabel?: string;
   row: number | undefined;
   status: "idle" | "loading" | "ready" | "unavailable" | "error";
+  supportedClasses?: readonly string[];
 }) {
   const [mode, setMode] =
     useState<SemanticOccupancyDisplayMode>("prediction");
@@ -524,6 +532,29 @@ export function SemanticOccupancyView({
   const [compactViewport, setCompactViewport] = useState(false);
   const [pointer, setPointer] = useState<PointerReading | null>(null);
   const hasTeacher = Boolean(artifact?.teacher && artifact.validBits);
+  const supportedClassNames = useMemo(
+    () =>
+      new Set(
+        supportedClasses ?? SEMANTIC_OCCUPANCY_CLASS_NAMES,
+      ),
+    [supportedClasses],
+  );
+  const effectiveEnabled = useMemo(
+    () =>
+      enabled.map(
+        (isEnabled, index) =>
+          isEnabled &&
+          supportedClassNames.has(SEMANTIC_OCCUPANCY_CLASS_NAMES[index]),
+      ),
+    [enabled, supportedClassNames],
+  );
+  const visibleClassIndices = useMemo(
+    () =>
+      SEMANTIC_OCCUPANCY_CLASS_NAMES.flatMap((className, index) =>
+        supportedClassNames.has(className) ? [index] : [],
+      ),
+    [supportedClassNames],
+  );
 
   useEffect(() => {
     if (!hasTeacher && mode !== "prediction") setMode("prediction");
@@ -545,14 +576,31 @@ export function SemanticOccupancyView({
             mode,
             threshold,
             opacity,
-            enabled,
+            effectiveEnabled,
           )
         : null,
-    [artifact, enabled, mode, opacity, row, threshold],
+    [artifact, effectiveEnabled, mode, opacity, row, threshold],
   );
   const objectClassIndices = useMemo(
-    () => OBJECT_CLASS_INDICES.filter((classIndex) => enabled[classIndex]),
-    [enabled],
+    () =>
+      OBJECT_CLASS_INDICES.filter(
+        (classIndex) => effectiveEnabled[classIndex],
+      ),
+    [effectiveEnabled],
+  );
+  const objectLegend = useMemo(
+    () =>
+      OBJECT_CLASS_INDICES.flatMap((classIndex, colorIndex) =>
+        supportedClassNames.has(SEMANTIC_OCCUPANCY_CLASS_NAMES[classIndex])
+          ? [
+              {
+                classIndex,
+                color: OBJECT_COLORS[colorIndex],
+              },
+            ]
+          : [],
+      ),
+    [supportedClassNames],
   );
   const components = useMemo(
     () =>
@@ -573,11 +621,11 @@ export function SemanticOccupancyView({
   const pointerRows = pointer
     ? SEMANTIC_OCCUPANCY_CLASS_NAMES.map((name, index) => ({
         name,
-        label: CLASS_LABELS[index],
+        label: classLabel(index, laneLabel),
         color: CLASS_COLORS[index],
         value: pointer.values[index],
       }))
-        .filter((_, index) => enabled[index])
+        .filter((_, index) => effectiveEnabled[index])
         .sort((left, right) => right.value - left.value)
     : [];
 
@@ -692,17 +740,22 @@ export function SemanticOccupancyView({
                 </CameraButton>
               </div>
 
-              <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-3 rounded border border-slate-700/80 bg-slate-950/80 px-2 py-1.5 font-mono text-[9px] text-slate-400 backdrop-blur">
-                <span className="flex items-center gap-1">
-                  <span className="size-2 bg-[#62df7b]" /> Vehicle
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="size-2 bg-[#ef73cf]" /> VRU
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="size-2 bg-[#f39a42]" /> Obstacle
-                </span>
-              </div>
+              {objectLegend.length > 0 && (
+                <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-3 rounded border border-slate-700/80 bg-slate-950/80 px-2 py-1.5 font-mono text-[9px] text-slate-400 backdrop-blur">
+                  {objectLegend.map((entry) => (
+                    <span
+                      key={entry.classIndex}
+                      className="flex items-center gap-1"
+                    >
+                      <span
+                        className="size-2"
+                        style={{ backgroundColor: entry.color }}
+                      />
+                      {classLabel(entry.classIndex, laneLabel)}
+                    </span>
+                  ))}
+                </div>
+              )}
 
               {pointer && (
                 <div className="pointer-events-none absolute top-2 left-2 min-w-40 rounded border border-slate-700 bg-slate-950/92 p-2 font-mono text-[9px] text-slate-300 shadow-xl backdrop-blur">
@@ -818,9 +871,9 @@ export function SemanticOccupancyView({
             <legend className="mb-2 text-[10px] text-slate-500">
               Classes
             </legend>
-            {CLASS_LABELS.map((label, index) => (
+            {visibleClassIndices.map((index) => (
               <label
-                key={label}
+                key={SEMANTIC_OCCUPANCY_CLASS_NAMES[index]}
                 className="flex min-w-0 items-center gap-2 text-[10px] text-slate-300"
               >
                 <input
@@ -850,7 +903,9 @@ export function SemanticOccupancyView({
                   }
                   aria-hidden="true"
                 />
-                <span className="truncate">{label}</span>
+                <span className="truncate">
+                  {classLabel(index, laneLabel)}
+                </span>
               </label>
             ))}
           </fieldset>
