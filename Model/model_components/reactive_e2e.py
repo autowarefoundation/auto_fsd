@@ -24,7 +24,7 @@ class ReactiveE2E(nn.Module):
                  route_channels=2, enable_route_conditioning=True,
                  map_fusion_mode="residual", map_fusion_kwargs=None,
                  temporal_memory_mode="no_memory", temporal_memory_kwargs=None,
-                 planner_mode="bezier", planner_kwargs=None,
+                 planner_mode="gru", planner_kwargs=None,
                  enable_reasoning=False, reasoning_mode="none",
                  reasoning_kwargs=None,
                  enable_bev_segmentation=False,
@@ -46,10 +46,11 @@ class ReactiveE2E(nn.Module):
             view_fusion_kwargs=view_fusion_kwargs,
         )
 
-        # Pooling and reduction of the fused image/map BEV features to a unified
-        # feature vector which can be consumed by the trajectory planner
-        self.FusedFeaturePooling = FusedFeaturePooling(
-            embed_dim=embed_dim
+        self.planner_mode = planner_mode
+        self.FusedFeaturePooling = (
+            FusedFeaturePooling(embed_dim=embed_dim)
+            if planner_mode == "bezier"
+            else None
         )
 
         # For BEV fusion mode the spatial size is bev_h × bev_w (potentially non-square).
@@ -311,8 +312,11 @@ class ReactiveE2E(nn.Module):
         else:
             fused_features = self.MapBEVFusion(image_bev, navigation_bev)
 
-        # --- Reduce fused image/map BEV features into a single feature vector ---
-        feature_vector = self.FusedFeaturePooling(fused_features)
+        planner_features = (
+            self.FusedFeaturePooling(fused_features)
+            if self.FusedFeaturePooling is not None
+            else fused_features
+        )
 
         # --- Temporal Memory ---
         visual_ctx, ego_ctx = self.TemporalMemory(visual_history, egomotion_history)
@@ -333,7 +337,7 @@ class ReactiveE2E(nn.Module):
 
         # --- Trajectory Prediction ---
         trajectory = self.TrajectoryPlanner(
-            feature_vector, visual_ctx, ego_ctx,
+            planner_features, visual_ctx, ego_ctx,
             reasoning_latent=reasoning_latent,
             reasoning_horizon_tokens=reasoning_horizon_tokens,
             **kwargs,
