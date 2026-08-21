@@ -125,6 +125,14 @@ func main() {
 				"/datasets/{name}/shards/{shard}/overlays/{model_id}",
 				overlayH.Body,
 			)
+			r.Get(
+				"/datasets/{name}/shards/{shard}/semantic-occupancy-models",
+				overlayH.OccupancyModels,
+			)
+			r.Get(
+				"/datasets/{name}/shards/{shard}/semantic-occupancy/{model_id}",
+				overlayH.SemanticOccupancy,
+			)
 
 			r.Get("/reasoning-labels/stats", reasoningH.Stats)
 			r.Get("/reasoning-labels/prompt-versions", reasoningH.PromptVersions)

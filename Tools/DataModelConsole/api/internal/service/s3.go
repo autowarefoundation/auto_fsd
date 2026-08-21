@@ -61,6 +61,10 @@ const MaxRangeBytes = 32 << 20 // 32 MiB
 // while preventing a corrupt pointer from exhausting the API pod.
 const MaxOverlayBytes = 16 << 20
 
+// MaxSemanticOccupancyBytes bounds one compressed shard-level occupancy body.
+// Dense 8x450x300 uint8 predictions are large even after compression.
+const MaxSemanticOccupancyBytes = 512 << 20
+
 const (
 	navigationRasterSize      = 256
 	navigationMapChannels     = 14
@@ -301,6 +305,12 @@ func (s *S3Service) ResolvedVersion(
 // OverlayBody is a verified canonical binary overlay and its public metadata.
 type OverlayBody struct {
 	Descriptor model.OverlayDescriptor
+	Payload    []byte
+}
+
+// SemanticOccupancyBody is one verified, precomputed 2D BEV semantic body.
+type SemanticOccupancyBody struct {
+	Descriptor model.SemanticOccupancyDescriptor
 	Payload    []byte
 }
 
