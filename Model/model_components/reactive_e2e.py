@@ -39,7 +39,7 @@ class ReactiveE2E(nn.Module):
         # view_fusion_kwargs forwards bev_h/bev_w/pc_range/image_size to BEV fusion.
         self.FeatureFusion = FeatureFusion(
             num_views=num_views,
-            backbone_channels=self.Backbone.backbone_channels,
+            backbone_channels=self.Backbone.feature_channels,
             embed_dim=embed_dim,
             fusion_mode="bev",
             image_feature_size=image_feature_size,
