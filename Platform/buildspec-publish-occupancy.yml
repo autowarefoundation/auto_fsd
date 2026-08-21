@@ -1,11 +1,13 @@
 version: 0.2
 
-# Publish the pinned native and BEVFormer V2 occupancy sets for KITScenes v3.3.
+# Publish pinned occupancy sets for KITScenes v3.3.
 #
 # Required start-build overrides:
 #   IMAGE_TAG, PUBLICATION_TIMESTAMP, REPOSITORY_REVISION
 # Optional:
-#   BEVFORMER_CHECKPOINT_URI and per-image tags
+#   BEVFORMER_CHECKPOINT_URI and per-image tags. HENet publication additionally
+#   requires PUBLISH_HENET=true, HENET_CHECKPOINT_URI,
+#   HENET_CHECKPOINT_SHA256, and HENET_LICENSE_AUTHORIZATION=author-approved.
 
 env:
   shell: bash
@@ -19,8 +21,13 @@ env:
     EVAL_IMAGE_TAG: ""
     OFFLINE_RL_IMAGE_TAG: ""
     BEVFORMER_V2_IMAGE_TAG: ""
+    HENET_IMAGE_TAG: ""
     AUTOE2E_CHECKPOINT_URI: ""
     BEVFORMER_CHECKPOINT_URI: ""
+    HENET_CHECKPOINT_URI: ""
+    HENET_CHECKPOINT_SHA256: ""
+    HENET_LICENSE_AUTHORIZATION: ""
+    PUBLISH_HENET: "false"
     PUBLISHED_SHARDS_URI: ""
     ARTIFACTS_BUCKET: ""
     DATASET: kitscenes
@@ -42,6 +49,7 @@ phases:
       - test "${DATASET}" = "kitscenes"
       - test "${DATASET_VERSION}" = "v3.3"
       - test "${SCORE_THRESHOLD}" = "0.2"
+      - test "${PUBLISH_HENET}" = "true" -o "${PUBLISH_HENET}" = "false"
       - test "${DATASET_MANIFEST_SHA256}" = "31faf5d2ceef17522f1c79e6ab31558a2aceb6f75043a130d1f6b7da3ce6211d"
       - test "${PUBLICATION_TIMESTAMP}" != ""
       - test "${REPOSITORY_REVISION}" != ""
@@ -61,7 +69,13 @@ phases:
         if [ -z "${ARTIFACTS_BUCKET}" ]; then
           ARTIFACTS_BUCKET="auto-e2e-platform-artifacts-${ACCOUNT_ID}"
         fi
+        if [ "${PUBLISH_HENET}" = "true" ]; then
+          test -n "${HENET_CHECKPOINT_URI}"
+          [[ "${HENET_CHECKPOINT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          test "${HENET_LICENSE_AUTHORIZATION}" = "author-approved"
+        fi
         export AUTOE2E_CHECKPOINT_URI BEVFORMER_CHECKPOINT_URI
+        export HENET_CHECKPOINT_URI HENET_CHECKPOINT_SHA256
         export PUBLISHED_SHARDS_URI ARTIFACTS_BUCKET
       - |
         verify_s3_sha256() {
@@ -94,12 +108,19 @@ phases:
           "${PUBLISHED_SHARDS_URI%/}/manifest.json" \
           "${DATASET_MANIFEST_SHA256}" \
           /tmp/kitscenes-v3.3-manifest.json
+        if [ "${PUBLISH_HENET}" = "true" ]; then
+          verify_s3_sha256 \
+            "${HENET_CHECKPOINT_URI}" \
+            "${HENET_CHECKPOINT_SHA256}" \
+            /tmp/henet-checkpoint.pth
+        fi
       - |
         TRAINING_IMAGE_TAG="${TRAINING_IMAGE_TAG:-${IMAGE_TAG}}"
         DATA_PREP_IMAGE_TAG="${DATA_PREP_IMAGE_TAG:-${IMAGE_TAG}}"
         EVAL_IMAGE_TAG="${EVAL_IMAGE_TAG:-${IMAGE_TAG}}"
         OFFLINE_RL_IMAGE_TAG="${OFFLINE_RL_IMAGE_TAG:-${IMAGE_TAG}}"
         BEVFORMER_V2_IMAGE_TAG="${BEVFORMER_V2_IMAGE_TAG:-${IMAGE_TAG}}"
+        HENET_IMAGE_TAG="${HENET_IMAGE_TAG:-${IMAGE_TAG}}"
         image_ref() {
           REPOSITORY="$1"
           TAG="$2"
@@ -129,9 +150,15 @@ phases:
         AUTO_E2E_BEVFORMER_V2_IMAGE="$(
           image_ref bevformer-v2 "${BEVFORMER_V2_IMAGE_TAG}"
         )" || exit 1
+        if [ "${PUBLISH_HENET}" = "true" ]; then
+          AUTO_E2E_HENET_IMAGE="$(
+            image_ref henet "${HENET_IMAGE_TAG}"
+          )" || exit 1
+        fi
         export AUTO_E2E_TRAINING_IMAGE AUTO_E2E_EVAL_IMAGE
         export AUTO_E2E_OFFLINE_RL_IMAGE AUTO_E2E_DATA_PREP_IMAGE
         export AUTO_E2E_BEVFORMER_V2_IMAGE
+        export AUTO_E2E_HENET_IMAGE
         export ECR_PREFIX="${ECR_URL}"
         export PYTHONPATH="${CODEBUILD_SRC_DIR}/Model:${CODEBUILD_SRC_DIR}:${PYTHONPATH:-}"
       - |
@@ -174,10 +201,24 @@ phases:
             "checkpoint": os.environ["BEVFORMER_CHECKPOINT_URI"],
             "score_threshold": float(os.environ["SCORE_THRESHOLD"]),
         }
-        for path, inputs in (
+        inputs_by_path = (
             ("/tmp/native-occupancy-inputs.json", native),
             ("/tmp/bevformer-v2-occupancy-inputs.json", bevformer),
-        ):
+        )
+        if os.environ["PUBLISH_HENET"] == "true":
+            inputs_by_path += (
+                (
+                    "/tmp/henet-occupancy-inputs.json",
+                    {
+                        **common,
+                        "checkpoint": os.environ["HENET_CHECKPOINT_URI"],
+                        "checkpoint_sha256": os.environ[
+                            "HENET_CHECKPOINT_SHA256"
+                        ],
+                    },
+                ),
+            )
+        for path, inputs in inputs_by_path:
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(inputs, stream, sort_keys=True)
         PY
@@ -197,3 +238,13 @@ phases:
           Platform/pipelines/workflows.py \
           wf_precompute_bevformer_v2_occupancy \
           --inputs-file /tmp/bevformer-v2-occupancy-inputs.json
+      - |
+        if [ "${PUBLISH_HENET}" = "true" ]; then
+          pyflyte --config /tmp/flyte.yaml run --remote \
+            --project "${FLYTE_PROJECT}" \
+            --domain "${FLYTE_DOMAIN}" \
+            --image "${AUTO_E2E_HENET_IMAGE}" \
+            Platform/pipelines/workflows.py \
+            wf_precompute_henet_occupancy \
+            --inputs-file /tmp/henet-occupancy-inputs.json
+        fi
