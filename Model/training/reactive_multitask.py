@@ -161,6 +161,8 @@ class ReactiveMultitaskObjective(nn.Module):
             route = route * non_bev_importance
         zero = predicted_controls.sum() * 0.0
         bev = zero
+        bev_bce = zero
+        bev_dice = zero
         if self.bev_loss is not None:
             available = batch["bev_segmentation_available"].to(
                 dtype=torch.bool
@@ -174,11 +176,14 @@ class ReactiveMultitaskObjective(nn.Module):
                 raise ValueError(
                     "nuPlan full training requires BEV segmentation logits"
                 )
-            bev = self.bev_loss(
+            bev_components = self.bev_loss.components(
                 bev_logits,
                 batch["bev_segmentation_target"],
                 batch["bev_segmentation_valid"],
             )
+            bev = bev_components["total"]
+            bev_bce = bev_components["bce"]
+            bev_dice = bev_components["dice"]
         total = (
             trajectory
             + self.bev_weight * bev
@@ -188,5 +193,7 @@ class ReactiveMultitaskObjective(nn.Module):
             "total": total,
             "trajectory": trajectory,
             "bev_segmentation": bev,
+            "bev_segmentation_bce": bev_bce,
+            "bev_segmentation_dice": bev_dice,
             "route_reconstruction": route,
         }
