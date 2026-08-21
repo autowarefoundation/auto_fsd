@@ -12,9 +12,11 @@ from PIL import Image, ImageDraw
 
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_MEMBER,
+    BEV_SEGMENTATION_STATS_MEMBER,
     BEV_SEGMENTATION_CLASSES,
     TRAJECTORY_XY_MEMBER,
     encode_bev_segmentation,
+    encode_bev_segmentation_stats,
     encode_reactive_navigation,
     encode_trajectory_xy,
 )
@@ -255,29 +257,29 @@ def _map_layer_polygons(
         max(abs(geometry.x_min_m), abs(geometry.x_max_m)),
         max(abs(geometry.y_min_m), abs(geometry.y_max_m)),
     )
-    lane_layers = (
-        SemanticMapLayer.LANE,
-        SemanticMapLayer.LANE_CONNECTOR,
+    required_drivable_layers = (
+        SemanticMapLayer.ROADBLOCK,
+        SemanticMapLayer.ROADBLOCK_CONNECTOR,
+        SemanticMapLayer.INTERSECTION,
     )
+    drivable_layers = required_drivable_layers
+    carpark_layer = getattr(SemanticMapLayer, "CARPARK_AREA", None)
+    if carpark_layer is not None:
+        drivable_layers += (carpark_layer,)
     layer_map = {
-        # nuPlan exposes DRIVABLE_AREA as a vector/raster layer but not as a
-        # MapObject. Lane polygons are the stable object-level approximation.
-        "drivable_area": lane_layers,
-        "lane_area": (
-            SemanticMapLayer.LANE,
-            SemanticMapLayer.LANE_CONNECTOR,
-        ),
+        "drivable_area": drivable_layers,
+        "lane_boundary": (SemanticMapLayer.LANE,),
         "intersection": (SemanticMapLayer.INTERSECTION,),
         "crosswalk": (SemanticMapLayer.CROSSWALK,),
         "stop_line": (SemanticMapLayer.STOP_LINE,),
     }
     available = set(scenario.map_api.get_available_map_objects())
-    requested = [
+    requested = list(dict.fromkeys(
         layer
         for layers in layer_map.values()
         for layer in layers
         if layer in available
-    ]
+    ))
     proximal = scenario.map_api.get_proximal_map_objects(
         Point2D(reference_pose[0], reference_pose[1]),
         radius,
@@ -292,9 +294,14 @@ def _map_layer_polygons(
         for name, layers in layer_map.items()
     }
     validity = {
-        name: all(layer in available for layer in layers)
+        name: bool(layers) and all(
+            layer in available for layer in layers
+        )
         for name, layers in layer_map.items()
     }
+    validity["drivable_area"] = all(
+        layer in available for layer in required_drivable_layers
+    )
     return polygons, validity
 
 
@@ -302,6 +309,8 @@ def _lane_features(
     scenario: Any,
     reference_pose: tuple[float, float, float],
     geometry: NavigationRasterGeometry,
+    *,
+    include_connectors: bool = True,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     if not hasattr(scenario, "map_api"):
         return [], []
@@ -316,10 +325,9 @@ def _lane_features(
         max(abs(geometry.x_min_m), abs(geometry.x_max_m)),
         max(abs(geometry.y_min_m), abs(geometry.y_max_m)),
     )
-    layers = [
-        SemanticMapLayer.LANE,
-        SemanticMapLayer.LANE_CONNECTOR,
-    ]
+    layers = [SemanticMapLayer.LANE]
+    if include_connectors:
+        layers.append(SemanticMapLayer.LANE_CONNECTOR)
     available = set(scenario.map_api.get_available_map_objects())
     requested = [layer for layer in layers if layer in available]
     if not requested:
@@ -573,40 +581,46 @@ def build_nuplan_reactive_targets(
     dynamic_polygons = _tracked_object_polygons(
         detections.tracked_objects
     )
+    _, physical_lane_boundaries = _lane_features(
+        scenario,
+        reference_pose,
+        geometry,
+        include_connectors=False,
+    )
     sources = {
         **map_polygons,
         **dynamic_polygons,
     }
-    known_map_area = (
-        map_context[MapChannel.KNOWN_MAP_AREA] > 0.0
-    )
     semantic = np.zeros(
         (len(BEV_SEGMENTATION_CLASSES), *shape),
         dtype=np.float32,
     )
     semantic_valid = np.zeros_like(semantic, dtype=np.bool_)
     for class_index, class_name in enumerate(BEV_SEGMENTATION_CLASSES):
-        semantic[class_index] = _rasterize_polygons(
-            sources[class_name],
-            reference_pose,
-            geometry,
-        )
-        if class_name in map_available:
-            semantic_valid[class_index] = (
-                camera_valid
-                & known_map_area
-                & map_available[class_name]
+        if class_name == "lane_boundary":
+            semantic[class_index] = _rasterize_polylines(
+                physical_lane_boundaries,
+                reference_pose,
+                geometry,
+                width_m=max(
+                    0.4,
+                    2.0 * geometry.meters_per_pixel,
+                ),
             )
         else:
-            # Positive footprints remain supervised even if the conservative
-            # lidar coverage mask excludes their cell.
-            semantic_valid[class_index] = (
-                camera_valid
-                & (
-                    lidar_valid
-                    | (semantic[class_index] > 0.0)
-                )
+            semantic[class_index] = _rasterize_polygons(
+                sources[class_name],
+                reference_pose,
+                geometry,
             )
+        if class_name in map_available:
+            # Proximal map queries cover the circumscribed BEV radius, so
+            # visible off-feature cells are valid static negatives.
+            semantic_valid[class_index] = (
+                camera_valid & map_available[class_name]
+            )
+        else:
+            semantic_valid[class_index] = camera_valid & lidar_valid
 
     corridor_polygons = _route_polygons(scenario)
     route_target = np.zeros((2, *shape), dtype=np.float32)
@@ -675,5 +689,11 @@ def nuplan_reactive_target_members(
     members[BEV_SEGMENTATION_MEMBER] = encode_bev_segmentation(
         targets.bev_segmentation,
         targets.bev_segmentation_valid,
+    )
+    members[BEV_SEGMENTATION_STATS_MEMBER] = (
+        encode_bev_segmentation_stats(
+            targets.bev_segmentation,
+            targets.bev_segmentation_valid,
+        )
     )
     return members
