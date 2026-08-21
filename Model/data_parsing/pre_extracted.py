@@ -571,16 +571,17 @@ def summarize_bev_training_statistics(
         if sample_uids is not None
         else None
     )
-    allowed_samples = (
-        frozenset(requested_samples)
-        if requested_samples is not None
-        else None
-    )
-    if allowed_samples is not None and (
-        not allowed_samples
-        or len(allowed_samples) != len(requested_samples)
-    ):
-        raise ValueError("BEV sample subset must be non-empty and unique")
+    if requested_samples is not None:
+        allowed_samples = frozenset(requested_samples)
+        if (
+            not allowed_samples
+            or len(allowed_samples) != len(requested_samples)
+        ):
+            raise ValueError(
+                "BEV sample subset must be non-empty and unique"
+            )
+    else:
+        allowed_samples = None
 
     positive_samples = np.zeros(class_count, dtype=np.int64)
     positive_cells = np.zeros(class_count, dtype=np.int64)
