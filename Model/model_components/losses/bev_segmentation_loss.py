@@ -37,6 +37,15 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
         target: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
+        return self.components(logits, target, valid_mask)["total"]
+
+    def components(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return total, BCE, and positive-pair Dice terms in FP32."""
         if logits.ndim != 4:
             raise ValueError("logits must have shape [B,C,H,W]")
         if target.shape != logits.shape or valid_mask.shape != logits.shape:
@@ -48,7 +57,8 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
         valid = valid_mask.to(device=logits.device, dtype=torch.bool)
         active = valid.any(dim=(2, 3))
         if not bool(active.any()):
-            return logits_fp32.sum() * 0.0
+            zero = logits_fp32.sum() * 0.0
+            return {"total": zero, "bce": zero, "dice": zero}
 
         with torch.autocast(
             device_type=logits.device.type,
@@ -74,5 +84,17 @@ class BEVSegmentationAuxiliaryLoss(nn.Module):
             sample_dice = 1.0 - (
                 2.0 * intersection + self.dice_epsilon
             ) / (denominator + self.dice_epsilon)
-            sample_loss = 0.5 * sample_bce + 0.5 * sample_dice
-            return sample_loss[active].mean()
+            bce_loss = sample_bce[active].mean()
+            positive_active = active & (
+                (target_fp32 * mask).sum(dim=(2, 3)) > 0.0
+            )
+            dice_loss = (
+                sample_dice[positive_active].mean()
+                if bool(positive_active.any())
+                else logits_fp32.sum() * 0.0
+            )
+            return {
+                "total": 0.5 * bce_loss + 0.5 * dice_loss,
+                "bce": bce_loss,
+                "dice": dice_loss,
+            }
