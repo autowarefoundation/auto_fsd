@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run after `terraform apply` completes successfully.
-# Sets up kubeconfig, applies the GPU NodePool + warm-node keeper, builds and
+# Sets up kubeconfig, applies GPU capacity and queue manifests, builds and
 # pushes the training image, and runs a GPU smoke-test Pod.
 #
 # All account/region specifics come from env or are resolved at runtime, so
@@ -26,13 +26,21 @@ aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION" --profile "$PROFI
 echo "=== 2. Verify cluster access ==="
 kubectl get nodepools
 
-echo "=== 3. Apply GPU NodeClass, NodePool, and warm-node keeper ==="
+echo "=== 3. Apply GPU NodeClasses, NodePools, and Kueue queues ==="
 sed "s/REPLACE_WITH_AWS_ACCOUNT_ID/${ACCOUNT}/g" \
   ../k8s/karpenter-nodepools/gpu-nodeclass.yaml | kubectl apply -f -
 kubectl apply -f ../k8s/karpenter-nodepools/gpu-nodepool.yaml
-kubectl apply -f ../k8s/gpu-node-keeper.yaml
-echo "Waiting for a GPU node to register (Karpenter provisions g6e)..."
-kubectl wait --for=condition=Ready node -l workload-type=gpu-training --timeout=600s
+kubectl apply -f ../k8s/kueue-config/kueue-objects.yaml
+for resource in \
+  nodeclass/auto-e2e-gpu-training \
+  nodeclass/auto-e2e-gpu-performance-reserved \
+  nodeclass/auto-e2e-gpu-performance-ondemand \
+  nodepool/gpu-training \
+  nodepool/gpu-performance-reserved \
+  nodepool/gpu-performance-ondemand
+do
+  kubectl wait --for=condition=Ready "$resource" --timeout=120s
+done
 
 echo "=== 4. ECR login ==="
 ECR_URL="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
@@ -54,5 +62,5 @@ kubectl logs -f train-smoke-test
 
 echo ""
 echo "=== Done ==="
-echo "GPU node: kubectl get nodes -l workload-type=gpu-training"
+echo "GPU capacity: kubectl get nodeclasses,nodepools"
 echo "Cleanup smoke test: kubectl delete pod train-smoke-test"
