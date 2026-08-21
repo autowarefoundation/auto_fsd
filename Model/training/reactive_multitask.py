@@ -39,6 +39,7 @@ def reactive_model_kwargs(
         raise ValueError("num_views must be positive")
     return {
         "num_views": num_views,
+        "image_feature_size": 32,
         "view_fusion_kwargs": (
             AUTOE2E_NAVIGATION_GEOMETRY.camera_bev_kwargs()
         ),
@@ -132,6 +133,32 @@ class ReactiveMultitaskObjective(nn.Module):
             batch["route_mask"].detach(),
             batch["route_channel_valid"],
         )
+        importance = batch.get("bev_sampling_importance")
+        if importance is not None:
+            importance = torch.as_tensor(
+                importance,
+                device=predicted_controls.device,
+                dtype=predicted_controls.dtype,
+            ).reshape(-1)
+            if (
+                importance.shape != predicted_controls.shape[:1]
+                or not torch.isfinite(importance).all()
+                or bool((importance <= 0.0).any())
+            ):
+                raise ValueError(
+                    "bev_sampling_importance must be finite, positive, "
+                    "and have shape [B]"
+                )
+            if importance.numel() > 1 and not torch.allclose(
+                importance,
+                importance[:1].expand_as(importance),
+            ):
+                raise ValueError(
+                    "non-uniform sampling importance requires batch size one"
+                )
+            non_bev_importance = importance.mean()
+            trajectory = trajectory * non_bev_importance
+            route = route * non_bev_importance
         zero = predicted_controls.sum() * 0.0
         bev = zero
         if self.bev_loss is not None:
