@@ -322,6 +322,114 @@ def test_four_rank_full_training_depends_on_gate_but_not_its_weights():
     assert gate_metadata.var == "metadata"
 
 
+def _bev_overfit_gate_metadata(tmp_path, **overrides):
+    metrics = {
+        "checkpoint_sha256": "a" * 64,
+        "dataset_manifest_sha256": "b" * 64,
+        "overfit_gate_pass": 1,
+        "overfit_sample_count": 64,
+        "overfit_sample_uid_sha256": "c" * 64,
+        "validation_bev_dynamic_macro_average_precision": 0.95,
+        "world_size": 4,
+    }
+    metrics.update({
+        f"bev_pos_weight_{index}": float(index + 2)
+        for index in range(len(BEV_SEGMENTATION_CLASSES))
+    })
+    metrics.update({
+        f"validation_bev_{class_name}_{suffix}": value
+        for class_name in BEV_SEGMENTATION_CLASSES
+        for suffix, value in (
+            ("positive_cells", 10.0),
+            ("recall", 0.95),
+        )
+    })
+    metrics.update(overrides)
+    path = tmp_path / "bev-overfit-gate.json"
+    path.write_text(json.dumps({
+        "history": [dict(metrics)],
+        "metrics": metrics,
+    }))
+    return distributed_training.FlyteFile(str(path))
+
+
+def test_bev_overfit_gate_validates_final_evidence(tmp_path):
+    metadata = _bev_overfit_gate_metadata(tmp_path)
+
+    assert distributed_training._validated_bev_overfit_gate_dataset(
+        metadata
+    ) == "b" * 64
+
+
+@pytest.mark.parametrize(
+    ("override_name", "override_value", "match"),
+    [
+        (
+            "validation_bev_dynamic_macro_average_precision",
+            0.89,
+            "average precision",
+        ),
+        (
+            "validation_bev_vehicle_recall",
+            0.89,
+            "vehicle",
+        ),
+        (
+            "validation_bev_vehicle_positive_cells",
+            0.0,
+            "no positives",
+        ),
+    ],
+)
+def test_bev_overfit_gate_rejects_weak_evidence(
+    tmp_path,
+    override_name,
+    override_value,
+    match,
+):
+    metadata = _bev_overfit_gate_metadata(
+        tmp_path,
+        **{override_name: override_value},
+    )
+
+    with pytest.raises(ValueError, match=match):
+        distributed_training._validated_bev_overfit_gate_dataset(
+            metadata
+        )
+
+
+def test_bev_overfit_gate_rejects_unit_weights_and_history_tampering(
+    tmp_path,
+):
+    unit_weights = {
+        f"bev_pos_weight_{index}": 1.0
+        for index in range(len(BEV_SEGMENTATION_CLASSES))
+    }
+    metadata = _bev_overfit_gate_metadata(tmp_path, **unit_weights)
+    with pytest.raises(ValueError, match="unit pos weights"):
+        distributed_training._validated_bev_overfit_gate_dataset(
+            metadata
+        )
+
+    metadata = _bev_overfit_gate_metadata(tmp_path)
+    path = Path(metadata.path)
+    payload = json.loads(path.read_text())
+    payload["history"][-1]["dataset_manifest_sha256"] = "d" * 64
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="history disagrees"):
+        distributed_training._validated_bev_overfit_gate_dataset(
+            metadata
+        )
+
+
+def test_four_rank_full_task_rejects_direct_ungated_call():
+    with pytest.raises(ValueError, match="requires BEV overfit gate"):
+        distributed_training.train_reactive_stage_ray_4.task_function(
+            shards=[],
+            stage="nuplan_full",
+        )
+
+
 def test_canary_launcher_is_idempotent_and_retries_flyte_admin():
     buildspec = (
         Path(distributed_training.__file__).parents[1]
