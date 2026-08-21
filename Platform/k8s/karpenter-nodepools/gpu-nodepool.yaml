@@ -91,7 +91,7 @@ spec:
       nodeClassRef:
         group: eks.amazonaws.com
         kind: NodeClass
-        name: default
+        name: auto-e2e-gpu-training
       requirements:
         - key: node.kubernetes.io/instance-type
           operator: In
@@ -101,7 +101,7 @@ spec:
           values: ["amd64"]
         - key: karpenter.sh/capacity-type
           operator: In
-          values: ["on-demand"]
+          values: ["reserved"]
         # Pinned to the AZ where the GPU ODCR is held (capacity-constrained)
         - key: topology.kubernetes.io/zone
           operator: In
@@ -111,8 +111,8 @@ spec:
           effect: NoSchedule
   limits:
     cpu: "64"
-    memory: 256Gi
-    nodes: "1"
+    memory: 512Gi
+    nodes: "4"
     nvidia.com/gpu: "4"
 ---
 apiVersion: karpenter.sh/v1
