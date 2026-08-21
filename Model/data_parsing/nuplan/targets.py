@@ -262,7 +262,7 @@ def _map_layer_polygons(
         SemanticMapLayer.ROADBLOCK_CONNECTOR,
         SemanticMapLayer.INTERSECTION,
     )
-    drivable_layers = required_drivable_layers
+    drivable_layers: tuple[Any, ...] = required_drivable_layers
     carpark_layer = getattr(SemanticMapLayer, "CARPARK_AREA", None)
     if carpark_layer is not None:
         drivable_layers += (carpark_layer,)
