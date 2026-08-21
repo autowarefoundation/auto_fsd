@@ -528,6 +528,8 @@ def _train_fixed_steps(
         "total",
         "trajectory",
         "bev_segmentation",
+        "bev_segmentation_bce",
+        "bev_segmentation_dice",
         "route_reconstruction",
     )
     totals = torch.zeros(
@@ -638,11 +640,17 @@ def _train_fixed_steps(
         "total": float(packed[0].item() / denominator),
         "trajectory": float(packed[1].item() / denominator),
         "bev_segmentation": float(packed[2].item() / denominator),
-        "route_reconstruction": float(
+        "bev_segmentation_bce": float(
             packed[3].item() / denominator
         ),
-        "consumed_samples": float(packed[4].item()),
-        "loader_restarts": float(packed[5].item()),
+        "bev_segmentation_dice": float(
+            packed[4].item() / denominator
+        ),
+        "route_reconstruction": float(
+            packed[5].item() / denominator
+        ),
+        "consumed_samples": float(packed[6].item()),
+        "loader_restarts": float(packed[7].item()),
         "local_consumed_samples": float(consumed_samples),
         "local_loader_restarts": float(iterator.restarts),
     }
@@ -719,6 +727,8 @@ def _evaluate_global_reactive(
     )
     negative_histogram = torch.zeros_like(positive_histogram)
     bev_loss_sum = 0.0
+    bev_bce_sum = 0.0
+    bev_dice_sum = 0.0
     bev_loss_batches = 0
     try:
         with torch.no_grad():
@@ -818,11 +828,20 @@ def _evaluate_global_reactive(
                         raise ValueError(
                             "BEV validation target shape differs"
                         )
-                    bev_loss_sum += float(objective.bev_loss(
+                    bev_components = objective.bev_loss.components(
                         bev_logits,
                         target,
                         valid_mask,
-                    ).item())
+                    )
+                    bev_loss_sum += float(
+                        bev_components["total"].item()
+                    )
+                    bev_bce_sum += float(
+                        bev_components["bce"].item()
+                    )
+                    bev_dice_sum += float(
+                        bev_components["dice"].item()
+                    )
                     bev_loss_batches += 1
                     probability = bev_logits.float().sigmoid()
                     binary_target = target >= 0.5
@@ -882,7 +901,12 @@ def _evaluate_global_reactive(
     dist.all_reduce(positive_histogram, op=dist.ReduceOp.SUM)
     dist.all_reduce(negative_histogram, op=dist.ReduceOp.SUM)
     bev_loss_values = torch.tensor(
-        [bev_loss_sum, float(bev_loss_batches)],
+        [
+            bev_loss_sum,
+            bev_bce_sum,
+            bev_dice_sum,
+            float(bev_loss_batches),
+        ],
         dtype=torch.float64,
         device=device,
     )
@@ -905,10 +929,16 @@ def _evaluate_global_reactive(
         metrics["selection_score"] = trajectory_quality
         return metrics
 
-    if float(bev_loss_values[1].item()) <= 0.0:
+    if float(bev_loss_values[3].item()) <= 0.0:
         raise ValueError("Stage A validation has no BEV batches")
     metrics["bev_loss"] = float(
-        bev_loss_values[0].item() / bev_loss_values[1].item()
+        bev_loss_values[0].item() / bev_loss_values[3].item()
+    )
+    metrics["bev_bce"] = float(
+        bev_loss_values[1].item() / bev_loss_values[3].item()
+    )
+    metrics["bev_dice"] = float(
+        bev_loss_values[2].item() / bev_loss_values[3].item()
     )
     average_precisions = [0.0] * class_count
     ap_lifts = [0.0] * class_count
@@ -1610,6 +1640,12 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 ),
                 "train_bev_segmentation": train_metrics[
                     "bev_segmentation"
+                ],
+                "train_bev_segmentation_bce": train_metrics[
+                    "bev_segmentation_bce"
+                ],
+                "train_bev_segmentation_dice": train_metrics[
+                    "bev_segmentation_dice"
                 ],
                 "train_loader_restarts": train_metrics[
                     "loader_restarts"
