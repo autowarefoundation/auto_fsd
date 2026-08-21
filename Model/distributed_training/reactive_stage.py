@@ -138,6 +138,10 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         raise ValueError("bev_ap_bins must be at least 256")
     if float(config.get("selection_ade_scale_m", 0.0)) <= 0.0:
         raise ValueError("selection_ade_scale_m must be positive")
+    if int(config.get("validation_sample_limit", 1024)) < world_size:
+        raise ValueError(
+            "validation_sample_limit must be at least num_workers"
+        )
     if float(
         config.get("selection_ade_regression_margin_m", -1.0)
     ) < 0.0:
@@ -1047,8 +1051,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         derive_bev_pos_weights,
         derive_bev_repeat_factors,
         discover_bev_sample_statistics,
+        discover_validation_sample_uids,
         make_multi_dataset_loader,
         passthrough_nodesplitter,
+        select_bev_validation_sample_uids,
         summarize_bev_positive_samples,
         summarize_bev_training_statistics,
     )
@@ -1138,6 +1144,47 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         )
         overfit_sample_uid_sha256 = hashlib.sha256(
             "\n".join(overfit_sample_uids).encode("utf-8")
+        ).hexdigest()
+    validation_sample_uids: tuple[str, ...] | None = None
+    validation_sample_uid_sha256 = ""
+    validation_sample_count = 0
+    if not overfit_sample_count:
+        local_validation_limit = math.ceil(
+            int(config.get("validation_sample_limit", 1024))
+            / world_size
+        )
+        if stage is ReactiveTrainingStage.NUPLAN_FULL:
+            assert local_bev_records is not None
+            validation_sample_uids = select_bev_validation_sample_uids(
+                local_bev_records,
+                val_fraction=float(config["val_fraction"]),
+                sample_limit=local_validation_limit,
+            )
+        else:
+            validation_sample_uids = discover_validation_sample_uids(
+                local_directories,
+                val_fraction=float(config["val_fraction"]),
+                sample_limit=local_validation_limit,
+            )
+        rank_validation_uids: list[Any] = [None] * world_size
+        dist.all_gather_object(
+            rank_validation_uids,
+            validation_sample_uids,
+        )
+        global_validation_uids = sorted(
+            str(sample_uid)
+            for rank_uids in rank_validation_uids
+            for sample_uid in rank_uids
+        )
+        if len(set(global_validation_uids)) != len(
+            global_validation_uids
+        ):
+            raise ValueError(
+                "Reactive validation subset contains duplicate samples"
+            )
+        validation_sample_count = len(global_validation_uids)
+        validation_sample_uid_sha256 = hashlib.sha256(
+            "\n".join(global_validation_uids).encode("utf-8")
         ).hexdigest()
     bev_pos_weights = (1.0,) * 8
     bev_repeat_factors = (1,) * 8
@@ -1295,6 +1342,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "bev_pos_weights": list(bev_pos_weights),
         "bev_repeat_factors": list(bev_repeat_factors),
         "bev_taxonomy_version": "bev_segmentation_v2",
+        "validation_sample_count": validation_sample_count,
+        "validation_sample_uid_sha256": validation_sample_uid_sha256,
     }
     start_epoch = 1
     best_selection_score = -float("inf")
@@ -1343,6 +1392,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "bev_pos_weights": list(bev_pos_weights),
         "bev_repeat_factors": list(bev_repeat_factors),
         "bev_taxonomy_version": "bev_segmentation_v2",
+        "validation_sample_count": validation_sample_count,
+        "validation_sample_uid_sha256": validation_sample_uid_sha256,
     }
     if raw_bev_statistics is not None:
         model_config["bev_raw_statistics"] = (
@@ -1401,7 +1452,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             shuffle=0,
             pin_memory=True,
             max_active_loaders=1,
-            sample_uids=overfit_sample_uids,
+            sample_uids=(
+                overfit_sample_uids
+                if overfit_sample_count
+                else validation_sample_uids
+            ),
             decode_future_frames=False,
             nodesplitter=passthrough_nodesplitter,
         )
@@ -1572,6 +1627,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "validation_selection_score": validation[
                     "selection_score"
                 ],
+                "validation_sample_count": validation_sample_count,
+                "validation_sample_uid_sha256": (
+                    validation_sample_uid_sha256
+                ),
                 "world_size": world_size,
             }
             for name, value in validation.items():
