@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import re
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ SEMANTIC_OCCUPANCY_CLASS_NAMES = (
 FLAG_TEACHER_PRESENT = 1 << 0
 _HEADER = struct.Struct("<4sHHIHHHH")
 _DIRECTORY_ENTRY = struct.Struct("<QI")
+_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,11 @@ def semantic_occupancy_s3_key(
     dataset_manifest_sha256: str,
     dataset: str,
     shard: str,
+    *,
+    artifact_schema: str = SEMANTIC_OCCUPANCY_SCHEMA,
+    geometry_id: str = SEMANTIC_OCCUPANCY_GEOMETRY_ID,
+    taxonomy_version: str = SEMANTIC_OCCUPANCY_TAXONOMY_VERSION,
+    head_version: str = SEMANTIC_OCCUPANCY_HEAD_VERSION,
 ) -> str:
     for label, digest in (
         ("model_checkpoint_sha256", model_checkpoint_sha256),
@@ -70,28 +77,45 @@ def semantic_occupancy_s3_key(
             for character in digest
         ):
             raise ValueError(f"{label} must be lowercase SHA-256")
-    for label, value in (("dataset", dataset), ("shard", shard)):
-        if not value or "/" in value or "\\" in value:
-            raise ValueError(f"{label} must be one path segment")
+    for label, value in (
+        ("artifact_schema", artifact_schema),
+        ("geometry_id", geometry_id),
+        ("taxonomy_version", taxonomy_version),
+        ("head_version", head_version),
+        ("dataset", dataset),
+        ("shard", shard),
+    ):
+        if not _PATH_SEGMENT_RE.fullmatch(value):
+            raise ValueError(f"{label} must be one canonical path segment")
     return (
-        f"semantic-occupancy/schema={SEMANTIC_OCCUPANCY_SCHEMA}/"
+        f"semantic-occupancy/schema={artifact_schema}/"
         f"model={model_checkpoint_sha256}/"
         f"manifest={dataset_manifest_sha256}/"
-        f"geometry={SEMANTIC_OCCUPANCY_GEOMETRY_ID}/"
-        f"taxonomy={SEMANTIC_OCCUPANCY_TAXONOMY_VERSION}/"
-        f"head={SEMANTIC_OCCUPANCY_HEAD_VERSION}/dataset={dataset}/"
+        f"geometry={geometry_id}/"
+        f"taxonomy={taxonomy_version}/"
+        f"head={head_version}/dataset={dataset}/"
         f"shard={shard}/occupancy.bin.gz"
     )
 
 
-def _quantize_probability(
+def quantize_semantic_occupancy(
     probability: np.ndarray,
 ) -> np.ndarray:
+    """Return canonical uint8 cells for one frame or a frame batch."""
     values = np.asarray(probability)
-    if values.ndim != 4 or values.shape[1] != len(
-        SEMANTIC_OCCUPANCY_CLASS_NAMES
-    ):
-        raise ValueError("probability must have shape [N,8,H,W]")
+    if values.ndim == 3:
+        class_count = values.shape[0]
+        expected_shape = "[8,H,W]"
+    elif values.ndim == 4:
+        class_count = values.shape[1]
+        expected_shape = "[N,8,H,W]"
+    else:
+        class_count = -1
+        expected_shape = "[8,H,W] or [N,8,H,W]"
+    if class_count != len(SEMANTIC_OCCUPANCY_CLASS_NAMES):
+        raise ValueError(f"probability must have shape {expected_shape}")
+    if values.dtype == np.uint8:
+        return np.ascontiguousarray(values)
     if (
         not np.issubdtype(values.dtype, np.floating)
         or not np.isfinite(values).all()
@@ -115,7 +139,9 @@ def encode_semantic_occupancy(
     sample_uids = tuple(sample_uids)
     if not sample_uids or len(set(sample_uids)) != len(sample_uids):
         raise ValueError("sample UIDs must be non-empty and unique")
-    probability_u8 = _quantize_probability(probability)
+    probability_u8 = quantize_semantic_occupancy(probability)
+    if probability_u8.ndim != 4:
+        raise ValueError("probability must have shape [N,8,H,W]")
     sample_count, class_count, height, width = probability_u8.shape
     if sample_count != len(sample_uids):
         raise ValueError("sample UID count differs from probability rows")
@@ -128,7 +154,7 @@ def encode_semantic_occupancy(
     if (teacher is None) != (valid_mask is None):
         raise ValueError("teacher and valid_mask must be present together")
     if teacher is not None and valid_mask is not None:
-        teacher_u8 = _quantize_probability(teacher)
+        teacher_u8 = quantize_semantic_occupancy(teacher)
         valid = np.asarray(valid_mask, dtype=np.bool_)
         if teacher_u8.shape != probability_u8.shape or valid.shape != (
             probability_u8.shape
