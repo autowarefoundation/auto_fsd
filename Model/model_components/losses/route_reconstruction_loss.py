@@ -93,8 +93,14 @@ class RouteReconstructionLoss(nn.Module):
         if not bool(valid.any()):
             return logits.sum() * 0.0
 
-        sample_losses = logits.new_zeros(logits.shape[0])
-        sample_terms = logits.new_zeros(logits.shape[0])
+        sample_losses = logits.new_zeros(
+            logits.shape[0],
+            dtype=torch.float32,
+        )
+        sample_terms = logits.new_zeros(
+            logits.shape[0],
+            dtype=torch.float32,
+        )
 
         corridor_valid = valid[:, 0]
         if bool(corridor_valid.any()):
