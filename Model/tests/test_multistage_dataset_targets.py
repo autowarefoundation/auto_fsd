@@ -31,6 +31,7 @@ from data_parsing.nuplan.packing import (
 import data_parsing.nuplan.targets as nuplan_targets
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_CLASSES,
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
     decode_bev_segmentation,
     decode_bev_segmentation_stats,
     decode_trajectory_xy,
@@ -649,7 +650,10 @@ def test_nuplan_packer_emits_log_grouped_immutable_shards(
 
     assert manifest["total_samples"] == 1
     assert manifest["bev_statistics_count"] == 1
-    assert manifest["bev_taxonomy_version"] == "bev_segmentation_v2"
+    assert (
+        manifest["bev_taxonomy_version"]
+        == BEV_SEGMENTATION_TAXONOMY_VERSION
+    )
     assert manifest["split_policy"] == "log_level_hash_bucket"
     assert manifest["navigation_geometry"] == geometry.contract()
     tar_path = tmp_path / manifest["shard_names"][0]
