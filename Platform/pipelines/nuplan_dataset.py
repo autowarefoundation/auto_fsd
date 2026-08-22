@@ -17,6 +17,10 @@ from flytekit import (
 from flytekit.types.directory import FlyteDirectory
 from flytekit.types.file import FlyteFile
 
+from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
+)
+
 
 DATA_PREP_IMAGE = os.environ.get(
     "AUTO_E2E_DATA_PREP_IMAGE",
@@ -708,8 +712,11 @@ def pack_nuplan_snapshot_reactive_dataset(
         max_rejection_fraction=max_rejection_fraction,
         pack_workers=pack_workers,
     )
-    if packed.get("bev_taxonomy_version") != "bev_segmentation_v2":
-        raise ValueError("nuPlan packer did not emit BEV schema v2")
+    if (
+        packed.get("bev_taxonomy_version")
+        != BEV_SEGMENTATION_TAXONOMY_VERSION
+    ):
+        raise ValueError("nuPlan packer did not emit the current BEV taxonomy")
     if packed.get("schema_version") != "nuplan_reactive_manifest_v2":
         raise ValueError("nuPlan packer did not emit manifest schema v2")
     packed_counts = {
