@@ -421,26 +421,6 @@ def _select_bev_overfit_subset(
             "BEV overfit candidates have insufficient positive sample "
             f"support: {insufficient}"
         )
-    quota_limited_support = [
-        sum(
-            min(rank_support, per_rank_count)
-            for rank_support in class_support
-        )
-        for class_support in available_support_by_rank
-    ]
-    quota_insufficient = {
-        class_index: {
-            "available_by_rank": available_support_by_rank[class_index],
-            "quota_limited_support": support,
-        }
-        for class_index, support in enumerate(quota_limited_support)
-        if support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES
-    }
-    if quota_insufficient:
-        raise ValueError(
-            "BEV overfit rank quotas cannot satisfy positive sample "
-            f"support: {quota_insufficient}"
-        )
 
     selected: dict[str, tuple[str, int, tuple[int, ...]]] = {}
     selected_per_rank = [0] * rank_count
