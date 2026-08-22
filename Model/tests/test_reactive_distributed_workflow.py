@@ -761,7 +761,7 @@ def test_nuplan_acquisition_workflow_binds_one_dynamic_import_program():
     assert bindings["concurrency"].promise.var == "concurrency"
 
 
-def test_nuplan_snapshot_pack_uses_bev_v2_cache_and_full_default():
+def test_nuplan_snapshot_pack_uses_bev_v3_cache_and_full_default():
     node, = nuplan_dataset.wf_pack_nuplan_snapshot_reactive_dataset.nodes
     bindings = {
         binding.var: binding.binding
@@ -772,7 +772,7 @@ def test_nuplan_snapshot_pack_uses_bev_v2_cache_and_full_default():
         "pack_nuplan_snapshot_reactive_dataset"
     )
     assert node.flyte_entity.metadata.cache_version == (
-        "nuplan-snapshot-pack-v4-parallel"
+        "nuplan-snapshot-pack-v5-parallel"
     )
     assert node.flyte_entity.metadata.retries == 1
     assert (
