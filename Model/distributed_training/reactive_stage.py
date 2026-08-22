@@ -65,6 +65,26 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         raise ValueError("weight_decay must be non-negative")
     if float(config.get("grad_clip", 0.0)) <= 0.0:
         raise ValueError("grad_clip must be positive")
+    for name in ("trajectory_weight", "bev_weight", "route_weight"):
+        try:
+            weight = float(config[name])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be configured") from error
+        if not math.isfinite(weight) or not 0.0 <= weight <= 1_000.0:
+            raise ValueError(
+                f"{name} must be finite and between zero and 1000"
+            )
+    try:
+        corridor_pos_weight = float(config["corridor_pos_weight"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("corridor_pos_weight must be configured") from error
+    if (
+        not math.isfinite(corridor_pos_weight)
+        or not 1.0 <= corridor_pos_weight <= 1_000.0
+    ):
+        raise ValueError(
+            "corridor_pos_weight must be finite and between one and 1000"
+        )
     precision = str(config.get("precision", ""))
     if precision not in SUPPORTED_PRECISIONS:
         raise ValueError(
@@ -105,6 +125,45 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "overfit_sample_count must be divisible by num_workers"
         )
+    overfit_bev_only = config.get("overfit_bev_only")
+    overfit_fixed_lr = config.get("overfit_fixed_lr")
+    if not isinstance(overfit_bev_only, bool):
+        raise ValueError("overfit_bev_only must be a boolean")
+    if not isinstance(overfit_fixed_lr, bool):
+        raise ValueError("overfit_fixed_lr must be a boolean")
+    if not overfit_sample_count and (
+        overfit_bev_only or overfit_fixed_lr
+    ):
+        raise ValueError(
+            "overfit controls require overfit_sample_count"
+        )
+    if overfit_sample_count and not overfit_fixed_lr:
+        raise ValueError("BEV overfit gates require a fixed learning rate")
+    if overfit_bev_only:
+        expected_weights = {
+            "trajectory_weight": 0.0,
+            "bev_weight": 1.0,
+            "route_weight": 0.0,
+        }
+        mismatches = {
+            name: (float(config[name]), expected)
+            for name, expected in expected_weights.items()
+            if float(config[name]) != expected
+        }
+        if mismatches:
+            raise ValueError(
+                f"BEV-only objective weights differ: {mismatches}"
+            )
+        if float(config["weight_decay"]) != 0.0:
+            raise ValueError("BEV-only capacity probes require weight_decay=0")
+        capacity_steps = (
+            int(config["epochs"]) * int(config.get("steps_per_epoch", 0))
+        )
+        if capacity_steps < 5_000:
+            raise ValueError(
+                "BEV-only capacity probes require at least 5000 "
+                "optimizer steps"
+            )
     overfit_shard_limit = int(config.get("overfit_shard_limit", 0))
     if overfit_shard_limit and overfit_shard_limit < world_size:
         raise ValueError(
@@ -503,6 +562,32 @@ def clip_finite_gradients_float64(
     return gradient_norm, finite
 
 
+def _build_reactive_scheduler(optimizer, *, fixed_lr: bool):
+    import torch
+
+    if fixed_lr:
+        return (
+            "constant_v1",
+            torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lr_lambda=lambda _: 1.0,
+            ),
+        )
+    return (
+        "selection_plateau_v1",
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=2,
+            threshold=1e-3,
+            threshold_mode="rel",
+            cooldown=1,
+            min_lr=1e-5,
+        ),
+    )
+
+
 def _train_fixed_steps(
     model,
     loader,
@@ -585,7 +670,9 @@ def _train_fixed_steps(
                         compute_bev_segmentation=(
                             objective.compute_bev_segmentation
                         ),
-                        compute_route_reconstruction=True,
+                        compute_route_reconstruction=(
+                            objective.compute_route_reconstruction
+                        ),
                     )
                     if not isinstance(output, tuple):
                         raise RuntimeError(
@@ -1131,6 +1218,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             "BEV overfit gate dataset differs from the full training dataset"
         )
     overfit_sample_count = int(config["overfit_sample_count"])
+    overfit_bev_only = bool(config["overfit_bev_only"])
+    overfit_fixed_lr = bool(config["overfit_fixed_lr"])
     assignment_shards = plan.shards
     overfit_shard_limit = int(config.get("overfit_shard_limit", 0))
     if overfit_sample_count and overfit_shard_limit:
@@ -1300,10 +1389,15 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         parent_path.parent.mkdir(parents=True, exist_ok=True)
         _download_checkpoint(parent_uri, parent_path)
         lineage.update(load_stage_a_parent(model, parent_path))
-    configure_model_for_stage(model, stage)
+    configure_model_for_stage(
+        model,
+        stage,
+        bev_only=overfit_bev_only,
+    )
     objective = ReactiveMultitaskObjective(
         stage,
         bev_pos_weight=bev_pos_weights,
+        trajectory_weight=float(config["trajectory_weight"]),
         bev_weight=float(config["bev_weight"]),
         route_weight=float(config["route_weight"]),
         corridor_pos_weight=float(config["corridor_pos_weight"]),
@@ -1326,15 +1420,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         lr=float(config["learning_rate"]),
         weight_decay=float(config["weight_decay"]),
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler_identity, scheduler = _build_reactive_scheduler(
         optimizer,
-        mode="max",
-        factor=0.5,
-        patience=2,
-        threshold=1e-3,
-        threshold_mode="rel",
-        cooldown=1,
-        min_lr=1e-5,
+        fixed_lr=overfit_fixed_lr,
     )
 
     if overfit_sample_count:
@@ -1368,6 +1456,14 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_global_batch": global_batch,
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
+        "trajectory_weight": float(config["trajectory_weight"]),
+        "bev_weight": float(config["bev_weight"]),
+        "route_weight": float(config["route_weight"]),
+        "corridor_pos_weight": float(config["corridor_pos_weight"]),
+        "training_seed": seed,
+        "scheduler_identity": scheduler_identity,
+        "overfit_bev_only": overfit_bev_only,
+        "overfit_fixed_lr": overfit_fixed_lr,
         "training_stage": stage.value,
         "bev_pos_weights": list(bev_pos_weights),
         "bev_repeat_factors": list(bev_repeat_factors),
@@ -1419,6 +1515,14 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_global_batch": global_batch,
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
+        "trajectory_weight": float(config["trajectory_weight"]),
+        "bev_weight": float(config["bev_weight"]),
+        "route_weight": float(config["route_weight"]),
+        "corridor_pos_weight": float(config["corridor_pos_weight"]),
+        "training_seed": seed,
+        "scheduler_identity": scheduler_identity,
+        "overfit_bev_only": overfit_bev_only,
+        "overfit_fixed_lr": overfit_fixed_lr,
         "bev_pos_weights": list(bev_pos_weights),
         "bev_repeat_factors": list(bev_repeat_factors),
         "bev_taxonomy_version": "bev_segmentation_v2",
@@ -1499,7 +1603,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             probability_bins=int(config["bev_ap_bins"]),
             ade_scale_m=float(config["selection_ade_scale_m"]),
         )
-        scheduler.step(validation["selection_score"])
+        if overfit_fixed_lr:
+            scheduler.step()
+        else:
+            scheduler.step(validation["selection_score"])
         overfit_gate_pass = False
         if (
             overfit_sample_count
