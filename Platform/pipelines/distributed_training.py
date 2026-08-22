@@ -56,6 +56,10 @@ RAY_TASK_ENVIRONMENT = {
 BEV_OVERFIT_SAMPLE_COUNT = 64
 BEV_OVERFIT_MIN_AP = 0.9
 BEV_OVERFIT_MIN_RECALL = 0.9
+BEV_CAPACITY_GATE_EPOCHS = 10
+BEV_CAPACITY_GATE_STEPS_PER_EPOCH = 500
+BEV_JOINT_GATE_EPOCHS = 50
+BEV_OVERFIT_LEARNING_RATE = 3e-4
 
 
 class RaySmokeOutput(NamedTuple):
@@ -359,6 +363,7 @@ def _run_reactive_stage_task(
     steps_per_epoch: int,
     shuffle_buffer: int,
     is_pretrained: bool,
+    trajectory_weight: float,
     bev_weight: float,
     route_weight: float,
     corridor_pos_weight: float,
@@ -371,6 +376,8 @@ def _run_reactive_stage_task(
     overfit_shard_limit: int,
     overfit_min_ap: float,
     overfit_min_recall: float,
+    overfit_bev_only: bool,
+    overfit_fixed_lr: bool,
     validation_sample_limit: int,
     required_gate_dataset_manifest_sha256: str = "",
 ) -> ReactiveRayOutput:
@@ -418,6 +425,8 @@ def _run_reactive_stage_task(
         "local_cache_root": "/tmp/auto-e2e-reactive",
         "num_loader_workers": num_loader_workers,
         "num_workers": num_workers,
+        "overfit_bev_only": overfit_bev_only,
+        "overfit_fixed_lr": overfit_fixed_lr,
         "overfit_min_ap": overfit_min_ap,
         "overfit_min_recall": overfit_min_recall,
         "overfit_sample_count": overfit_sample_count,
@@ -438,6 +447,7 @@ def _run_reactive_stage_task(
         "steps_per_epoch": steps_per_epoch,
         "storage_path": RAY_STORAGE_PATH,
         "training_seed": training_seed,
+        "trajectory_weight": trajectory_weight,
         "use_gpu": True,
         "val_fraction": val_fraction,
         "validation_sample_limit": validation_sample_limit,
@@ -772,9 +782,12 @@ def train_reactive_stage_ray_2(
     steps_per_epoch: int = 2,
     shuffle_buffer: int = 64,
     is_pretrained: bool = False,
+    trajectory_weight: float = 1.0,
     bev_weight: float = 1.0,
     route_weight: float = 1.0,
     corridor_pos_weight: float = 1.0,
+    overfit_bev_only: bool = False,
+    overfit_fixed_lr: bool = False,
 ) -> ReactiveRayOutput:
     """Run a two-node real-model integration canary."""
     return _run_reactive_stage_task(
@@ -795,6 +808,7 @@ def train_reactive_stage_ray_2(
         steps_per_epoch=steps_per_epoch,
         shuffle_buffer=shuffle_buffer,
         is_pretrained=is_pretrained,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
         corridor_pos_weight=corridor_pos_weight,
@@ -807,6 +821,8 @@ def train_reactive_stage_ray_2(
         overfit_shard_limit=0,
         overfit_min_ap=0.9,
         overfit_min_recall=0.9,
+        overfit_bev_only=overfit_bev_only,
+        overfit_fixed_lr=overfit_fixed_lr,
         validation_sample_limit=256,
     )
 
@@ -839,22 +855,36 @@ def train_reactive_stage_ray_4(
     steps_per_epoch: int = 0,
     shuffle_buffer: int = 1000,
     is_pretrained: bool = True,
+    trajectory_weight: float = 1.0,
     bev_weight: float = 1.0,
     route_weight: float = 1.0,
     corridor_pos_weight: float = 1.0,
     overfit_sample_count: int = 0,
     overfit_min_ap: float = 0.9,
     overfit_min_recall: float = 0.9,
+    overfit_bev_only: bool = False,
+    overfit_fixed_lr: bool = False,
 ) -> ReactiveRayOutput:
     """Run a four-rank Reactive performance training stage."""
     if overfit_sample_count:
-        if gate_metadata is not None:
-            raise ValueError("BEV overfit runs cannot consume gate metadata")
-        required_gate_dataset = ""
+        if overfit_bev_only:
+            if gate_metadata is not None:
+                raise ValueError(
+                    "BEV-only capacity probes cannot consume gate metadata"
+                )
+            required_gate_dataset = ""
+        else:
+            if gate_metadata is None:
+                raise ValueError(
+                    "joint overfit gates require capacity gate metadata"
+                )
+            required_gate_dataset = _validated_bev_overfit_gate_dataset(
+                gate_metadata
+            )
     else:
         if gate_metadata is None:
             raise ValueError(
-                "four-rank full training requires BEV overfit gate metadata"
+                "four-rank full training requires joint gate metadata"
             )
         required_gate_dataset = _validated_bev_overfit_gate_dataset(
             gate_metadata
@@ -877,6 +907,7 @@ def train_reactive_stage_ray_4(
         steps_per_epoch=steps_per_epoch,
         shuffle_buffer=shuffle_buffer,
         is_pretrained=is_pretrained,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
         corridor_pos_weight=corridor_pos_weight,
@@ -893,6 +924,8 @@ def train_reactive_stage_ray_4(
         overfit_shard_limit=(32 if overfit_sample_count else 0),
         overfit_min_ap=overfit_min_ap,
         overfit_min_recall=overfit_min_recall,
+        overfit_bev_only=overfit_bev_only,
+        overfit_fixed_lr=overfit_fixed_lr,
         required_gate_dataset_manifest_sha256=required_gate_dataset,
         validation_sample_limit=1024,
     )
@@ -926,9 +959,12 @@ def train_reactive_stage_ray_8(
     steps_per_epoch: int = 0,
     shuffle_buffer: int = 1000,
     is_pretrained: bool = True,
+    trajectory_weight: float = 1.0,
     bev_weight: float = 1.0,
     route_weight: float = 1.0,
     corridor_pos_weight: float = 1.0,
+    overfit_bev_only: bool = False,
+    overfit_fixed_lr: bool = False,
 ) -> ReactiveRayOutput:
     """Run one production-size Reactive DDP stage."""
     if stage == "nuplan_full":
@@ -963,6 +999,7 @@ def train_reactive_stage_ray_8(
         steps_per_epoch=steps_per_epoch,
         shuffle_buffer=shuffle_buffer,
         is_pretrained=is_pretrained,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
         corridor_pos_weight=corridor_pos_weight,
@@ -975,6 +1012,8 @@ def train_reactive_stage_ray_8(
         overfit_shard_limit=0,
         overfit_min_ap=0.9,
         overfit_min_recall=0.9,
+        overfit_bev_only=overfit_bev_only,
+        overfit_fixed_lr=overfit_fixed_lr,
         required_gate_dataset_manifest_sha256=required_gate_dataset,
         validation_sample_limit=1024,
     )
@@ -989,8 +1028,8 @@ def wf_ray_ddp_smoke_4(steps: int = 4) -> FlyteFile:
 def wf_overfit_reactive_nuplan_ray_4(
     nuplan_shards: List[FlyteDirectory],
     sample_count: int = BEV_OVERFIT_SAMPLE_COUNT,
-    epochs: int = 50,
-    learning_rate: float = 3e-4,
+    epochs: int = BEV_CAPACITY_GATE_EPOCHS,
+    learning_rate: float = BEV_OVERFIT_LEARNING_RATE,
     val_fraction: float = 0.2,
     training_seed: int = 149,
 ) -> ReactiveRayOutput:
@@ -1002,19 +1041,23 @@ def wf_overfit_reactive_nuplan_ray_4(
         gate_metadata=None,
         epochs=epochs,
         learning_rate=learning_rate,
+        weight_decay=0.0,
         val_fraction=val_fraction,
         num_loader_workers=2,
         training_seed=training_seed,
         precision="bf16",
         gradient_accumulation_steps=1,
-        steps_per_epoch=0,
+        steps_per_epoch=BEV_CAPACITY_GATE_STEPS_PER_EPOCH,
         shuffle_buffer=256,
         is_pretrained=True,
+        trajectory_weight=0.0,
         bev_weight=1.0,
-        route_weight=1.0,
+        route_weight=0.0,
         overfit_sample_count=sample_count,
         overfit_min_ap=BEV_OVERFIT_MIN_AP,
         overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
+        overfit_bev_only=True,
+        overfit_fixed_lr=True,
     )
 
 
@@ -1027,17 +1070,42 @@ def wf_train_reactive_nuplan_ray_4(
     num_loader_workers: int = 2,
     training_seed: int = 149,
     precision: str = "bf16",
+    trajectory_weight: float = 1.0,
     bev_weight: float = 1.0,
     route_weight: float = 1.0,
 ) -> ReactiveRayOutput:
-    """Pass the BEV overfit gate, then train Stage A from initial weights."""
-    overfit = train_reactive_stage_ray_4(
+    """Pass capacity and joint gates, then train from initial weights."""
+    capacity_gate = train_reactive_stage_ray_4(
         shards=nuplan_shards,
         stage="nuplan_full",
         parent_checkpoint=None,
         gate_metadata=None,
-        epochs=50,
-        learning_rate=3e-4,
+        epochs=BEV_CAPACITY_GATE_EPOCHS,
+        learning_rate=BEV_OVERFIT_LEARNING_RATE,
+        weight_decay=0.0,
+        val_fraction=val_fraction,
+        num_loader_workers=num_loader_workers,
+        training_seed=training_seed,
+        precision=precision,
+        steps_per_epoch=BEV_CAPACITY_GATE_STEPS_PER_EPOCH,
+        shuffle_buffer=256,
+        is_pretrained=True,
+        trajectory_weight=0.0,
+        bev_weight=1.0,
+        route_weight=0.0,
+        overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
+        overfit_min_ap=BEV_OVERFIT_MIN_AP,
+        overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
+        overfit_bev_only=True,
+        overfit_fixed_lr=True,
+    )
+    joint_gate = train_reactive_stage_ray_4(
+        shards=nuplan_shards,
+        stage="nuplan_full",
+        parent_checkpoint=None,
+        gate_metadata=capacity_gate.metadata,
+        epochs=BEV_JOINT_GATE_EPOCHS,
+        learning_rate=BEV_OVERFIT_LEARNING_RATE,
         val_fraction=val_fraction,
         num_loader_workers=num_loader_workers,
         training_seed=training_seed,
@@ -1045,17 +1113,20 @@ def wf_train_reactive_nuplan_ray_4(
         steps_per_epoch=0,
         shuffle_buffer=256,
         is_pretrained=True,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
         overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
         overfit_min_ap=BEV_OVERFIT_MIN_AP,
         overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
+        overfit_bev_only=False,
+        overfit_fixed_lr=True,
     )
     return train_reactive_stage_ray_4(
         shards=nuplan_shards,
         stage="nuplan_full",
         parent_checkpoint=None,
-        gate_metadata=overfit.metadata,
+        gate_metadata=joint_gate.metadata,
         epochs=epochs,
         learning_rate=learning_rate,
         val_fraction=val_fraction,
@@ -1065,8 +1136,11 @@ def wf_train_reactive_nuplan_ray_4(
         steps_per_epoch=0,
         shuffle_buffer=1000,
         is_pretrained=True,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
+        overfit_bev_only=False,
+        overfit_fixed_lr=False,
     )
 
 
@@ -1082,17 +1156,42 @@ def wf_train_reactive_nuplan_l2d_ray_8(
     num_loader_workers: int = 2,
     training_seed: int = 149,
     precision: str = "bf16",
+    trajectory_weight: float = 1.0,
     bev_weight: float = 1.0,
     route_weight: float = 1.0,
 ) -> ReactiveDistributedProgramOutput:
-    """Train Stage A and Stage B as separate eight-rank RayJobs."""
-    overfit = train_reactive_stage_ray_4(
+    """Gate Stage A, then run both eight-rank training stages."""
+    capacity_gate = train_reactive_stage_ray_4(
         shards=nuplan_shards,
         stage="nuplan_full",
         parent_checkpoint=None,
         gate_metadata=None,
-        epochs=50,
-        learning_rate=3e-4,
+        epochs=BEV_CAPACITY_GATE_EPOCHS,
+        learning_rate=BEV_OVERFIT_LEARNING_RATE,
+        weight_decay=0.0,
+        val_fraction=val_fraction,
+        num_loader_workers=num_loader_workers,
+        training_seed=training_seed,
+        precision=precision,
+        steps_per_epoch=BEV_CAPACITY_GATE_STEPS_PER_EPOCH,
+        shuffle_buffer=256,
+        is_pretrained=True,
+        trajectory_weight=0.0,
+        bev_weight=1.0,
+        route_weight=0.0,
+        overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
+        overfit_min_ap=BEV_OVERFIT_MIN_AP,
+        overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
+        overfit_bev_only=True,
+        overfit_fixed_lr=True,
+    )
+    joint_gate = train_reactive_stage_ray_4(
+        shards=nuplan_shards,
+        stage="nuplan_full",
+        parent_checkpoint=None,
+        gate_metadata=capacity_gate.metadata,
+        epochs=BEV_JOINT_GATE_EPOCHS,
+        learning_rate=BEV_OVERFIT_LEARNING_RATE,
         val_fraction=val_fraction,
         num_loader_workers=num_loader_workers,
         training_seed=training_seed,
@@ -1100,25 +1199,31 @@ def wf_train_reactive_nuplan_l2d_ray_8(
         steps_per_epoch=0,
         shuffle_buffer=256,
         is_pretrained=True,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
         overfit_sample_count=BEV_OVERFIT_SAMPLE_COUNT,
         overfit_min_ap=BEV_OVERFIT_MIN_AP,
         overfit_min_recall=BEV_OVERFIT_MIN_RECALL,
+        overfit_bev_only=False,
+        overfit_fixed_lr=True,
     )
     stage_a = train_reactive_stage_ray_8(
         shards=nuplan_shards,
         stage="nuplan_full",
         parent_checkpoint=None,
-        gate_metadata=overfit.metadata,
+        gate_metadata=joint_gate.metadata,
         epochs=stage_a_epochs,
         learning_rate=stage_a_learning_rate,
         val_fraction=val_fraction,
         num_loader_workers=num_loader_workers,
         training_seed=training_seed,
         precision=precision,
+        trajectory_weight=trajectory_weight,
         bev_weight=bev_weight,
         route_weight=route_weight,
+        overfit_bev_only=False,
+        overfit_fixed_lr=False,
     )
     stage_b = train_reactive_stage_ray_8(
         shards=l2d_shards,
@@ -1131,8 +1236,11 @@ def wf_train_reactive_nuplan_l2d_ray_8(
         num_loader_workers=num_loader_workers,
         training_seed=training_seed,
         precision=precision,
+        trajectory_weight=trajectory_weight,
         bev_weight=0.0,
         route_weight=route_weight,
+        overfit_bev_only=False,
+        overfit_fixed_lr=False,
     )
     return ReactiveDistributedProgramOutput(
         stage_a_checkpoint=stage_a.checkpoint,
