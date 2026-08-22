@@ -562,6 +562,51 @@ def test_perfect_multitask_predictions_approach_zero():
     assert xy_loss.item() == pytest.approx(0.0)
 
 
+def test_route_loss_components_preserve_masked_total():
+    logits = torch.zeros(2, 2, 4, 6)
+    target = torch.zeros_like(logits)
+    target[0, 0, 1:3, 2:4] = 1.0
+    target[1, 1, 2, 4] = 1.0
+    channel_valid = torch.tensor([
+        [True, False],
+        [False, True],
+    ])
+    loss_function = RouteReconstructionLoss()
+
+    components = loss_function.components(
+        logits,
+        target,
+        channel_valid,
+    )
+    expected_total = (
+        0.5 * components["corridor_bce"]
+        + 0.5 * components["corridor_dice"]
+        + 0.25 * components["destination_focal"]
+    ) / 2.0
+
+    assert components["total"].dtype == torch.float32
+    assert torch.equal(components["total"], expected_total)
+    assert torch.equal(
+        loss_function(logits, target, channel_valid),
+        components["total"],
+    )
+
+
+def test_zero_weight_destination_only_route_loss_is_finite():
+    logits = torch.zeros(1, 2, 4, 6)
+    target = torch.zeros_like(logits)
+    target[0, 1, 2, 4] = 1.0
+    channel_valid = torch.tensor([[False, True]])
+
+    components = RouteReconstructionLoss(
+        destination_weight=0.0,
+    ).components(logits, target, channel_valid)
+
+    assert components["total"].item() == 0.0
+    assert torch.isfinite(components["total"])
+    assert components["destination_focal"].item() > 0.0
+
+
 def test_route_destination_focal_is_resolution_invariant():
     losses = []
     for height, width in ((32, 32), (450, 300)):
