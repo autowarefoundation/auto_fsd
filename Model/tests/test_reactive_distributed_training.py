@@ -993,6 +993,31 @@ def test_overfit_subset_rejects_insufficient_rare_class_support():
         )
 
 
+def test_overfit_subset_rejects_rank_quota_limited_support():
+    rank_summaries = tuple(
+        tuple(
+            (
+                f"rank-{rank}-sample-{index:03d}",
+                tuple(
+                    int(class_index < 7 or rank == 0)
+                    for class_index in range(8)
+                ),
+            )
+            for index in range(8)
+        )
+        for rank in range(16)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"quota_limited_support.*4",
+    ):
+        _select_bev_overfit_subset(
+            rank_summaries,
+            sample_count=64,
+        )
+
+
 def test_camera_feature_scale_diagnostics_are_normalized():
     torch = pytest.importorskip("torch")
     model = SimpleNamespace(
@@ -1353,6 +1378,20 @@ def test_stage_a_validation_skips_disabled_route_decoder(monkeypatch):
             f"bev_lane_boundary_{range_name}_precision"
         ] == 1.0
         assert metrics[f"bev_lane_boundary_{range_name}_recall"] == 1.0
+    assert metrics["bev_lane_boundary_positive_cells"] == pytest.approx(
+        sum(
+            metrics[
+                f"bev_lane_boundary_{range_name}_positive_cells"
+            ]
+            for range_name in ("near", "far")
+        )
+    )
+    assert metrics["bev_lane_boundary_valid_cells"] == pytest.approx(
+        sum(
+            metrics[f"bev_lane_boundary_{range_name}_valid_cells"]
+            for range_name in ("near", "far")
+        )
+    )
     assert model.forward_options["return_auxiliary"] is True
     assert model.forward_options["compute_bev_segmentation"] is True
     assert model.forward_options["compute_route_reconstruction"] is False
