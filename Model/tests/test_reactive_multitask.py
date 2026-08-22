@@ -603,6 +603,35 @@ def test_route_destination_focal_stays_fp32_for_bf16_extremes():
     assert torch.isfinite(logits.grad).all()
 
 
+def test_route_corridor_loss_stays_fp32_for_bf16_production_raster():
+    logits = torch.zeros(
+        1,
+        2,
+        450,
+        300,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    target = torch.zeros_like(logits)
+    target[:, 0, 120:330, 110:190] = 1.0
+    channel_valid = torch.tensor([[True, False]])
+    loss_function = RouteReconstructionLoss(corridor_pos_weight=8.0)
+
+    loss = loss_function(logits, target, channel_valid)
+    reference = loss_function(
+        logits.detach().float(),
+        target.float(),
+        channel_valid,
+    )
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert loss.item() == pytest.approx(reference.item())
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
 def test_trajectory_loss_reaches_all_reactive_modules(
     build_mock_model,
     device,
