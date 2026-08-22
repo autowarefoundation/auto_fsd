@@ -1628,6 +1628,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_global_batch": global_batch,
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
+        "gradient_clip_max_norm": float(config["grad_clip"]),
+        "gradient_clip_mode": "branch_v1",
         "trajectory_weight": float(config["trajectory_weight"]),
         "bev_weight": float(config["bev_weight"]),
         "route_weight": float(config["route_weight"]),
@@ -1687,6 +1689,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_global_batch": global_batch,
         "distributed_precision": str(config["precision"]),
         "distributed_world_size": world_size,
+        "gradient_clip_max_norm": float(config["grad_clip"]),
+        "gradient_clip_mode": "branch_v1",
         "trajectory_weight": float(config["trajectory_weight"]),
         "bev_weight": float(config["bev_weight"]),
         "route_weight": float(config["route_weight"]),
@@ -1934,6 +1938,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "elapsed_seconds": time.perf_counter() - started,
                 "epoch": epoch,
                 "executed_optimizer_steps": executed_optimizer_steps,
+                "gradient_clip_max_norm": float(config["grad_clip"]),
+                "gradient_clip_mode": "branch_v1",
                 "is_best": int(is_best),
                 "learning_rate": float(
                     optimizer.param_groups[0]["lr"]
