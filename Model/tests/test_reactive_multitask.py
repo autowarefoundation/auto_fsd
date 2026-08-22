@@ -24,6 +24,7 @@ from training.reactive_multitask import (
     ReactiveMultitaskObjective,
     ReactiveTrainingStage,
     configure_model_for_stage,
+    reactive_model_kwargs,
 )
 from training.reactive_stage_runner import (
     evaluate_reactive_multitask,
@@ -226,6 +227,15 @@ def test_common_geometry_matches_camera_bev_contract():
         geometry.pixel_to_ego(geometry.ego_to_pixel(points)),
         points,
     )
+
+
+def test_reactive_model_contract_preserves_native_camera_resolution():
+    kwargs = reactive_model_kwargs(
+        ReactiveTrainingStage.NUPLAN_FULL,
+        num_views=8,
+    )
+
+    assert kwargs["image_feature_size"] == 64
 
 
 def test_reactive_model_emits_both_auxiliary_heads(
