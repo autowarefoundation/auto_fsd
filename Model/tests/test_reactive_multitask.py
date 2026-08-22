@@ -419,6 +419,103 @@ def test_repeat_importance_preserves_non_bev_objective_mean():
         )
 
 
+def test_multitask_total_applies_every_objective_weight():
+    objective = ReactiveMultitaskObjective(
+        ReactiveTrainingStage.NUPLAN_FULL,
+        bev_pos_weight=[1.0],
+        trajectory_weight=0.25,
+        bev_weight=0.5,
+        route_weight=0.75,
+    )
+    controls = torch.zeros(1, 128)
+    bev_logits = torch.zeros(1, 1, 4, 4)
+    route_logits = torch.zeros(1, 2, 4, 4)
+    batch = {
+        "trajectory_xy_m": torch.ones(1, 64, 2),
+        "trajectory_valid": torch.ones(1, 64, dtype=torch.bool),
+        "initial_speed_mps": torch.zeros(1),
+        "bev_segmentation_available": torch.ones(1, dtype=torch.bool),
+        "bev_segmentation_target": torch.ones_like(bev_logits),
+        "bev_segmentation_valid": torch.ones_like(
+            bev_logits,
+            dtype=torch.bool,
+        ),
+        "route_mask": torch.zeros_like(route_logits),
+        "route_channel_valid": torch.ones(1, 2, dtype=torch.bool),
+    }
+
+    terms = objective(
+        controls,
+        {
+            "bev_segmentation_logits": bev_logits,
+            "route_reconstruction_logits": route_logits,
+        },
+        batch,
+    )
+
+    expected = (
+        0.25 * terms["trajectory"]
+        + 0.5 * terms["bev_segmentation"]
+        + 0.75 * terms["route_reconstruction"]
+    )
+    assert torch.equal(terms["total"], expected)
+
+
+def test_bev_only_objective_skips_inactive_inputs_and_gradients():
+    objective = ReactiveMultitaskObjective(
+        ReactiveTrainingStage.NUPLAN_FULL,
+        bev_pos_weight=[1.0],
+        trajectory_weight=0.0,
+        bev_weight=1.0,
+        route_weight=0.0,
+    )
+    controls = torch.randn(1, 128, requires_grad=True)
+    bev_logits = torch.zeros(1, 1, 4, 4, requires_grad=True)
+    batch = {
+        "bev_segmentation_available": torch.ones(1, dtype=torch.bool),
+        "bev_segmentation_target": torch.ones_like(bev_logits),
+        "bev_segmentation_valid": torch.ones_like(
+            bev_logits,
+            dtype=torch.bool,
+        ),
+    }
+
+    terms = objective(
+        controls,
+        {"bev_segmentation_logits": bev_logits},
+        batch,
+    )
+    terms["total"].backward()
+
+    assert objective.compute_bev_segmentation
+    assert not objective.compute_route_reconstruction
+    assert terms["trajectory"].item() == 0.0
+    assert terms["route_reconstruction"].item() == 0.0
+    assert controls.grad is not None
+    assert torch.count_nonzero(controls.grad).item() == 0
+    assert bev_logits.grad is not None
+    assert torch.count_nonzero(bev_logits.grad).item() > 0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"trajectory_weight": float("nan")}, "trajectory_weight"),
+        ({"bev_weight": float("inf")}, "bev_weight"),
+        ({"route_weight": -1.0}, "route_weight"),
+        ({"route_weight": 1_001.0}, "route_weight"),
+        ({"corridor_pos_weight": 0.5}, "corridor_pos_weight"),
+    ],
+)
+def test_multitask_objective_rejects_invalid_weights(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        ReactiveMultitaskObjective(
+            ReactiveTrainingStage.NUPLAN_FULL,
+            bev_pos_weight=[1.0],
+            **overrides,
+        )
+
+
 def test_perfect_multitask_predictions_approach_zero():
     bev_target = torch.zeros(1, 8, 4, 4)
     bev_target[:, :, 1:3, 1:3] = 1.0
