@@ -712,12 +712,27 @@ def pack_nuplan_snapshot_reactive_dataset(
         raise ValueError("nuPlan packer did not emit BEV schema v2")
     if packed.get("schema_version") != "nuplan_reactive_manifest_v2":
         raise ValueError("nuPlan packer did not emit manifest schema v2")
-    if int(packed.get("bev_statistics_count", 0)) != int(
-        packed.get("total_samples", -1)
+    packed_counts = {
+        name: packed.get(name)
+        for name in (
+            "bev_statistics_count",
+            "bev_segmentation_count",
+            "total_samples",
+        )
+    }
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in packed_counts.values()
+    ):
+        raise ValueError("nuPlan packer emitted invalid sample counts")
+    if (
+        packed_counts["bev_statistics_count"]
+        != packed_counts["total_samples"]
     ):
         raise ValueError("nuPlan packer omitted BEV v2 sample statistics")
-    if int(packed.get("bev_segmentation_count", 0)) != int(
-        packed.get("total_samples", -1)
+    if (
+        packed_counts["bev_segmentation_count"]
+        != packed_counts["total_samples"]
     ):
         raise ValueError("nuPlan packer omitted BEV segmentation samples")
 
