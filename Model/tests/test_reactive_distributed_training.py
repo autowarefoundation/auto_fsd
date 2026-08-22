@@ -36,12 +36,14 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from distributed_training.reactive_stage import (
+    MIN_OVERFIT_OPTIMIZER_STEPS,
     _all_reduce_bev_statistics,
     _bev_overfit_gate_result,
     _build_reactive_scheduler,
     _checkpoint_history,
     _histogram_average_precision,
     _load_resume_checkpoint,
+    _overfit_gate_passed,
     _select_bev_overfit_subset,
     _select_result_checkpoint,
     _report_reactive_epoch,
@@ -440,6 +442,21 @@ def test_validate_stage_config_accepts_bev_only_capacity_probe():
     })
 
     validate_reactive_stage_config(config)
+
+
+def test_validate_stage_config_enforces_joint_gate_step_floor():
+    config = _stage_config("nuplan_full")
+    config.update({
+        "epochs": 10,
+        "overfit_fixed_lr": True,
+        "overfit_sample_count": 64,
+        "steps_per_epoch": 500,
+    })
+    validate_reactive_stage_config(config)
+
+    config["steps_per_epoch"] = 499
+    with pytest.raises(ValueError, match="5000"):
+        validate_reactive_stage_config(config)
 
 
 @pytest.mark.parametrize(
@@ -878,6 +895,21 @@ def test_bev_overfit_gate_result_reports_weakest_classes():
     assert result["minimum_ap_class"] == "vehicle"
     assert result["minimum_recall"] == pytest.approx(0.61)
     assert result["minimum_recall_class"] == "vulnerable_road_user"
+
+
+def test_overfit_gate_pass_requires_executed_step_floor():
+    assert not _overfit_gate_passed(
+        thresholds_passed=False,
+        executed_optimizer_steps=MIN_OVERFIT_OPTIMIZER_STEPS,
+    )
+    assert not _overfit_gate_passed(
+        thresholds_passed=True,
+        executed_optimizer_steps=MIN_OVERFIT_OPTIMIZER_STEPS - 1,
+    )
+    assert _overfit_gate_passed(
+        thresholds_passed=True,
+        executed_optimizer_steps=MIN_OVERFIT_OPTIMIZER_STEPS,
+    )
 
 
 def test_reactive_epoch_reports_checkpoint_before_gate_failure():
