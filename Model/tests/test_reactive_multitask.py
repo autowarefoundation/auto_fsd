@@ -756,6 +756,70 @@ def test_stage_b_skips_and_freezes_bev_head(build_mock_model, device):
     )
 
 
+def test_bev_only_stage_excludes_and_preserves_non_bev_parameters(
+    build_mock_model,
+    device,
+):
+    model = _model(build_mock_model, device).train()
+    configure_model_for_stage(
+        model,
+        ReactiveTrainingStage.NUPLAN_FULL,
+        bev_only=True,
+    )
+    reactive = model.Reactive_E2E
+    trainable = {
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    }
+    expected_trainable = {
+        id(parameter)
+        for module in (
+            reactive.Backbone,
+            reactive.FeatureFusion,
+            reactive.BEVSegmentationHead,
+        )
+        for parameter in module.parameters()
+    }
+    frozen_navigation = {
+        name: parameter.detach().clone()
+        for name, parameter in reactive.NavigationEncoder.named_parameters()
+    }
+    optimizer = torch.optim.AdamW(
+        [
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ],
+        lr=1e-3,
+        weight_decay=0.1,
+    )
+    optimizer_parameters = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+
+    _, auxiliary = _forward(
+        model,
+        _inputs(device),
+        compute_route_reconstruction=False,
+    )
+    logits = auxiliary["bev_segmentation_logits"]
+    loss = BEVSegmentationAuxiliaryLoss([1.0] * 8).to(device)(
+        logits,
+        torch.ones_like(logits),
+        torch.ones_like(logits, dtype=torch.bool),
+    )
+    loss.backward()
+    optimizer.step()
+
+    assert trainable == expected_trainable
+    assert optimizer_parameters == expected_trainable
+    for name, parameter in reactive.NavigationEncoder.named_parameters():
+        assert torch.equal(parameter.detach(), frozen_navigation[name])
+
+
 def test_packed_reactive_targets_round_trip():
     xy = np.arange(128, dtype=np.float32).reshape(64, 2)
     trajectory_valid = np.ones(64, dtype=np.bool_)
