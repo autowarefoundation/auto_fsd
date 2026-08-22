@@ -205,7 +205,8 @@ class ReactiveMultitaskObjective(nn.Module):
         bev = zero
         bev_bce = zero
         bev_dice = zero
-        if self.compute_bev_segmentation:
+        bev_loss = self.bev_loss
+        if bev_loss is not None and self.bev_weight > 0.0:
             available = batch["bev_segmentation_available"].to(
                 dtype=torch.bool
             )
@@ -218,7 +219,7 @@ class ReactiveMultitaskObjective(nn.Module):
                 raise ValueError(
                     "nuPlan full training requires BEV segmentation logits"
                 )
-            bev_components = self.bev_loss.components(
+            bev_components = bev_loss.components(
                 bev_logits,
                 batch["bev_segmentation_target"],
                 batch["bev_segmentation_valid"],
