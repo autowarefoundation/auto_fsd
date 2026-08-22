@@ -1260,6 +1260,60 @@ def _load_resume_checkpoint(
     )
 
 
+def _bev_overfit_gate_result(
+    validation: Mapping[str, float],
+    *,
+    minimum_ap: float,
+    minimum_recall: float,
+) -> dict[str, Any]:
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_CLASSES,
+    )
+
+    class_average_precisions = {
+        class_name: float(
+            validation[f"bev_{class_name}_average_precision"]
+        )
+        for class_name in BEV_SEGMENTATION_CLASSES
+    }
+    class_recalls = {
+        class_name: float(validation[f"bev_{class_name}_recall"])
+        for class_name in BEV_SEGMENTATION_CLASSES
+    }
+    minimum_ap_class = min(
+        class_average_precisions,
+        key=class_average_precisions.__getitem__,
+    )
+    minimum_recall_class = min(
+        class_recalls,
+        key=class_recalls.__getitem__,
+    )
+    observed_ap = class_average_precisions[minimum_ap_class]
+    observed_recall = class_recalls[minimum_recall_class]
+    return {
+        "passed": (
+            observed_ap >= minimum_ap
+            and observed_recall >= minimum_recall
+        ),
+        "minimum_ap": observed_ap,
+        "minimum_ap_class": minimum_ap_class,
+        "minimum_recall": observed_recall,
+        "minimum_recall_class": minimum_recall_class,
+    }
+
+
+def _report_reactive_epoch(
+    report,
+    metrics: Mapping[str, Any],
+    *,
+    checkpoint,
+    failure_message: str | None = None,
+) -> None:
+    report(metrics, checkpoint=checkpoint)
+    if failure_message is not None:
+        raise RuntimeError(failure_message)
+
+
 def train_loop_per_worker(config: dict[str, Any]) -> None:
     """Train one fixed Reactive stage on every Ray worker."""
     import torch
@@ -1712,47 +1766,27 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             scheduler.step()
         else:
             scheduler.step(validation["selection_score"])
+        overfit_gate = None
         overfit_gate_pass = False
-        if (
-            overfit_sample_count
-            and epoch == int(config["epochs"])
-        ):
-            from data_processing.reactive_training_artifacts import (
-                BEV_SEGMENTATION_CLASSES,
+        overfit_failure_message = None
+        if overfit_sample_count:
+            overfit_gate = _bev_overfit_gate_result(
+                validation,
+                minimum_ap=float(config["overfit_min_ap"]),
+                minimum_recall=float(config["overfit_min_recall"]),
             )
-
-            class_average_precisions = {
-                class_name: validation[
-                    f"bev_{class_name}_average_precision"
-                ]
-                for class_name in BEV_SEGMENTATION_CLASSES
-            }
-            class_recalls = {
-                class_name: validation[f"bev_{class_name}_recall"]
-                for class_name in BEV_SEGMENTATION_CLASSES
-            }
-            minimum_ap_class = min(
-                class_average_precisions,
-                key=class_average_precisions.__getitem__,
-            )
-            minimum_recall_class = min(
-                class_recalls,
-                key=class_recalls.__getitem__,
-            )
-            minimum_ap = class_average_precisions[minimum_ap_class]
-            minimum_recall = class_recalls[minimum_recall_class]
-            overfit_gate_pass = (
-                minimum_ap >= float(config["overfit_min_ap"])
-                and minimum_recall
-                >= float(config["overfit_min_recall"])
-            )
-            if not overfit_gate_pass:
-                raise RuntimeError(
+            overfit_gate_pass = bool(overfit_gate["passed"])
+            if (
+                epoch == int(config["epochs"])
+                and not overfit_gate_pass
+            ):
+                overfit_failure_message = (
                     "BEV overfit gate failed: "
-                    f"minimum_ap={minimum_ap:.6f} "
-                    f"class={minimum_ap_class} "
-                    f"minimum_recall={minimum_recall:.6f} "
-                    f"class={minimum_recall_class}"
+                    f"minimum_ap={overfit_gate['minimum_ap']:.6f} "
+                    f"class={overfit_gate['minimum_ap_class']} "
+                    "minimum_recall="
+                    f"{overfit_gate['minimum_recall']:.6f} "
+                    f"class={overfit_gate['minimum_recall_class']}"
                 )
         maximum_delta = _maximum_parameter_delta(
             model,
@@ -1795,13 +1829,32 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             else -1.0
         )
         checkpoint_retention_score = checkpoint_selection_score
-        if epoch == int(config["epochs"]):
+        if overfit_gate_pass or epoch == int(config["epochs"]):
             checkpoint_retention_score = (
                 2.0 + validation["selection_score"]
             )
         if is_best:
             best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
+        checkpoint_metrics: dict[str, Any] = dict(validation)
+        checkpoint_metrics["overfit_gate_pass"] = int(
+            overfit_gate_pass
+        )
+        if overfit_gate is not None:
+            checkpoint_metrics.update({
+                "overfit_minimum_ap": float(
+                    overfit_gate["minimum_ap"]
+                ),
+                "overfit_minimum_ap_class": str(
+                    overfit_gate["minimum_ap_class"]
+                ),
+                "overfit_minimum_recall": float(
+                    overfit_gate["minimum_recall"]
+                ),
+                "overfit_minimum_recall_class": str(
+                    overfit_gate["minimum_recall_class"]
+                ),
+            })
         checkpoint_sha256: str | None = None
         with tempfile.TemporaryDirectory() as checkpoint_directory:
             checkpoint = None
@@ -1820,7 +1873,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                     model_config=model_config,
                     optimizer=optimizer,
                     scheduler=scheduler,
-                    metrics=validation,
+                    metrics=checkpoint_metrics,
                     training_state={
                         "assignment_sha256": assignment_sha256,
                         "best_ade_6p4s_m": best_ade,
@@ -1913,6 +1966,19 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                         f"gradient_{group_name}_clip_scale"
                     ]
                 )
+            if overfit_gate is not None:
+                metrics["overfit_minimum_ap"] = float(
+                    overfit_gate["minimum_ap"]
+                )
+                metrics["overfit_minimum_ap_class"] = str(
+                    overfit_gate["minimum_ap_class"]
+                )
+                metrics["overfit_minimum_recall"] = float(
+                    overfit_gate["minimum_recall"]
+                )
+                metrics["overfit_minimum_recall_class"] = str(
+                    overfit_gate["minimum_recall_class"]
+                )
             epoch_history.append(metrics)
             if rank == 0:
                 history_path = (
@@ -1930,7 +1996,14 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 checkpoint = Checkpoint.from_directory(
                     checkpoint_directory
                 )
-            train.report(metrics, checkpoint=checkpoint)
+            _report_reactive_epoch(
+                train.report,
+                metrics,
+                checkpoint=checkpoint,
+                failure_message=overfit_failure_message,
+            )
+        if overfit_gate_pass:
+            return
 
 
 def _result_checkpoint_entry(entry) -> tuple[Any, dict[str, Any]]:
