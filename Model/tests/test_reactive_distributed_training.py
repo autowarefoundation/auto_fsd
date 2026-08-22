@@ -48,7 +48,9 @@ from distributed_training.reactive_stage import (
     _all_reduce_bev_statistics,
     _bev_lane_range_masks,
     _bev_overfit_gate_result,
+    _bev_overfit_selected_support,
     _build_reactive_scheduler,
+    _camera_feature_scale_weights,
     _checkpoint_history,
     _histogram_average_precision,
     _load_resume_checkpoint,
@@ -943,6 +945,10 @@ def test_overfit_subset_has_class_support_and_exact_rank_quotas():
         )
         for class_index in range(8)
     ]
+    assert _bev_overfit_selected_support(
+        rank_summaries,
+        selected,
+    ) == tuple(class_support)
     assert all(
         support >= BEV_OVERFIT_MIN_POSITIVE_SAMPLES
         for support in class_support
@@ -985,6 +991,28 @@ def test_overfit_subset_rejects_insufficient_rare_class_support():
             rank_summaries,
             sample_count=64,
         )
+
+
+def test_camera_feature_scale_diagnostics_are_normalized():
+    torch = pytest.importorskip("torch")
+    model = SimpleNamespace(
+        Reactive_E2E=SimpleNamespace(
+            FeatureFusion=SimpleNamespace(
+                scale_logits=torch.tensor([0.0, 1.0, 2.0, 3.0]),
+            ),
+        ),
+    )
+
+    weights = _camera_feature_scale_weights(model)
+
+    assert weights == pytest.approx(
+        torch.tensor([0.0, 1.0, 2.0, 3.0]).softmax(0).tolist()
+    )
+    assert sum(weights) == pytest.approx(1.0)
+
+    model.Reactive_E2E.FeatureFusion.scale_logits[0] = float("nan")
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        _camera_feature_scale_weights(model)
 
 
 def test_bev_statistics_all_reduce_preserves_vector_offsets(monkeypatch):
