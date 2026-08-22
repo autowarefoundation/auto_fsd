@@ -39,7 +39,7 @@ from kubernetes.client import (
     V1VolumeMount,
 )
 
-from training.reactive_contracts import (
+from reactive_training_contracts import (
     MAX_OVERFIT_SAMPLE_COUNT,
     MIN_OVERFIT_SAMPLE_COUNT,
 )
