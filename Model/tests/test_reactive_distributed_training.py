@@ -14,12 +14,14 @@ import pytest
 
 from data_parsing.pre_extracted import (
     BEVClassRepeatPolicy,
+    BEVSampleStatistics,
     BEVTrainingStatistics,
     derive_bev_pos_weights,
     derive_bev_repeat_factors,
     discover_bev_training_statistics,
     make_pre_extracted_loader,
     passthrough_nodesplitter,
+    summarize_bev_positive_samples,
 )
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_CLASSES,
@@ -39,6 +41,7 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from distributed_training.reactive_stage import (
+    BEV_OVERFIT_MIN_POSITIVE_SAMPLES,
     MIN_OVERFIT_OPTIMIZER_STEPS,
     ROUTE_VALIDATION_METRICS_VERSION,
     _all_reduce_bev_statistics,
@@ -861,12 +864,62 @@ def test_canary_dataset_uses_production_loader_contract(
         assert statistics.positive_sample_count == (4,) * 8
 
 
-def test_overfit_subset_is_class_complete_and_covers_every_rank():
+def test_positive_sample_summary_retains_per_class_cell_counts():
+    records = tuple(
+        BEVSampleStatistics(
+            sample_uid=f"sample-{index:03d}",
+            split_group_uid=f"group-{index:03d}",
+            positive_cell_count=(
+                index + 10,
+                0,
+                3,
+                0,
+                0,
+                1,
+                0,
+                0,
+            ),
+            positive_mass=(
+                float(index + 10),
+                0.0,
+                3.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+            ),
+            valid_cell_count=(100,) * 8,
+        )
+        for index in range(20)
+    )
+    expected = {
+        record.sample_uid: record.positive_cell_count
+        for record in records
+    }
+
+    summaries = summarize_bev_positive_samples(
+        records,
+        val_fraction=0.1,
+    )
+
+    assert summaries
+    assert all(cell_counts == expected[uid] for uid, cell_counts in summaries)
+
+
+def test_overfit_subset_has_class_support_and_exact_rank_quotas():
     rank_summaries = tuple(
         tuple(
             (
                 f"rank-{rank}-sample-{index:03d}",
-                tuple(range(8)) if index == 0 else (index % 8,),
+                tuple(
+                    (
+                        100 + index
+                        if index == 0 or class_index == index % 8
+                        else 0
+                    )
+                    for class_index in range(8)
+                ),
             )
             for index in range(20)
         )
@@ -879,6 +932,19 @@ def test_overfit_subset_is_class_complete_and_covers_every_rank():
     )
 
     assert len(selected) == 64
+    selected_set = set(selected)
+    class_support = [
+        sum(
+            uid in selected_set and cell_counts[class_index] > 0
+            for summaries in rank_summaries
+            for uid, cell_counts in summaries
+        )
+        for class_index in range(8)
+    ]
+    assert all(
+        support >= BEV_OVERFIT_MIN_POSITIVE_SAMPLES
+        for support in class_support
+    )
     assert [
         sum(uid.startswith(f"rank-{rank}-") for uid in selected)
         for rank in range(4)
@@ -887,6 +953,36 @@ def test_overfit_subset_is_class_complete_and_covers_every_rank():
         tuple(reversed(rank_summaries)),
         sample_count=64,
     )
+
+
+def test_overfit_subset_rejects_insufficient_rare_class_support():
+    rank_summaries = tuple(
+        tuple(
+            (
+                f"rank-{rank}-sample-{index:03d}",
+                tuple(
+                    (
+                        1
+                        if class_index < 7
+                        or rank * 20 + index < 7
+                        else 0
+                    )
+                    for class_index in range(8)
+                ),
+            )
+            for index in range(20)
+        )
+        for rank in range(4)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="insufficient positive sample support",
+    ):
+        _select_bev_overfit_subset(
+            rank_summaries,
+            sample_count=64,
+        )
 
 
 def test_bev_statistics_all_reduce_preserves_vector_offsets(monkeypatch):
