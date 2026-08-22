@@ -21,6 +21,9 @@ import numpy as np
 from PIL import Image
 
 from data_processing.contract_versions import contract_versions
+from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
+)
 from navigation.contracts import canonical_json_bytes
 from navigation.geometry import (
     AUTOE2E_NAVIGATION_GEOMETRY,
@@ -1282,7 +1285,7 @@ def pack_nuplan_reactive_scenarios(
     manifest: dict[str, object] = {
         "bev_segmentation_count": len(accepted),
         "bev_statistics_count": len(accepted),
-        "bev_taxonomy_version": "bev_segmentation_v2",
+        "bev_taxonomy_version": BEV_SEGMENTATION_TAXONOMY_VERSION,
         "camera_order": list(NUPLAN_CAMERA_CHANNELS),
         "contracts": contract_versions(),
         "dataset": "nuplan/nuplan-v1.1",
