@@ -10,9 +10,11 @@ horizon token ablations, object-token masks, etc.), it keeps the causes that
 actually moved the plan and emits ``ReasoningHorizonLabel`` entries.
 
 Default provenance is ``counterfactual_weak``, not ``counterfactual_gt``.
-#122's circularity objection: labels from the model's own sensitivity are not
-ground truth until they are scored against an external anchor (geometric
-conflict / KIT LiDAR). See ``evaluation.cause_label_validation``.
+#122's circularity objection stands: labels from the model's own sensitivity
+are not ground truth until they are scored against an external anchor
+(KIT LiDAR / HD-map conflict). This PR does not have that data. The
+synthetic geometry protocol in ``evaluation.cause_label_unit_protocol``
+only smoke-tests the selector; it is not #122 validation.
 """
 
 from __future__ import annotations
@@ -83,8 +85,9 @@ def horizon_labels_from_intervention_deltas(
     (clamped to ``[0, 1]``) times ``confidence_scale``.
 
     Provenance defaults to ``counterfactual_weak``. Pass
-    ``provenance="counterfactual_gt"`` only after external-truth validation
-    (#122) justifies treating the labeller as ground truth.
+    ``provenance="counterfactual_gt"`` only after a real KIT LiDAR /
+    HD-map pass (#122) justifies treating the labeller as ground truth.
+    The synthetic unit protocol in this PR is not that pass.
     """
     labels: List[ReasoningHorizonLabel] = []
     for h in HORIZON_SECONDS:
