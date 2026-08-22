@@ -22,6 +22,7 @@ from data_parsing.pre_extracted import (
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_CLASSES,
     BEV_SEGMENTATION_STATS_MEMBER,
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
     encode_bev_segmentation_stats,
 )
 from distributed_training.reactive_canary_data import (
@@ -88,7 +89,7 @@ def _write_source(
             sum(shard_counts) if include_bev else 0
         ),
         "bev_taxonomy_version": (
-            "bev_segmentation_v2" if include_bev else None
+            BEV_SEGMENTATION_TAXONOMY_VERSION if include_bev else None
         ),
         "dataset": dataset,
         "has_bev_segmentation": include_bev,
