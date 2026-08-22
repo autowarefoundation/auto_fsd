@@ -38,6 +38,19 @@ SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
 BEV_OVERFIT_MIN_POSITIVE_SAMPLES = 8
 BEV_LANE_NEAR_RADIUS_M = 30.0
+CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX = (
+    "camera_feature_scale_weight_"
+)
+PEAK_CUDA_ALLOCATED_BYTES_METRIC_PREFIX = (
+    "peak_cuda_allocated_bytes_rank_"
+)
+PEAK_CUDA_RESERVED_BYTES_METRIC_PREFIX = (
+    "peak_cuda_reserved_bytes_rank_"
+)
+OVERFIT_POSITIVE_SAMPLE_SUPPORT_METRIC_PREFIX = (
+    "overfit_positive_sample_support_"
+)
+BEV_LANE_RANGE_METRIC_PREFIX = "bev_lane_boundary_"
 ROUTE_DESTINATION_LOGIT_RANGE_EPSILON = 1e-6
 ROUTE_VALIDATION_METRICS_VERSION = "route_validation_v1"
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
@@ -387,6 +400,17 @@ def _select_bev_overfit_subset(
         sum(candidate[2][class_index] > 0 for candidate in candidates)
         for class_index in range(class_count)
     ]
+    available_support_by_rank = [
+        tuple(
+            sum(
+                candidate[1] == rank
+                and candidate[2][class_index] > 0
+                for candidate in candidates
+            )
+            for rank in range(rank_count)
+        )
+        for class_index in range(class_count)
+    ]
     insufficient = {
         class_index: support
         for class_index, support in enumerate(available_support)
@@ -396,6 +420,26 @@ def _select_bev_overfit_subset(
         raise ValueError(
             "BEV overfit candidates have insufficient positive sample "
             f"support: {insufficient}"
+        )
+    quota_limited_support = [
+        sum(
+            min(rank_support, per_rank_count)
+            for rank_support in class_support
+        )
+        for class_support in available_support_by_rank
+    ]
+    quota_insufficient = {
+        class_index: {
+            "available_by_rank": available_support_by_rank[class_index],
+            "quota_limited_support": support,
+        }
+        for class_index, support in enumerate(quota_limited_support)
+        if support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES
+    }
+    if quota_insufficient:
+        raise ValueError(
+            "BEV overfit rank quotas cannot satisfy positive sample "
+            f"support: {quota_insufficient}"
         )
 
     selected: dict[str, tuple[str, int, tuple[int, ...]]] = {}
@@ -426,9 +470,25 @@ def _select_bev_overfit_subset(
             and selected_per_rank[candidate[1]] < per_rank_count
         ]
         if not eligible:
+            remaining_capacity = tuple(
+                per_rank_count - count for count in selected_per_rank
+            )
+            remaining_support = tuple(
+                sum(
+                    candidate[0] not in selected
+                    and candidate[1] == rank
+                    and candidate[2][target_class] > 0
+                    for candidate in candidates
+                )
+                for rank in range(rank_count)
+            )
             raise ValueError(
                 "BEV overfit rank quotas cannot satisfy positive sample "
-                f"support for class {target_class}"
+                f"support for class {target_class}: "
+                f"available_by_rank="
+                f"{available_support_by_rank[target_class]}, "
+                f"remaining_support_by_rank={remaining_support}, "
+                f"remaining_capacity_by_rank={remaining_capacity}"
             )
         chosen = min(
             eligible,
@@ -1221,6 +1281,7 @@ def _evaluate_global_reactive(
         lane_range_positive_histogram
     )
     lane_range_masks = None
+    lane_class_index = BEV_SEGMENTATION_CLASSES.index("lane_boundary")
     bev_loss_sum = 0.0
     bev_bce_sum = 0.0
     bev_dice_sum = 0.0
@@ -1403,9 +1464,6 @@ def _evaluate_global_reactive(
                                 minlength=probability_bins,
                             )
                         )
-                    lane_class_index = BEV_SEGMENTATION_CLASSES.index(
-                        "lane_boundary"
-                    )
                     if lane_range_masks is None:
                         lane_range_masks = _bev_lane_range_masks(
                             target.shape[-2],
@@ -1671,7 +1729,7 @@ def _evaluate_global_reactive(
                 lane_range_positive_histogram[range_index],
                 lane_range_negative_histogram[range_index],
             )
-        prefix = f"bev_lane_boundary_{range_name}"
+        prefix = f"{BEV_LANE_RANGE_METRIC_PREFIX}{range_name}"
         metrics[f"{prefix}_average_precision"] = average_precision
         metrics[f"{prefix}_precision"] = _metric_ratio(
             true_positive,
@@ -2390,7 +2448,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
         diagnostic_metrics: dict[str, float | int] = {
-            f"camera_feature_scale_weight_{index}": weight
+            f"{CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX}{index}": weight
             for index, weight in enumerate(feature_scale_weights)
         }
         if overfit_positive_sample_support is not None:
@@ -2399,7 +2457,8 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 overfit_positive_sample_support,
             ):
                 diagnostic_metrics[
-                    f"overfit_positive_sample_support_{class_name}"
+                    f"{OVERFIT_POSITIVE_SAMPLE_SUPPORT_METRIC_PREFIX}"
+                    f"{class_name}"
                 ] = support
         for evidence in rank_evidence:
             if not isinstance(evidence, Mapping):
@@ -2409,8 +2468,16 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "peak_cuda_allocated_bytes",
                 "peak_cuda_reserved_bytes",
             ):
+                metric_prefix = {
+                    "peak_cuda_allocated_bytes": (
+                        PEAK_CUDA_ALLOCATED_BYTES_METRIC_PREFIX
+                    ),
+                    "peak_cuda_reserved_bytes": (
+                        PEAK_CUDA_RESERVED_BYTES_METRIC_PREFIX
+                    ),
+                }[memory_name]
                 diagnostic_metrics[
-                    f"{memory_name}_rank_{evidence_rank}"
+                    f"{metric_prefix}{evidence_rank}"
                 ] = int(evidence[memory_name])
         checkpoint_metrics: dict[str, Any] = dict(validation)
         checkpoint_metrics.update(diagnostic_metrics)
