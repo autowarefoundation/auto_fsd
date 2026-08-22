@@ -9,6 +9,7 @@ import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -282,7 +283,11 @@ def test_nuplan_partition_merge_accounts_for_all_rejected_worker(
     assert merged["total_samples"] == 1
     assert merged["rejection_count"] == 1
     assert merged["rejection_fraction"] == 0.5
-    assert merged["packing_partitions"][0]["rejected_count"] == 1
+    packing_partitions = cast(
+        list[dict[str, object]],
+        merged["packing_partitions"],
+    )
+    assert packing_partitions[0]["rejected_count"] == 1
 
 
 def test_nuplan_partition_merge_enforces_global_rejection_before_move(
@@ -358,7 +363,8 @@ def test_nuplan_partition_merge_rejects_corrupted_shard(
         partition_root / "worker-000",
         [_scenario("accepted", "group-accepted")],
     )
-    shard_path = partition_root / "worker-000" / manifest["shard_names"][0]
+    shard_names = cast(list[str], manifest["shard_names"])
+    shard_path = partition_root / "worker-000" / shard_names[0]
     with shard_path.open("ab") as shard:
         shard.write(b"corruption")
 
@@ -384,8 +390,9 @@ def test_nuplan_partition_merge_rejects_unreported_shard(
         worker_directory,
         [_scenario("accepted", "group-accepted")],
     )
+    shard_names = cast(list[str], manifest["shard_names"])
     shutil.copyfile(
-        worker_directory / manifest["shard_names"][0],
+        worker_directory / shard_names[0],
         worker_directory / "nuplan-unreported.tar",
     )
 
@@ -569,7 +576,10 @@ def test_nuplan_local_parallel_path_builds_spawned_worker_configs(
         pack_workers=2,
     )
 
-    configs = executor_state["configs"]
+    configs = cast(
+        list[_NuPlanPackWorkerConfig],
+        executor_state["configs"],
+    )
     assert executor_state["context_method"] == "spawn"
     assert executor_state["mp_context"] is context
     assert executor_state["max_workers"] == 2
