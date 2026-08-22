@@ -211,10 +211,10 @@ def test_nuplan_full_target_builder_uses_current_annotations(
     assert targets.route_channel_valid.tolist() == [True, True]
     assert targets.route_target[1].max() == pytest.approx(1.0)
     assert scenario.future_calls == 1
-    assert any(
-        call.get("include_connectors") is True
-        for call in lane_calls
-    )
+    assert lane_calls == [
+        {},
+        {"include_connectors": False},
+    ]
 
     members = nuplan_targets.nuplan_reactive_target_members(
         targets,
