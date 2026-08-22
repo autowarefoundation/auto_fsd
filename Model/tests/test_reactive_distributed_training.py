@@ -181,6 +181,34 @@ def test_dataset_plan_and_assignment_are_deterministic(tmp_path):
     )
 
 
+def test_stage_a_dataset_plan_rejects_previous_bev_taxonomy(tmp_path):
+    source = tmp_path / "previous-taxonomy"
+    manifest = _write_source(
+        source,
+        dataset="nuplan/nuplan-v1.1",
+        shard_counts=[4],
+        include_bev=True,
+        num_views=8,
+    )
+    version_prefix, separator, version_number = (
+        BEV_SEGMENTATION_TAXONOMY_VERSION.rpartition("v")
+    )
+    assert separator and int(version_number) > 1
+    manifest["bev_taxonomy_version"] = (
+        f"{version_prefix}v{int(version_number) - 1}"
+    )
+    (source / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="ascii",
+    )
+
+    with pytest.raises(ValueError, match="current BEV taxonomy"):
+        build_reactive_dataset_plan(
+            [str(source)],
+            stage=ReactiveTrainingStage.NUPLAN_FULL,
+        )
+
+
 def test_dataset_plan_rejects_legacy_manifest_without_per_shard_counts(
     tmp_path,
 ):
