@@ -30,12 +30,15 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
+from training.reactive_contracts import (
+    MAX_OVERFIT_SAMPLE_COUNT,
+    MIN_OVERFIT_SAMPLE_COUNT,
+)
 from training.reactive_multitask import ReactiveTrainingStage
 
 
 SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
-MIN_OVERFIT_SAMPLE_COUNT = 64
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
 BEV_OVERFIT_MIN_POSITIVE_SAMPLES = 8
 BEV_LANE_NEAR_RADIUS_M = 30.0
@@ -137,11 +140,15 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
     overfit_sample_count = int(config.get("overfit_sample_count", 0))
     if overfit_sample_count not in (
         0,
-        *range(MIN_OVERFIT_SAMPLE_COUNT, 129),
+        *range(
+            MIN_OVERFIT_SAMPLE_COUNT,
+            MAX_OVERFIT_SAMPLE_COUNT + 1,
+        ),
     ):
         raise ValueError(
             "overfit_sample_count must be zero or between "
-            f"{MIN_OVERFIT_SAMPLE_COUNT} and 128"
+            f"{MIN_OVERFIT_SAMPLE_COUNT} and "
+            f"{MAX_OVERFIT_SAMPLE_COUNT}"
         )
     if (
         overfit_sample_count
@@ -364,8 +371,16 @@ def _select_bev_overfit_subset(
     sample_count: int,
 ) -> tuple[str, ...]:
     """Choose a deterministic class-balanced subset with exact rank quotas."""
-    if not MIN_OVERFIT_SAMPLE_COUNT <= sample_count <= 128:
-        raise ValueError("BEV overfit subset must contain 64 to 128 samples")
+    if not (
+        MIN_OVERFIT_SAMPLE_COUNT
+        <= sample_count
+        <= MAX_OVERFIT_SAMPLE_COUNT
+    ):
+        raise ValueError(
+            "BEV overfit subset must contain "
+            f"{MIN_OVERFIT_SAMPLE_COUNT} to "
+            f"{MAX_OVERFIT_SAMPLE_COUNT} samples"
+        )
     rank_count = len(rank_summaries)
     if rank_count <= 0 or sample_count % rank_count:
         raise ValueError(
@@ -403,17 +418,6 @@ def _select_bev_overfit_subset(
 
     available_support = [
         sum(candidate[2][class_index] > 0 for candidate in candidates)
-        for class_index in range(class_count)
-    ]
-    available_support_by_rank = [
-        tuple(
-            sum(
-                candidate[1] == rank
-                and candidate[2][class_index] > 0
-                for candidate in candidates
-            )
-            for rank in range(rank_count)
-        )
         for class_index in range(class_count)
     ]
     insufficient = {
@@ -458,6 +462,14 @@ def _select_bev_overfit_subset(
             remaining_capacity = tuple(
                 per_rank_count - count for count in selected_per_rank
             )
+            available_support_by_rank = tuple(
+                sum(
+                    candidate[1] == rank
+                    and candidate[2][target_class] > 0
+                    for candidate in candidates
+                )
+                for rank in range(rank_count)
+            )
             remaining_support = tuple(
                 sum(
                     candidate[0] not in selected
@@ -471,7 +483,7 @@ def _select_bev_overfit_subset(
                 "BEV overfit rank quotas cannot satisfy positive sample "
                 f"support for class {target_class}: "
                 f"available_by_rank="
-                f"{available_support_by_rank[target_class]}, "
+                f"{available_support_by_rank}, "
                 f"remaining_support_by_rank={remaining_support}, "
                 f"remaining_capacity_by_rank={remaining_capacity}"
             )
