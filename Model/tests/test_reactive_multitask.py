@@ -465,6 +465,47 @@ def test_perfect_multitask_predictions_approach_zero():
     assert xy_loss.item() == pytest.approx(0.0)
 
 
+def test_route_destination_focal_is_resolution_invariant():
+    losses = []
+    for height, width in ((32, 32), (450, 300)):
+        logits = torch.zeros(1, 2, height, width)
+        target = torch.zeros_like(logits)
+        target[:, 1, height // 2, width // 2] = 1.0
+        loss = RouteReconstructionLoss()(
+            logits,
+            target,
+            torch.tensor([[False, True]]),
+        )
+        losses.append(loss)
+
+    expected = 0.25 * 2.0 * (-np.log(0.5)) * 0.5**2
+    assert losses[0].item() == pytest.approx(expected)
+    assert losses[1].item() == pytest.approx(expected)
+
+
+def test_route_destination_focal_stays_fp32_for_bf16_extremes():
+    logits = torch.full(
+        (1, 2, 32, 32),
+        100.0,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    target = torch.zeros_like(logits)
+    target[:, 1, 16, 16] = 1.0
+
+    loss = RouteReconstructionLoss()(
+        logits,
+        target,
+        torch.tensor([[False, True]]),
+    )
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
 def test_trajectory_loss_reaches_all_reactive_modules(
     build_mock_model,
     device,
