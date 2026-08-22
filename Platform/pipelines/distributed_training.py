@@ -595,14 +595,14 @@ def _validated_bev_overfit_gate_dataset(
             raise ValueError(
                 f"BEV overfit gate {evidence_name} has wrong seed"
             )
-        for name, expected in objective_contract.items():
+        for name, expected_weight in objective_contract.items():
             try:
                 actual = float(evidence[name])
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(
                     f"BEV overfit gate {evidence_name} omitted {name}"
                 ) from error
-            if not math.isfinite(actual) or actual != expected:
+            if not math.isfinite(actual) or actual != expected_weight:
                 raise ValueError(
                     f"BEV overfit gate {evidence_name} has wrong {name}"
                 )
