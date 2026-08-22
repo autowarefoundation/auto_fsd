@@ -2097,7 +2097,7 @@ def run_reactive_stage(config: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             ),
             checkpoint_config=train.CheckpointConfig(
-                num_to_keep=3,
+                num_to_keep=None,
                 checkpoint_score_attribute="checkpoint_retention_score",
                 checkpoint_score_order="max",
             ),
