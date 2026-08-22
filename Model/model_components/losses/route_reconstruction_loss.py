@@ -84,33 +84,50 @@ class RouteReconstructionLoss(nn.Module):
         target: torch.Tensor,
         channel_valid: torch.Tensor,
     ) -> torch.Tensor:
+        return self.components(logits, target, channel_valid)["total"]
+
+    def components(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        channel_valid: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return total and per-channel loss terms in FP32."""
         if logits.ndim != 4 or logits.shape[1] != 2:
             raise ValueError("route logits must have shape [B,2,H,W]")
         if target.shape != logits.shape:
             raise ValueError("route target must match logits")
         if channel_valid.shape != logits.shape[:2]:
             raise ValueError("channel_valid must have shape [B,2]")
-        target = target.to(device=logits.device, dtype=logits.dtype)
+        logits_fp32 = logits.to(dtype=torch.float32)
+        target_fp32 = target.to(device=logits.device, dtype=torch.float32)
         valid = channel_valid.to(device=logits.device, dtype=torch.bool)
+        zero = logits_fp32.sum() * 0.0
         if not bool(valid.any()):
-            return logits.sum() * 0.0
+            return {
+                "total": zero,
+                "corridor_bce": zero,
+                "corridor_dice": zero,
+                "destination_focal": zero,
+            }
 
-        sample_losses = logits.new_zeros(
+        sample_losses = logits_fp32.new_zeros(
             logits.shape[0],
-            dtype=torch.float32,
         )
-        sample_terms = logits.new_zeros(
+        sample_terms = logits_fp32.new_zeros(
             logits.shape[0],
-            dtype=torch.float32,
         )
+        corridor_bce_loss = zero
+        corridor_dice_loss = zero
+        destination_focal_loss = zero
 
         corridor_valid = valid[:, 0]
         if bool(corridor_valid.any()):
-            corridor_logits = logits[corridor_valid, 0]
-            corridor_target = target[corridor_valid, 0]
+            corridor_logits = logits_fp32[corridor_valid, 0]
+            corridor_target = target_fp32[corridor_valid, 0]
             corridor_bce = F.binary_cross_entropy_with_logits(
-                corridor_logits.float(),
-                corridor_target.float(),
+                corridor_logits,
+                corridor_target,
                 pos_weight=self.corridor_pos_weight.float(),
                 reduction="none",
             ).mean(dim=(1, 2))
@@ -123,17 +140,26 @@ class RouteReconstructionLoss(nn.Module):
                 0.5 * corridor_bce + 0.5 * corridor_dice
             )
             sample_terms[corridor_valid] += 1.0
+            corridor_bce_loss = corridor_bce.mean()
+            corridor_dice_loss = corridor_dice.mean()
 
         destination_valid = valid[:, 1]
         if bool(destination_valid.any()):
             destination_loss = _destination_heatmap_focal(
-                logits[destination_valid, 1],
-                target[destination_valid, 1],
+                logits_fp32[destination_valid, 1],
+                target_fp32[destination_valid, 1],
             )
             sample_losses[destination_valid] += (
                 self.destination_weight * destination_loss
             )
             sample_terms[destination_valid] += self.destination_weight
+            destination_focal_loss = destination_loss.mean()
 
         active = sample_terms > 0
-        return sample_losses[active].mean()
+        total = sample_losses[active].mean() if bool(active.any()) else zero
+        return {
+            "total": total,
+            "corridor_bce": corridor_bce_loss,
+            "corridor_dice": corridor_dice_loss,
+            "destination_focal": destination_focal_loss,
+        }
