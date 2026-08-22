@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -63,6 +65,27 @@ from model_components.losses import (
     RouteReconstructionLoss,
 )
 from training.reactive_multitask import ReactiveTrainingStage
+
+
+def test_bev_taxonomy_version_is_single_sourced():
+    root = Path(__file__).parents[2]
+    definition = (
+        root
+        / "Model"
+        / "data_processing"
+        / "reactive_training_artifacts.py"
+    )
+    offenders = []
+    version_literal = re.compile(
+        r"""["']bev_segmentation_""" + r"""v\d+["']"""
+    )
+    for directory in ("Model", "Platform"):
+        for path in (root / directory).rglob("*.py"):
+            if path == definition:
+                continue
+            if version_literal.search(path.read_text(encoding="utf-8")):
+                offenders.append(str(path.relative_to(root)))
+    assert offenders == []
 
 
 def _write_source(
