@@ -15,18 +15,25 @@ from .route_consistency_loss import (
     ego_points_to_grid,
 )
 from .fidelity_aware_reward import (
+    EXPERIMENT_NOISE_WM_SIGMA,
     FIDELITY_AWARE_REWARD_VERSION,
+    FIDELITY_SATURATION,
+    FIDELITY_TEMPERATURE,
     FidelityAwareRewardResult,
     V1_WEIGHTS,
     consequence_alignment_reward,
     fidelity_aware_reward,
+    path_frame_along_cross,
     soft_advantage_from_reward,
     v1_handcrafted_reward,
     world_model_fidelity,
 )
 
 __all__ = [
+    "EXPERIMENT_NOISE_WM_SIGMA",
     "FIDELITY_AWARE_REWARD_VERSION",
+    "FIDELITY_SATURATION",
+    "FIDELITY_TEMPERATURE",
     "FidelityAwareRewardResult",
     "HorizonReasoningLoss",
     "ROLLOUT_ALIGNED_LOSS_VERSION",
@@ -39,6 +46,7 @@ __all__ = [
     "ego_points_to_grid",
     "fidelity_aware_reward",
     "integrate_controls_torch",
+    "path_frame_along_cross",
     "soft_advantage_from_reward",
     "v1_handcrafted_reward",
     "world_model_fidelity",

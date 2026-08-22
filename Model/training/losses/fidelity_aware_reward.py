@@ -5,10 +5,22 @@ v1 (the issue's concrete formula, minus an imitation KL term)::
     R = w_safe R_safety + w_prog R_progress + w_comf R_comfort
       + g * R_wm
 
-``R_safety / R_progress / R_comfort`` come from the same tensors
-``RolloutAlignedLoss`` already uses (unicycle rollout + comfort excess).
-``g = exp(-mse / T)`` is world-model fidelity. It gates **only** the WM
-consequence term — a broken WM must not zero collision/comfort.
+Handcrafted terms are **not** imitation:
+
+* ``R_safety`` is mean lane-departure in the intended-path Frenet frame
+  (cross-track vs the path heading along the trajectory), not ``|y|`` in
+  the t=0 ego frame. Turning in a ~3.5 m lane is free; leaving it is not.
+* ``R_progress`` is along-track displacement of the predicted trajectory
+  along that same path, normalized by the coast horizon. Matching the
+  expert's positions is not the objective; going forward along the path is.
+* ``R_comfort`` is jerk / lateral-accel excess vs the physical thresholds
+  already used by ``RolloutAlignedLoss``, not vs the expert log.
+
+``g = g_sat * exp(-mse / T)`` gates **only** the WM consequence term — a
+broken WM must not zero collision/comfort. ``T`` and ``g_sat`` are derived
+below from the offline experiment's WM residual scale; ``g_sat < 1`` so a
+"good enough" reconstruction does not fully trust a (possibly misleading)
+consequence.
 
 This is the tensor #177 (AlpaSim closed-loop) should call later. It does
 not import that PR.
@@ -23,7 +35,6 @@ from dataclasses import dataclass
 import torch
 
 from training.losses.control_rollout import integrate_controls_torch
-from training.losses.rollout_aligned_loss import comfort_excess_per_sample
 
 
 FIDELITY_AWARE_REWARD_VERSION = "v1_safety_comfort_progress_gated_wm"
@@ -33,6 +44,38 @@ V1_WEIGHTS = {
     "progress": 1.0,
     "comfort": 0.5,
 }
+
+# Physical comfort limits — same numbers as RolloutAlignedLoss.
+JERK_THRESHOLD_MPS3 = 4.13
+LATERAL_ACCEL_THRESHOLD_MPS2 = 4.89
+
+# --- fidelity temperature / saturation --------------------------------------
+# Offline experiment WM residual is an (B, 8) tensor.
+#   faithful arm: mse = 0
+#   noise arm:    pred ~ N(0, σ_noise²) with σ_noise = 10  →  E[mse] = 100
+# A barely-faithful WM is defined as 10× smaller residual than that noise
+# (σ_good = 1). T is its expected per-element MSE, so:
+#   g(barely-faithful) = g_sat / e
+#   g(noise)           = g_sat * exp(-100) ≈ 0
+# and the exponential still moves in the operating range instead of sitting
+# at the ceiling for every "pretty good" WM.
+EXPERIMENT_WM_DIM = 8
+EXPERIMENT_NOISE_WM_SIGMA = 10.0
+FAITHFUL_NOISE_RATIO = 10.0
+FIDELITY_TEMPERATURE = (
+    EXPERIMENT_NOISE_WM_SIGMA / FAITHFUL_NOISE_RATIO
+) ** 2  # 1.0
+
+# Even mse = 0 does not fully trust R_wm: reconstruction fidelity is not
+# consequence-target fidelity (the experiment's misleading preference).
+# Rule of succession on the experiment's 8-d residual: after D exact
+# matches, P(trust) = (D+1)/(D+2) = 0.9, not 1.
+FIDELITY_SATURATION = (EXPERIMENT_WM_DIM + 1) / (EXPERIMENT_WM_DIM + 2)
+
+# Prefix/suffix used to treat the intended path as an infinite lane so
+# along-track is not capped at the expert's last point (that cap would
+# re-introduce imitation).
+_LANE_EXTENSION_M = 1.0e3
 
 
 @dataclass(frozen=True)
@@ -50,14 +93,17 @@ def world_model_fidelity(
     prediction: torch.Tensor,
     target: torch.Tensor,
     *,
-    temperature: float = 1.0,
+    temperature: float = FIDELITY_TEMPERATURE,
+    saturation: float = FIDELITY_SATURATION,
     reduce_dims: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """Map WM prediction error to a ``(0, 1]`` fidelity weight.
+    """Map WM prediction error to a ``(0, g_sat]`` fidelity weight.
 
-    ``fidelity = exp(-mse / temperature)``. High fidelity means the world
-    model is a trustworthy source of consequence information for this sample;
-    low fidelity down-weights any reward that depends on those predictions.
+    ``fidelity = saturation * exp(-mse / temperature)``. High fidelity
+    means the world model is a trustworthy source of consequence
+    information for this sample; low fidelity down-weights any reward
+    that depends on those predictions. ``saturation < 1`` keeps a
+    "good enough" WM from fully deferring to a misspecified consequence.
     """
     if prediction.shape != target.shape:
         raise ValueError(
@@ -66,6 +112,10 @@ def world_model_fidelity(
         )
     if temperature <= 0:
         raise ValueError(f"temperature must be > 0, got {temperature}")
+    if saturation <= 0 or saturation > 1:
+        raise ValueError(
+            f"saturation must be in (0, 1], got {saturation}"
+        )
 
     err = (prediction.float() - target.float()).pow(2)
     if reduce_dims is None:
@@ -77,7 +127,7 @@ def world_model_fidelity(
     else:
         mse = err.mean(dim=reduce_dims)
 
-    return torch.exp(-mse / temperature)
+    return float(saturation) * torch.exp(-mse / temperature)
 
 
 def consequence_alignment_reward(
@@ -114,30 +164,124 @@ def consequence_alignment_reward(
     return -scale * mse
 
 
+def _polyline_along_cross(
+    pos: torch.Tensor,
+    ref: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nearest-point Frenet coords of ``pos`` vs polyline ``ref``.
+
+    Both ``(B, T, 2)``. Along-track is arc length from ``ref[:, 0]``;
+    cross-track is signed left-positive distance to the closest segment.
+    """
+    seg = ref[:, 1:, :] - ref[:, :-1, :]
+    seg_len = torch.linalg.norm(seg, dim=-1)
+    seg_len_sq = seg_len.square().clamp(min=1e-12)
+    zeros = torch.zeros(
+        ref.shape[0], 1, dtype=ref.dtype, device=ref.device,
+    )
+    arc_start = torch.cat(
+        [zeros, torch.cumsum(seg_len, dim=-1)[:, :-1]], dim=-1,
+    )
+
+    start = ref[:, None, :-1, :]
+    rel = pos[:, :, None, :] - start
+    t_proj = (rel * seg[:, None, :, :]).sum(-1) / seg_len_sq[:, None, :]
+    t_clamped = t_proj.clamp(0.0, 1.0)
+    closest = start + t_clamped.unsqueeze(-1) * seg[:, None, :, :]
+    offset = pos[:, :, None, :] - closest
+    dist2 = (offset * offset).sum(-1)
+    idx = dist2.argmin(dim=-1)
+
+    batch = torch.arange(pos.shape[0], device=pos.device)[:, None]
+    time = torch.arange(pos.shape[1], device=pos.device)[None, :]
+    t_star = t_clamped[batch, time, idx]
+    along = arc_start[batch, idx] + t_star * seg_len[batch, idx]
+    seg_n = seg[batch, idx]
+    off_n = offset[batch, time, idx]
+    denom = seg_len[batch, idx].clamp(min=1e-6)
+    cross = (
+        seg_n[..., 0] * off_n[..., 1] - seg_n[..., 1] * off_n[..., 0]
+    ) / denom
+    return along, cross
+
+
+def path_frame_along_cross(
+    pos: torch.Tensor,
+    ref_pos: torch.Tensor,
+    ref_heading: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Along-track / cross-track of ``pos`` in the intended-path frame.
+
+    The path is the polyline ``ref_pos``, extended along ``ref_heading``
+    at both ends so progress is not capped at the last logged point (that
+    cap would reward matching the expert's horizon, i.e. imitation).
+
+    This is **not** ``|y|`` in the t=0 ego frame: a curved in-lane path
+    has large ego-y and near-zero cross-track.
+    """
+    u0 = torch.stack(
+        [ref_heading[:, 0].cos(), ref_heading[:, 0].sin()], dim=-1,
+    )
+    u1 = torch.stack(
+        [ref_heading[:, -1].cos(), ref_heading[:, -1].sin()], dim=-1,
+    )
+    origin = torch.zeros(
+        ref_pos.shape[0], 1, 2, dtype=ref_pos.dtype, device=ref_pos.device,
+    )
+    extend = pos.new_tensor(_LANE_EXTENSION_M)
+    prefix = origin - extend * u0[:, None, :]
+    suffix = ref_pos[:, -1:, :] + extend * u1[:, None, :]
+    ref_ext = torch.cat([prefix, origin, ref_pos, suffix], dim=1)
+    along_ext, cross = _polyline_along_cross(pos, ref_ext)
+    return along_ext - _LANE_EXTENSION_M, cross
+
+
+def _absolute_comfort_penalty(
+    controls: torch.Tensor,
+    speeds: torch.Tensor,
+    *,
+    dt: float,
+) -> torch.Tensor:
+    """Mean jerk / lateral-accel excess vs physical thresholds, not the log.
+
+    ``comfort_excess_per_sample`` charges ``relu(peak_pred - peak_target)``,
+    which is zero when the expert is equally jerky. v1 must not do that.
+    """
+    accel = controls[:, :, 0]
+    curvature = controls[:, :, 1]
+    jerk = (accel[:, 1:] - accel[:, :-1]) / dt
+    lateral = speeds.square() * curvature
+    jerk_excess = torch.relu(jerk.abs() - JERK_THRESHOLD_MPS3).mean(dim=1)
+    lateral_excess = torch.relu(
+        lateral.abs() - LATERAL_ACCEL_THRESHOLD_MPS2,
+    ).mean(dim=1)
+    return 0.5 * (jerk_excess + lateral_excess)
+
+
 def v1_handcrafted_reward(
     controls: torch.Tensor,
-    expert_controls: torch.Tensor,
+    intended_controls: torch.Tensor,
     initial_speed: torch.Tensor,
     *,
     dt: float = 0.1,
     lane_half_width_m: float = 1.75,
 ) -> dict[str, torch.Tensor]:
-    """#123 handcrafted terms from the existing rollout/comfort helpers.
+    """#123 handcrafted terms in the intended-path frame.
 
+    ``intended_controls`` is the logged plan used as **path geometry**
+    (centerline heading along the trajectory), not an imitation target.
     Returns per-sample ``safety``, ``progress``, ``comfort``, and ``base``
-    (weighted sum). Higher is better. ``expert_controls`` is the logged plan
-    used as the progress target and the comfort reference.
+    (weighted sum). Higher is better.
     """
     pos, _, speeds = integrate_controls_torch(controls, initial_speed, dt=dt)
-    exp_pos, _, exp_speeds = integrate_controls_torch(
-        expert_controls, initial_speed, dt=dt,
+    ref_pos, ref_heading, _ = integrate_controls_torch(
+        intended_controls, initial_speed, dt=dt,
     )
-    r_progress = -(pos - exp_pos).pow(2).sum(dim=-1).sqrt().mean(dim=1)
-    comfort, _, _ = comfort_excess_per_sample(
-        controls, expert_controls, speeds, exp_speeds, dt=dt,
-    )
-    r_comfort = -comfort
-    r_safety = -torch.relu(pos[..., 1].abs() - lane_half_width_m).mean(dim=1)
+    along, cross = path_frame_along_cross(pos, ref_pos, ref_heading)
+    horizon_m = initial_speed.clamp(min=1e-3) * dt * pos.shape[1]
+    r_progress = along[:, -1] / horizon_m
+    r_safety = -torch.relu(cross.abs() - lane_half_width_m).mean(dim=1)
+    r_comfort = -_absolute_comfort_penalty(controls, speeds, dt=dt)
     base = (
         V1_WEIGHTS["safety"] * r_safety
         + V1_WEIGHTS["progress"] * r_progress
@@ -148,6 +292,8 @@ def v1_handcrafted_reward(
         "progress": r_progress,
         "comfort": r_comfort,
         "base": base,
+        "along_track_m": along[:, -1],
+        "cross_track_m": cross.abs().amax(dim=1),
     }
 
 
@@ -158,7 +304,8 @@ def fidelity_aware_reward(
     wm_target: torch.Tensor,
     preferred_future: torch.Tensor | None = None,
     predicted_future: torch.Tensor | None = None,
-    fidelity_temperature: float = 1.0,
+    fidelity_temperature: float = FIDELITY_TEMPERATURE,
+    fidelity_saturation: float = FIDELITY_SATURATION,
     consequence_scale: float = 1.0,
     consequence_weight: float = 1.0,
     min_fidelity: float = 0.0,
@@ -173,6 +320,7 @@ def fidelity_aware_reward(
         wm_prediction,
         wm_target,
         temperature=fidelity_temperature,
+        saturation=fidelity_saturation,
     )
     if fidelity.shape != base_reward.shape and not (
         fidelity.ndim == 1 and base_reward.ndim == 0
@@ -215,6 +363,7 @@ def fidelity_aware_reward(
         "base_reward_mean": float(base_reward.detach().float().mean().cpu()),
         "reward_mean": float(reward.detach().mean().cpu()),
         "fidelity_temperature": float(fidelity_temperature),
+        "fidelity_saturation": float(fidelity_saturation),
         "consequence_weight": float(consequence_weight),
         "min_fidelity": float(min_fidelity),
     }
