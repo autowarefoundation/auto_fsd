@@ -301,13 +301,7 @@ def _map_layer_polygons(
     validity["drivable_area"] = all(
         layer in available for layer in required_drivable_layers
     )
-    validity["lane_boundary"] = all(
-        layer in available
-        for layer in (
-            SemanticMapLayer.LANE,
-            SemanticMapLayer.LANE_CONNECTOR,
-        )
-    )
+    validity["lane_boundary"] = SemanticMapLayer.LANE in available
     return polygons, validity
 
 
@@ -554,7 +548,13 @@ def build_nuplan_reactive_targets(
     camera_visibility: np.ndarray | None = None,
     lidar_observability: np.ndarray | None = None,
 ) -> NuPlanReactiveTargets:
-    """Build trajectory, BEV semantics, and route targets for one scenario."""
+    """Build trajectory, BEV semantics, and route targets for one scenario.
+
+    The navigation map retains one-cell lane-connector boundaries as topology
+    context. The camera-supervised target uses only physical lane boundaries
+    and rasterizes them two cells wide; synthetic intersection connectors are
+    not observable image semantics.
+    """
     current = scenario.get_ego_state_at_iteration(iteration)
     reference_pose = _pose_xy_heading(current)
     trajectory, trajectory_valid, initial_speed = future_trajectory_xy(
@@ -591,7 +591,7 @@ def build_nuplan_reactive_targets(
         scenario,
         reference_pose,
         geometry,
-        include_connectors=True,
+        include_connectors=False,
     )
     sources = {
         **map_polygons,
