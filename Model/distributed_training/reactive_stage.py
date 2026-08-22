@@ -1304,6 +1304,17 @@ def _bev_overfit_gate_result(
     }
 
 
+def _overfit_gate_passed(
+    *,
+    thresholds_passed: bool,
+    executed_optimizer_steps: int,
+) -> bool:
+    return (
+        thresholds_passed
+        and executed_optimizer_steps >= MIN_OVERFIT_OPTIMIZER_STEPS
+    )
+
+
 def _report_reactive_epoch(
     report,
     metrics: Mapping[str, Any],
@@ -1780,10 +1791,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 minimum_recall=float(config["overfit_min_recall"]),
             )
             overfit_thresholds_pass = bool(overfit_gate["passed"])
-            overfit_gate_pass = (
-                overfit_thresholds_pass
-                and executed_optimizer_steps
-                >= MIN_OVERFIT_OPTIMIZER_STEPS
+            overfit_gate_pass = _overfit_gate_passed(
+                thresholds_passed=overfit_thresholds_pass,
+                executed_optimizer_steps=executed_optimizer_steps,
             )
             if (
                 epoch == int(config["epochs"])
