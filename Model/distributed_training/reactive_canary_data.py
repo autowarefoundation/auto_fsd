@@ -16,6 +16,7 @@ from data_processing.dataset_snapshot import split_bucket
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_MEMBER,
     BEV_SEGMENTATION_STATS_MEMBER,
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
     encode_bev_segmentation,
     encode_bev_segmentation_stats,
     encode_reactive_navigation,
@@ -231,7 +232,7 @@ def write_reactive_canary_dataset(
             else 0
         ),
         "bev_taxonomy_version": (
-            "bev_segmentation_v2"
+            BEV_SEGMENTATION_TAXONOMY_VERSION
             if stage is ReactiveTrainingStage.NUPLAN_FULL
             else None
         ),
