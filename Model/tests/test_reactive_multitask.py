@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
     decode_bev_segmentation,
     decode_trajectory_xy,
     encode_bev_segmentation,
@@ -987,7 +988,7 @@ def test_stage_a_to_stage_b_to_semantic_artifact_smoke(
             "overfit_fixed_lr": False,
             "bev_pos_weights": [1.0] * 8,
             "bev_repeat_factors": [1] * 8,
-            "bev_taxonomy_version": "bev_segmentation_v2",
+            "bev_taxonomy_version": BEV_SEGMENTATION_TAXONOMY_VERSION,
         },
         optimizer=stage_a_optimizer,
         metrics=stage_a_metrics,
@@ -1246,7 +1247,7 @@ def test_stage_b_rejects_stage_a_that_did_not_optimize_bev(
             "overfit_fixed_lr": False,
             "bev_pos_weights": [2.0] * 8,
             "bev_repeat_factors": [1] * 8,
-            "bev_taxonomy_version": "bev_segmentation_v2",
+            "bev_taxonomy_version": BEV_SEGMENTATION_TAXONOMY_VERSION,
         },
     )
 
