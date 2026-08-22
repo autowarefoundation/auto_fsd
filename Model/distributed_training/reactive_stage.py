@@ -881,6 +881,129 @@ def _metric_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator > 0.0 else 0.0
 
 
+def _route_validation_statistics(
+    route_logits,
+    route_target,
+    route_channel_valid,
+    route_valid,
+    route_loss,
+):
+    import torch
+
+    if route_logits.ndim != 4 or route_logits.shape[1] != 2:
+        raise ValueError("route logits must have shape [B,2,H,W]")
+    if route_target.shape != route_logits.shape:
+        raise ValueError("route validation target shape differs")
+    if route_channel_valid.shape != route_logits.shape[:2]:
+        raise ValueError("route channel validity shape differs")
+    if route_valid.shape != route_logits.shape[:1]:
+        raise ValueError("route sample validity shape differs")
+
+    logits = route_logits.to(dtype=torch.float32)
+    target = route_target.to(
+        device=route_logits.device,
+        dtype=torch.float32,
+    )
+    channel_valid = route_channel_valid.to(
+        device=route_logits.device,
+        dtype=torch.bool,
+    )
+    sample_valid = route_valid.to(
+        device=route_logits.device,
+        dtype=torch.bool,
+    )
+    active_samples = channel_valid.any(dim=1)
+    if not torch.equal(active_samples, sample_valid):
+        raise ValueError(
+            "route_valid must equal route_channel_valid.any(dim=1)"
+        )
+    if (
+        not torch.isfinite(logits[channel_valid]).all()
+        or not torch.isfinite(target[channel_valid]).all()
+    ):
+        raise FloatingPointError(
+            "route validation contains non-finite active values"
+        )
+
+    zero = logits.new_zeros(())
+    route_loss_sum = zero
+    corridor_bce_sum = zero
+    corridor_dice_sum = zero
+    destination_focal_sum = zero
+    active_count = active_samples.sum()
+    components = route_loss.components(logits, target, channel_valid)
+    if bool(active_samples.any()):
+        route_loss_sum = components["total"] * active_count
+
+    corridor_valid = channel_valid[:, 0]
+    corridor_count = corridor_valid.sum()
+    true_positive = zero
+    false_positive = zero
+    false_negative = zero
+    if bool(corridor_valid.any()):
+        corridor_bce_sum = components["corridor_bce"] * corridor_count
+        corridor_dice_sum = components["corridor_dice"] * corridor_count
+        corridor_prediction = logits[corridor_valid, 0] >= 0.0
+        corridor_target = target[corridor_valid, 0] >= 0.5
+        true_positive = (corridor_prediction & corridor_target).sum()
+        false_positive = (corridor_prediction & ~corridor_target).sum()
+        false_negative = (~corridor_prediction & corridor_target).sum()
+
+    destination_valid = channel_valid[:, 1]
+    destination_count = destination_valid.sum()
+    destination_error_sum = zero
+    if bool(destination_valid.any()):
+        destination_focal_sum = (
+            components["destination_focal"] * destination_count
+        )
+        destination_logits = logits[destination_valid, 1]
+        destination_target = target[destination_valid, 1]
+        _, _, width = destination_logits.shape
+        predicted_index = destination_logits.flatten(1).argmax(dim=1)
+        target_index = destination_target.flatten(1).argmax(dim=1)
+        predicted_cells = torch.stack(
+            (
+                torch.div(
+                    predicted_index,
+                    width,
+                    rounding_mode="floor",
+                ),
+                predicted_index.remainder(width),
+            ),
+            dim=1,
+        ).to(torch.float64)
+        target_cells = torch.stack(
+            (
+                torch.div(target_index, width, rounding_mode="floor"),
+                target_index.remainder(width),
+            ),
+            dim=1,
+        ).to(torch.float64)
+        destination_error_sum = torch.linalg.vector_norm(
+            predicted_cells - target_cells,
+            dim=1,
+        ).sum()
+
+    statistics = torch.stack([
+        route_loss_sum,
+        active_count,
+        corridor_bce_sum,
+        corridor_dice_sum,
+        true_positive,
+        false_positive,
+        false_negative,
+        corridor_count,
+        destination_focal_sum,
+        destination_error_sum,
+        destination_count,
+    ]).to(dtype=torch.float64)
+    if not torch.isfinite(statistics).all():
+        raise FloatingPointError(
+            "route validation produced non-finite statistics"
+        )
+    return statistics
+
+
 def _evaluate_global_reactive(
     model,
     loader,
@@ -924,6 +1047,7 @@ def _evaluate_global_reactive(
     bev_bce_sum = 0.0
     bev_dice_sum = 0.0
     bev_loss_batches = 0
+    route_values = torch.zeros(11, dtype=torch.float64, device=device)
     try:
         with torch.no_grad():
             for item in loader:
@@ -950,13 +1074,11 @@ def _evaluate_global_reactive(
                     projection=projection,
                     geometry_type=geometry_type,
                     mode="infer",
-                    return_auxiliary=(
-                        stage is ReactiveTrainingStage.NUPLAN_FULL
-                    ),
+                    return_auxiliary=True,
                     compute_bev_segmentation=(
                         stage is ReactiveTrainingStage.NUPLAN_FULL
                     ),
-                    compute_route_reconstruction=False,
+                    compute_route_reconstruction=True,
                 )
                 if isinstance(output, tuple):
                     controls, auxiliary = output
@@ -987,6 +1109,21 @@ def _evaluate_global_reactive(
                     raise ValueError(
                         "trajectory target shape differs from rollout"
                     )
+                route_logits = auxiliary.get(
+                    "route_reconstruction_logits"
+                )
+                if not torch.is_tensor(route_logits):
+                    raise RuntimeError(
+                        "Reactive validation omitted route logits"
+                    )
+                # Route supervision is independent of trajectory completeness.
+                route_values += _route_validation_statistics(
+                    route_logits,
+                    batch["route_mask"],
+                    batch["route_channel_valid"],
+                    batch["route_valid"],
+                    objective.route_loss,
+                )
                 complete = valid.all(dim=1)
                 if not bool(complete.any()):
                     continue
@@ -1094,6 +1231,7 @@ def _evaluate_global_reactive(
     dist.all_reduce(bev_counts, op=dist.ReduceOp.SUM)
     dist.all_reduce(positive_histogram, op=dist.ReduceOp.SUM)
     dist.all_reduce(negative_histogram, op=dist.ReduceOp.SUM)
+    dist.all_reduce(route_values, op=dist.ReduceOp.SUM)
     bev_loss_values = torch.tensor(
         [
             bev_loss_sum,
@@ -1119,6 +1257,61 @@ def _evaluate_global_reactive(
         -metrics["ade_6p4s_m"] / ade_scale_m
     )
     metrics["trajectory_quality"] = trajectory_quality
+    (
+        route_loss_sum,
+        route_supported,
+        corridor_bce_sum,
+        corridor_dice_sum,
+        corridor_true_positive,
+        corridor_false_positive,
+        corridor_false_negative,
+        corridor_supported,
+        destination_focal_sum,
+        destination_error_sum,
+        destination_supported,
+    ) = (float(value) for value in route_values.tolist())
+    metrics.update({
+        "route_loss": _metric_ratio(
+            route_loss_sum,
+            route_supported,
+        ),
+        "route_supported_samples": route_supported,
+        "route_corridor_bce": _metric_ratio(
+            corridor_bce_sum,
+            corridor_supported,
+        ),
+        "route_corridor_dice": _metric_ratio(
+            corridor_dice_sum,
+            corridor_supported,
+        ),
+        "route_corridor_iou": _metric_ratio(
+            corridor_true_positive,
+            corridor_true_positive
+            + corridor_false_positive
+            + corridor_false_negative,
+        ),
+        "route_corridor_precision": _metric_ratio(
+            corridor_true_positive,
+            corridor_true_positive + corridor_false_positive,
+        ),
+        "route_corridor_recall": _metric_ratio(
+            corridor_true_positive,
+            corridor_true_positive + corridor_false_negative,
+        ),
+        "route_corridor_positive_cells": (
+            corridor_true_positive + corridor_false_negative
+        ),
+        "route_corridor_supported_samples": corridor_supported,
+        "route_destination_focal": _metric_ratio(
+            destination_focal_sum,
+            destination_supported,
+        ),
+        "route_destination_error_cells": _metric_ratio(
+            destination_error_sum,
+            destination_supported,
+        ),
+        "route_destination_supported_samples": destination_supported,
+    })
     if stage is not ReactiveTrainingStage.NUPLAN_FULL:
         metrics["selection_score"] = trajectory_quality
         return metrics
