@@ -667,9 +667,9 @@ def summarize_bev_positive_samples(
     *,
     val_fraction: float,
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
-    """Return train identities and positive classes from scanned records."""
+    """Return train identities and per-class positive cells."""
     summaries = tuple(
-        (record.sample_uid, record.positive_classes)
+        (record.sample_uid, record.positive_cell_count)
         for record in records
         if not _is_validation_group(
             record.split_group_uid,
@@ -759,7 +759,7 @@ def discover_bev_positive_samples(
     *,
     val_fraction: float,
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
-    """Return train sample identities and positive classes without decoding."""
+    """Return train identities and per-class positive cells without decoding."""
     return summarize_bev_positive_samples(
         discover_bev_sample_statistics(shard_dirs),
         val_fraction=val_fraction,
