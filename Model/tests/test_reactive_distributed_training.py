@@ -43,6 +43,7 @@ from distributed_training.reactive_stage import (
     _select_result_checkpoint,
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
+    reactive_gradient_parameter_groups,
     run_reactive_stage,
     validate_reactive_stage_config,
 )
@@ -260,6 +261,68 @@ def test_float64_gradient_clipping_rejects_non_finite_values():
 
     assert not finite
     assert torch.isnan(parameter.grad[0])
+
+
+def test_reactive_gradient_groups_clip_branches_independently():
+    torch = pytest.importorskip("torch")
+
+    class Reactive(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.Backbone = torch.nn.Linear(1, 1, bias=False)
+            self.FeatureFusion = torch.nn.Linear(1, 1, bias=False)
+            self.BEVSegmentationHead = torch.nn.Linear(1, 1, bias=False)
+            self.NavigationEncoder = torch.nn.Linear(1, 1, bias=False)
+            self.MapBEVFusion = torch.nn.Linear(1, 1, bias=False)
+            self.RouteReconstructionHead = torch.nn.Linear(
+                1,
+                1,
+                bias=False,
+            )
+            self.TemporalMemory = torch.nn.Linear(1, 1, bias=False)
+            self.TrajectoryPlanner = torch.nn.Linear(1, 1, bias=False)
+
+    model = torch.nn.Module()
+    model.Reactive_E2E = Reactive()
+    groups = reactive_gradient_parameter_groups(model)
+
+    expected_ids = {
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    }
+    grouped_ids = {
+        id(parameter)
+        for parameters in groups.values()
+        for parameter in parameters
+    }
+    assert set(groups) == {"camera", "navigation", "planner"}
+    assert grouped_ids == expected_ids
+    assert sum(len(parameters) for parameters in groups.values()) == len(
+        expected_ids
+    )
+
+    gradient_values = {
+        "camera": 10.0,
+        "navigation": 0.5 / len(groups["navigation"]) ** 0.5,
+        "planner": 4.0,
+    }
+    post_clip_norms = {}
+    for group_name, parameters in groups.items():
+        for parameter in parameters:
+            parameter.grad = torch.full_like(
+                parameter,
+                gradient_values[group_name],
+            )
+        clip_finite_gradients_float64(parameters, 1.0)
+        post_clip_norms[group_name] = torch.linalg.vector_norm(torch.stack([
+            parameter.grad.reshape(-1)
+            for parameter in parameters
+        ]))
+
+    assert post_clip_norms["camera"].item() == pytest.approx(1.0)
+    assert post_clip_norms["navigation"].item() == pytest.approx(0.5)
+    assert post_clip_norms["planner"].item() == pytest.approx(1.0)
 
 
 def test_ray_checkpoint_uri_restores_s3_scheme_within_storage():
