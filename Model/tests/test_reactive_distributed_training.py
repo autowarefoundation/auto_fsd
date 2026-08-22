@@ -44,6 +44,8 @@ from distributed_training.reactive_stage import (
     _histogram_average_precision,
     _load_resume_checkpoint,
     _overfit_gate_passed,
+    _evaluate_global_reactive,
+    _route_validation_statistics,
     _select_bev_overfit_subset,
     _select_result_checkpoint,
     _report_reactive_epoch,
@@ -54,6 +56,7 @@ from distributed_training.reactive_stage import (
     validate_reactive_stage_config,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
+from model_components.losses import RouteReconstructionLoss
 from training.reactive_multitask import ReactiveTrainingStage
 
 
@@ -879,6 +882,152 @@ def test_histogram_average_precision_matches_hand_calculation():
     )
 
     assert average_precision == pytest.approx(5.0 / 6.0)
+
+
+def test_route_validation_statistics_are_batch_and_mask_independent():
+    torch = pytest.importorskip("torch")
+    target = torch.zeros(2, 2, 3, 5)
+    target[0, 0, 1, 1:4] = 1.0
+    target[1, 1, 2, 4] = 1.0
+    logits = torch.full_like(target, -20.0)
+    logits[0, 0, 1, 1:4] = 20.0
+    logits[1, 1, 0, 1] = 20.0
+    channel_valid = torch.tensor([
+        [True, False],
+        [False, True],
+    ])
+    route_valid = torch.ones(2, dtype=torch.bool)
+    route_loss = RouteReconstructionLoss()
+
+    combined = _route_validation_statistics(
+        logits,
+        target,
+        channel_valid,
+        route_valid,
+        route_loss,
+    )
+    split = sum(
+        (
+            _route_validation_statistics(
+                logits[index:index + 1],
+                target[index:index + 1],
+                channel_valid[index:index + 1],
+                route_valid[index:index + 1],
+                route_loss,
+            )
+            for index in range(2)
+        ),
+        torch.zeros_like(combined),
+    )
+
+    torch.testing.assert_close(combined, split)
+    assert combined[1].item() == 2
+    assert combined[4].item() == 3
+    assert combined[5].item() == 0
+    assert combined[6].item() == 0
+    assert combined[7].item() == 1
+    assert combined[9].item() == pytest.approx(13**0.5)
+    assert combined[10].item() == 1
+
+
+def test_route_validation_statistics_empty_case_is_finite():
+    torch = pytest.importorskip("torch")
+    logits = torch.full((2, 2, 3, 5), float("nan"))
+    target = torch.zeros_like(logits)
+    channel_valid = torch.zeros(2, 2, dtype=torch.bool)
+    route_valid = torch.zeros(2, dtype=torch.bool)
+
+    statistics = _route_validation_statistics(
+        logits,
+        target,
+        channel_valid,
+        route_valid,
+        RouteReconstructionLoss(),
+    )
+
+    assert torch.equal(statistics, torch.zeros_like(statistics))
+    assert torch.isfinite(statistics).all()
+    json.dumps(statistics.tolist(), allow_nan=False)
+
+
+def test_route_validation_statistics_reject_validity_drift():
+    torch = pytest.importorskip("torch")
+
+    with pytest.raises(ValueError, match="route_valid must equal"):
+        _route_validation_statistics(
+            torch.zeros(1, 2, 3, 5),
+            torch.zeros(1, 2, 3, 5),
+            torch.tensor([[True, False]]),
+            torch.tensor([False]),
+            RouteReconstructionLoss(),
+        )
+
+
+def test_stage_b_validation_emits_route_metrics(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    target = torch.zeros(1, 2, 3, 5)
+    target[0, 0, 1, 1:4] = 1.0
+    target[0, 1, 2, 4] = 1.0
+    logits = torch.full_like(target, -20.0)
+    logits[0, 0, 1, 1:4] = 20.0
+    logits[0, 1, 0, 1] = 20.0
+
+    class RouteValidationModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_options = None
+
+        def forward(self, visual_tiles, *args, **kwargs):
+            self.forward_options = kwargs
+            controls = visual_tiles.new_zeros(
+                visual_tiles.shape[0],
+                128,
+            )
+            return controls, {
+                "route_reconstruction_logits": logits,
+            }
+
+    model = RouteValidationModel()
+    batch = {
+        "visual_tiles": torch.zeros(1, 1, 3, 2, 2),
+        "map_context": torch.zeros(1, 14, 3, 5),
+        "visual_history": torch.zeros(1, 1),
+        "egomotion_history": torch.zeros(1, 1),
+        "route_mask": target,
+        "map_valid": torch.ones(1, dtype=torch.bool),
+        "route_valid": torch.ones(1, dtype=torch.bool),
+        "route_channel_valid": torch.ones(1, 2, dtype=torch.bool),
+        "trajectory_xy_m": torch.zeros(1, 64, 2),
+        "trajectory_valid": torch.ones(1, 64, dtype=torch.bool),
+        "initial_speed_mps": torch.zeros(1),
+    }
+    objective = SimpleNamespace(
+        route_loss=RouteReconstructionLoss(),
+    )
+    monkeypatch.setattr(dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    metrics = _evaluate_global_reactive(
+        model,
+        [batch],
+        objective,
+        stage=ReactiveTrainingStage.L2D_CONTINUATION,
+        device=torch.device("cpu"),
+        probability_bins=8,
+        ade_scale_m=5.0,
+    )
+
+    assert metrics["route_corridor_iou"] == 1.0
+    assert metrics["route_destination_error_cells"] == pytest.approx(
+        13**0.5
+    )
+    assert metrics["route_supported_samples"] == 1.0
+    assert metrics["selection_score"] == 1.0
+    assert "bev_loss" not in metrics
+    assert model.forward_options["return_auxiliary"] is True
+    assert model.forward_options["compute_bev_segmentation"] is False
+    assert model.forward_options["compute_route_reconstruction"] is True
 
 
 def test_bev_overfit_gate_result_reports_weakest_classes():
