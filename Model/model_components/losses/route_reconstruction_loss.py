@@ -13,9 +13,11 @@ def _soft_dice(
     *,
     epsilon: float,
 ) -> torch.Tensor:
-    probabilities = logits.sigmoid()
-    intersection = (probabilities * target).sum(dim=(1, 2))
-    denominator = (probabilities + target).sum(dim=(1, 2))
+    logits_fp32 = logits.float()
+    target_fp32 = target.float()
+    probabilities = logits_fp32.sigmoid()
+    intersection = (probabilities * target_fp32).sum(dim=(1, 2))
+    denominator = (probabilities + target_fp32).sum(dim=(1, 2))
     return 1.0 - (2.0 * intersection + epsilon) / (
         denominator + epsilon
     )
@@ -107,9 +109,9 @@ class RouteReconstructionLoss(nn.Module):
             corridor_logits = logits[corridor_valid, 0]
             corridor_target = target[corridor_valid, 0]
             corridor_bce = F.binary_cross_entropy_with_logits(
-                corridor_logits,
-                corridor_target,
-                pos_weight=self.corridor_pos_weight,
+                corridor_logits.float(),
+                corridor_target.float(),
+                pos_weight=self.corridor_pos_weight.float(),
                 reduction="none",
             ).mean(dim=(1, 2))
             corridor_dice = _soft_dice(
