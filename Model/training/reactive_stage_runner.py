@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -211,6 +212,34 @@ def load_stage_a_parent(
         raise ValueError(
             f"Stage A parent checkpoint contract differs: {mismatches}"
         )
+    objective_values = {
+        name: config.get(name)
+        for name in (
+            "trajectory_weight",
+            "bev_weight",
+            "route_weight",
+            "corridor_pos_weight",
+        )
+    }
+    if (
+        any(
+            not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in objective_values.values()
+        )
+        or float(objective_values["trajectory_weight"]) <= 0.0
+        or float(objective_values["bev_weight"]) <= 0.0
+        or float(objective_values["route_weight"]) < 0.0
+        or float(objective_values["corridor_pos_weight"]) < 1.0
+        or not isinstance(config.get("training_seed"), int)
+        or config.get("scheduler_identity")
+        not in {"constant_v1", "selection_plateau_v1"}
+        or config.get("overfit_bev_only") is not False
+        or config.get("overfit_fixed_lr") is not False
+    ):
+        raise ValueError(
+            "Stage A parent checkpoint lacks valid objective provenance"
+        )
     pos_weights = np.asarray(
         config.get("bev_pos_weights", ()),
         dtype=np.float64,
@@ -295,7 +324,9 @@ def run_reactive_epoch(
             compute_bev_segmentation=(
                 objective.compute_bev_segmentation
             ),
-            compute_route_reconstruction=True,
+            compute_route_reconstruction=(
+                objective.compute_route_reconstruction
+            ),
         )
         if not isinstance(output, tuple):
             raise RuntimeError(
