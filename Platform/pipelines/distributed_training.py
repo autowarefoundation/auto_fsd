@@ -58,7 +58,9 @@ BEV_OVERFIT_MIN_AP = 0.9
 BEV_OVERFIT_MIN_RECALL = 0.9
 BEV_CAPACITY_GATE_EPOCHS = 10
 BEV_CAPACITY_GATE_STEPS_PER_EPOCH = 500
-BEV_JOINT_GATE_EPOCHS = 50
+BEV_JOINT_GATE_EPOCHS = 10
+BEV_JOINT_GATE_STEPS_PER_EPOCH = 500
+BEV_OVERFIT_MIN_OPTIMIZER_STEPS = 5_000
 BEV_OVERFIT_LEARNING_RATE = 3e-4
 
 
@@ -344,6 +346,26 @@ def _reactive_worker_cpus(num_workers: int) -> int:
     return 3 if num_workers in {2, 4} else 4
 
 
+def _reactive_run_name(
+    *,
+    execution_name: str,
+    stage: str,
+    num_workers: int,
+    overfit_sample_count: int,
+    overfit_bev_only: bool,
+) -> str:
+    if overfit_sample_count:
+        mode = "capacity" if overfit_bev_only else "joint"
+        run_suffix = f"{mode}-overfit-{overfit_sample_count}"
+    else:
+        run_suffix = "full"
+    return re.sub(
+        r"[^a-zA-Z0-9_-]",
+        "-",
+        f"{execution_name}-{stage}-ray-{num_workers}-{run_suffix}",
+    )
+
+
 def _run_reactive_stage_task(
     *,
     shards: List[FlyteDirectory],
@@ -389,13 +411,12 @@ def _run_reactive_stage_task(
         if context.execution_id is not None
         else "local"
     )
-    run_name = re.sub(
-        r"[^a-zA-Z0-9_-]",
-        "-",
-        (
-            f"{execution_name}-{stage}-ray-{num_workers}-"
-            f"{'overfit-' + str(overfit_sample_count) if overfit_sample_count else 'full'}"
-        ),
+    run_name = _reactive_run_name(
+        execution_name=execution_name,
+        stage=stage,
+        num_workers=num_workers,
+        overfit_sample_count=overfit_sample_count,
+        overfit_bev_only=overfit_bev_only,
     )
     source_uris = [_flyte_remote_uri(shard) for shard in shards]
     parent_uri = (
@@ -503,6 +524,7 @@ def _validated_bev_overfit_gate_dataset(
 
     integer_contract = {
         "overfit_gate_pass": 1,
+        "overfit_thresholds_pass": 1,
         "world_size": 4,
     }
     for name, expected in integer_contract.items():
@@ -523,6 +545,20 @@ def _validated_bev_overfit_gate_dataset(
         raise ValueError(
             "BEV overfit gate history has invalid overfit_sample_count"
         )
+    executed_optimizer_steps = int(
+        metrics.get("executed_optimizer_steps", -1)
+    )
+    if executed_optimizer_steps < BEV_OVERFIT_MIN_OPTIMIZER_STEPS:
+        raise ValueError(
+            "BEV overfit gate executed fewer than 5000 optimizer steps"
+        )
+    if (
+        int(final_history.get("executed_optimizer_steps", -1))
+        != executed_optimizer_steps
+    ):
+        raise ValueError(
+            "BEV overfit gate history has invalid executed_optimizer_steps"
+        )
 
     objective_contract = {
         "trajectory_weight": expected_trajectory_weight,
@@ -534,11 +570,20 @@ def _validated_bev_overfit_gate_dataset(
         ("final metrics", metrics),
         ("history", final_history),
     ):
-        if evidence.get("overfit_bev_only") is not expected_bev_only:
+        raw_bev_only = evidence.get("overfit_bev_only")
+        if (
+            not isinstance(raw_bev_only, (bool, int))
+            or int(raw_bev_only) not in {0, 1}
+            or bool(raw_bev_only) != expected_bev_only
+        ):
             raise ValueError(
                 f"BEV overfit gate {evidence_name} has wrong mode"
             )
-        if evidence.get("overfit_fixed_lr") is not True:
+        raw_fixed_lr = evidence.get("overfit_fixed_lr")
+        if (
+            not isinstance(raw_fixed_lr, (bool, int))
+            or int(raw_fixed_lr) != 1
+        ):
             raise ValueError(
                 f"BEV overfit gate {evidence_name} did not use fixed LR"
             )
@@ -1169,11 +1214,12 @@ def wf_train_reactive_nuplan_ray_4(
         gate_metadata=capacity_gate.metadata,
         epochs=BEV_JOINT_GATE_EPOCHS,
         learning_rate=BEV_OVERFIT_LEARNING_RATE,
+        weight_decay=0.0,
         val_fraction=val_fraction,
         num_loader_workers=num_loader_workers,
         training_seed=training_seed,
         precision=precision,
-        steps_per_epoch=0,
+        steps_per_epoch=BEV_JOINT_GATE_STEPS_PER_EPOCH,
         shuffle_buffer=256,
         is_pretrained=True,
         trajectory_weight=trajectory_weight,
@@ -1255,11 +1301,12 @@ def wf_train_reactive_nuplan_l2d_ray_8(
         gate_metadata=capacity_gate.metadata,
         epochs=BEV_JOINT_GATE_EPOCHS,
         learning_rate=BEV_OVERFIT_LEARNING_RATE,
+        weight_decay=0.0,
         val_fraction=val_fraction,
         num_loader_workers=num_loader_workers,
         training_seed=training_seed,
         precision=precision,
-        steps_per_epoch=0,
+        steps_per_epoch=BEV_JOINT_GATE_STEPS_PER_EPOCH,
         shuffle_buffer=256,
         is_pretrained=True,
         trajectory_weight=trajectory_weight,
