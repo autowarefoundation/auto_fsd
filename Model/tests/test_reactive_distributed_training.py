@@ -36,6 +36,7 @@ from distributed_training.reactive_data import (
 )
 from distributed_training.reactive_stage import (
     _all_reduce_bev_statistics,
+    _build_reactive_scheduler,
     _checkpoint_history,
     _histogram_average_precision,
     _select_bev_overfit_subset,
@@ -297,6 +298,8 @@ def _stage_config(stage: str) -> dict[str, object]:
         "bev_min_positive_samples": 1,
         "bev_pos_weight_cap": 64.0,
         "bev_repeat_frequency_threshold": 0.05,
+        "bev_weight": 1.0,
+        "corridor_pos_weight": 1.0,
         "epochs": 2,
         "grad_clip": 1.0,
         "gradient_accumulation_steps": 1,
@@ -306,6 +309,8 @@ def _stage_config(stage: str) -> dict[str, object]:
         "num_workers": 8,
         "overfit_min_ap": 0.9,
         "overfit_min_recall": 0.9,
+        "overfit_bev_only": False,
+        "overfit_fixed_lr": False,
         "overfit_sample_count": 0,
         "overfit_shard_limit": 0,
         "parent_checkpoint_uri": (
@@ -315,6 +320,7 @@ def _stage_config(stage: str) -> dict[str, object]:
         ),
         "per_rank_batch_size": 1,
         "precision": "bf16",
+        "route_weight": 1.0,
         "run_name": "reactive-stage-test",
         "selection_ade_regression_margin_m": 0.5,
         "selection_ade_scale_m": 5.0,
@@ -322,6 +328,8 @@ def _stage_config(stage: str) -> dict[str, object]:
         "stage": stage,
         "steps_per_epoch": 0,
         "storage_path": "s3://checkpoints/ray-train",
+        "training_seed": 149,
+        "trajectory_weight": 1.0,
         "val_fraction": 0.1,
         "validation_sample_limit": 1024,
         "weight_decay": 0.01,
@@ -349,6 +357,77 @@ def test_validate_stage_config_rejects_parent_and_batch_contract_changes():
     caller_weighted["bev_pos_weights"] = [1.0] * 8
     with pytest.raises(ValueError, match="derived"):
         validate_reactive_stage_config(caller_weighted)
+
+
+def test_validate_stage_config_accepts_bev_only_capacity_probe():
+    config = _stage_config("nuplan_full")
+    config.update({
+        "epochs": 10,
+        "overfit_bev_only": True,
+        "overfit_fixed_lr": True,
+        "overfit_sample_count": 64,
+        "route_weight": 0.0,
+        "steps_per_epoch": 500,
+        "trajectory_weight": 0.0,
+        "weight_decay": 0.0,
+    })
+
+    validate_reactive_stage_config(config)
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"overfit_fixed_lr": False}, "fixed learning rate"),
+        ({"route_weight": 1.0}, "objective weights"),
+        ({"steps_per_epoch": 499}, "5000"),
+        ({"weight_decay": 0.01}, "weight_decay"),
+    ],
+)
+def test_validate_stage_config_rejects_invalid_bev_only_probe(
+    override,
+    match,
+):
+    config = _stage_config("nuplan_full")
+    config.update({
+        "epochs": 10,
+        "overfit_bev_only": True,
+        "overfit_fixed_lr": True,
+        "overfit_sample_count": 64,
+        "route_weight": 0.0,
+        "steps_per_epoch": 500,
+        "trajectory_weight": 0.0,
+        "weight_decay": 0.0,
+        **override,
+    })
+
+    with pytest.raises(ValueError, match=match):
+        validate_reactive_stage_config(config)
+
+
+def test_fixed_overfit_scheduler_preserves_lr_and_state():
+    torch = pytest.importorskip("torch")
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.AdamW([parameter], lr=3e-4)
+    identity, scheduler = _build_reactive_scheduler(
+        optimizer,
+        fixed_lr=True,
+    )
+
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+
+    restored_optimizer = torch.optim.AdamW([parameter], lr=3e-4)
+    restored_identity, restored_scheduler = _build_reactive_scheduler(
+        restored_optimizer,
+        fixed_lr=True,
+    )
+    restored_scheduler.load_state_dict(scheduler.state_dict())
+
+    assert identity == restored_identity == "constant_v1"
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
+    assert restored_scheduler.state_dict() == scheduler.state_dict()
 
 
 def test_ray_actor_cpu_reservation_matches_worker_config(
