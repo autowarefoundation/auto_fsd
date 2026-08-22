@@ -1025,6 +1025,7 @@ def test_overfit_subset_reports_joint_rank_quota_conflict():
         ValueError,
         match=(
             r"support for class 1: .*"
+            r"available_by_rank=\(8, 0, 0, 0\), .*"
             r"remaining_support_by_rank=\(3, 0, 0, 0\), .*"
             r"remaining_capacity_by_rank=\(0, 16, 16, 16\)"
         ),
