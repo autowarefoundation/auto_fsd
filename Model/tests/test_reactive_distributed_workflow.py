@@ -285,10 +285,13 @@ def test_ray_tasks_serialize_the_resolved_storage_path():
 
 
 def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
-    overfit, stage_a, stage_b = (
+    capacity, joint, stage_a, stage_b = (
         distributed_training.wf_train_reactive_nuplan_l2d_ray_8.nodes
     )
-    assert overfit.flyte_entity.name.endswith(
+    assert capacity.flyte_entity.name.endswith(
+        "train_reactive_stage_ray_4"
+    )
+    assert joint.flyte_entity.name.endswith(
         "train_reactive_stage_ray_4"
     )
     assert stage_a.flyte_entity.name.endswith(
@@ -297,14 +300,43 @@ def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
     assert stage_b.flyte_entity.name.endswith(
         "train_reactive_stage_ray_8"
     )
-    stage_a_bindings = {
+    capacity_bindings = {
         binding.var: binding.binding
-        for binding in stage_a.bindings
+        for binding in capacity.bindings
+    }
+    joint_bindings = {
+        binding.var: binding.binding
+        for binding in joint.bindings
+    }
+    stage_a_bindings = {
+        binding.var: binding.binding for binding in stage_a.bindings
     }
     stage_b_bindings = {
-        binding.var: binding.binding
-        for binding in stage_b.bindings
+        binding.var: binding.binding for binding in stage_b.bindings
     }
+    assert capacity_bindings[
+        "overfit_bev_only"
+    ].scalar.primitive.boolean
+    assert capacity_bindings[
+        "overfit_fixed_lr"
+    ].scalar.primitive.boolean
+    assert (
+        capacity_bindings["trajectory_weight"].scalar.primitive.float_value
+        == 0.0
+    )
+    assert capacity_bindings["bev_weight"].scalar.primitive.float_value == 1.0
+    assert capacity_bindings["route_weight"].scalar.primitive.float_value == 0.0
+    capacity_metadata = joint_bindings["gate_metadata"].promise
+    assert capacity_metadata.node_id == capacity.id
+    assert capacity_metadata.var == "metadata"
+    assert not joint_bindings[
+        "overfit_bev_only"
+    ].scalar.primitive.boolean
+    assert joint_bindings[
+        "overfit_fixed_lr"
+    ].scalar.primitive.boolean
+    for weight in ("trajectory_weight", "bev_weight", "route_weight"):
+        assert joint_bindings[weight].promise.var == weight
     assert stage_a_bindings["stage"].scalar.primitive.string_value == (
         "nuplan_full"
     )
@@ -312,8 +344,14 @@ def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
         "l2d_continuation"
     )
     gate_promise = stage_a_bindings["gate_metadata"].promise
-    assert gate_promise.node_id == overfit.id
+    assert gate_promise.node_id == joint.id
     assert gate_promise.var == "metadata"
+    assert (
+        stage_a_bindings[
+            "parent_checkpoint"
+        ].scalar.union.value.scalar.none_type
+        is not None
+    )
     parent_promise = stage_b_bindings["parent_checkpoint"].promise
     assert parent_promise.node_id == stage_a.id
     assert parent_promise.var == "checkpoint"
@@ -342,27 +380,74 @@ def test_distributed_workflow_source_has_no_deployment_account_id():
         distributed_training.train_reactive_stage_ray_4
         .python_interface.inputs
     )
+    for task in (
+        distributed_training.train_reactive_stage_ray_2,
+        distributed_training.train_reactive_stage_ray_4,
+        distributed_training.train_reactive_stage_ray_8,
+    ):
+        assert {
+            "trajectory_weight",
+            "overfit_bev_only",
+            "overfit_fixed_lr",
+        } <= set(task.python_interface.inputs)
 
 
-def test_four_rank_full_training_depends_on_gate_but_not_its_weights():
-    overfit, full = (
+def test_four_rank_training_requires_capacity_then_joint_gate():
+    capacity, joint, full = (
         distributed_training.wf_train_reactive_nuplan_ray_4.nodes
     )
-    overfit_bindings = {
+    capacity_bindings = {
         binding.var: binding.binding
-        for binding in overfit.bindings
+        for binding in capacity.bindings
+    }
+    joint_bindings = {
+        binding.var: binding.binding
+        for binding in joint.bindings
     }
     full_bindings = {
         binding.var: binding.binding
         for binding in full.bindings
     }
 
+    capacity_values = {
+        "epochs": 10,
+        "overfit_sample_count": 64,
+        "steps_per_epoch": 500,
+    }
+    for name, expected in capacity_values.items():
+        assert capacity_bindings[name].scalar.primitive.integer == expected
+    assert capacity_bindings[
+        "overfit_bev_only"
+    ].scalar.primitive.boolean
+    assert capacity_bindings[
+        "overfit_fixed_lr"
+    ].scalar.primitive.boolean
     assert (
-        overfit_bindings[
-            "overfit_sample_count"
-        ].scalar.primitive.integer
-        == 64
+        capacity_bindings["weight_decay"].scalar.primitive.float_value
+        == 0.0
     )
+    assert (
+        capacity_bindings["trajectory_weight"].scalar.primitive.float_value
+        == 0.0
+    )
+    assert capacity_bindings["bev_weight"].scalar.primitive.float_value == 1.0
+    assert capacity_bindings["route_weight"].scalar.primitive.float_value == 0.0
+
+    capacity_metadata = joint_bindings["gate_metadata"].promise
+    assert capacity_metadata.node_id == capacity.id
+    assert capacity_metadata.var == "metadata"
+    assert joint_bindings[
+        "overfit_sample_count"
+    ].scalar.primitive.integer == 64
+    assert not joint_bindings[
+        "overfit_bev_only"
+    ].scalar.primitive.boolean
+    assert joint_bindings[
+        "overfit_fixed_lr"
+    ].scalar.primitive.boolean
+    for weight in ("trajectory_weight", "bev_weight", "route_weight"):
+        assert joint_bindings[weight].promise.var == weight
+
     assert (
         full_bindings[
             "overfit_sample_count"
@@ -376,8 +461,32 @@ def test_four_rank_full_training_depends_on_gate_but_not_its_weights():
         is not None
     )
     gate_metadata = full_bindings["gate_metadata"].promise
-    assert gate_metadata.node_id == overfit.id
+    assert gate_metadata.node_id == joint.id
     assert gate_metadata.var == "metadata"
+    assert not full_bindings[
+        "overfit_bev_only"
+    ].scalar.primitive.boolean
+    assert not full_bindings[
+        "overfit_fixed_lr"
+    ].scalar.primitive.boolean
+    for weight in ("trajectory_weight", "bev_weight", "route_weight"):
+        assert full_bindings[weight].promise.var == weight
+
+
+def test_standalone_overfit_workflow_is_bev_capacity_probe():
+    node, = distributed_training.wf_overfit_reactive_nuplan_ray_4.nodes
+    bindings = {
+        binding.var: binding.binding for binding in node.bindings
+    }
+
+    assert bindings["epochs"].promise.var == "epochs"
+    assert bindings["steps_per_epoch"].scalar.primitive.integer == 500
+    assert bindings["weight_decay"].scalar.primitive.float_value == 0.0
+    assert bindings["trajectory_weight"].scalar.primitive.float_value == 0.0
+    assert bindings["bev_weight"].scalar.primitive.float_value == 1.0
+    assert bindings["route_weight"].scalar.primitive.float_value == 0.0
+    assert bindings["overfit_bev_only"].scalar.primitive.boolean
+    assert bindings["overfit_fixed_lr"].scalar.primitive.boolean
 
 
 def _bev_overfit_gate_metadata(tmp_path, **overrides):
@@ -493,7 +602,7 @@ def test_bev_overfit_gate_rejects_unit_weights_and_history_tampering(
 
 
 def test_four_rank_full_task_rejects_direct_ungated_call():
-    with pytest.raises(ValueError, match="requires BEV overfit gate"):
+    with pytest.raises(ValueError, match="requires joint gate"):
         distributed_training.train_reactive_stage_ray_4.task_function(
             shards=[],
             stage="nuplan_full",
