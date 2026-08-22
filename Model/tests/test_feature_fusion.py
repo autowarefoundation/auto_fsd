@@ -40,9 +40,21 @@ class TestFeatureFusionComponent:
 
 
 class TestFeatureFusionWithSwinChannels:
-    def test_dynamic_backbone_channels_with_swin_sizes(self, device):
+    def test_dynamic_backbone_channels_with_swin_sizes(
+        self,
+        device,
+        monkeypatch,
+    ):
         """FeatureFusion should accept Swin's per-stage channels (96, 192, 384, 768)
         at their natural spatial resolutions and produce the expected fused shape."""
+        def reject_adaptive_max_pool(*_args, **_kwargs):
+            raise AssertionError("native camera features must not be pooled")
+
+        monkeypatch.setattr(
+            torch.nn.functional,
+            "adaptive_max_pool2d",
+            reject_adaptive_max_pool,
+        )
         backbone_channels = (96, 192, 384, 768)
         fusion = FeatureFusion(
             num_views=8,
