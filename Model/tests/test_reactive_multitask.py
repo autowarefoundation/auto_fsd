@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_ARTIFACT_VERSION,
     BEV_SEGMENTATION_TAXONOMY_VERSION,
     decode_bev_segmentation,
     decode_trajectory_xy,
@@ -35,6 +36,19 @@ from training.reactive_stage_runner import (
     run_reactive_epoch,
     save_reactive_checkpoint,
 )
+
+
+def test_bev_artifact_encoding_does_not_follow_taxonomy_version():
+    assert BEV_SEGMENTATION_ARTIFACT_VERSION == (
+        "bev_segmentation_" + "v2"
+    )
+    assert BEV_SEGMENTATION_TAXONOMY_VERSION == (
+        "bev_segmentation_" + "v3"
+    )
+    assert (
+        BEV_SEGMENTATION_ARTIFACT_VERSION
+        != BEV_SEGMENTATION_TAXONOMY_VERSION
+    )
 
 
 def _inputs(device: torch.device, *, batch_size: int = 2, views: int = 8):
