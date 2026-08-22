@@ -1,4 +1,4 @@
-"""Flyte workflows for immutable nuPlan acquisition and BEV v2 packing."""
+"""Flyte workflows for immutable nuPlan acquisition and BEV v3 packing."""
 
 from __future__ import annotations
 
@@ -591,7 +591,7 @@ def wf_acquire_nuplan_raw_snapshot(
         ephemeral_storage="500Gi",
     ),
     cache=True,
-    cache_version="nuplan-snapshot-pack-v4-parallel",
+    cache_version="nuplan-snapshot-pack-v5-parallel",
     retries=1,
 )
 def pack_nuplan_snapshot_reactive_dataset(
@@ -604,7 +604,7 @@ def pack_nuplan_snapshot_reactive_dataset(
     max_rejection_fraction: float = 0.0,
     aws_region: str = "us-west-2",
 ) -> FlyteDirectory:
-    """Materialize an immutable raw snapshot and emit BEV v2 shards."""
+    """Materialize an immutable raw snapshot and emit BEV v3 shards."""
     import hashlib
     import json
     import tempfile
@@ -736,7 +736,7 @@ def pack_nuplan_snapshot_reactive_dataset(
         packed_counts["bev_statistics_count"]
         != packed_counts["total_samples"]
     ):
-        raise ValueError("nuPlan packer omitted BEV v2 sample statistics")
+        raise ValueError("nuPlan packer omitted BEV v3 sample statistics")
     if (
         packed_counts["bev_segmentation_count"]
         != packed_counts["total_samples"]
@@ -779,7 +779,7 @@ def wf_pack_nuplan_snapshot_reactive_dataset(
     max_rejection_fraction: float = 0.0,
     aws_region: str = "us-west-2",
 ) -> FlyteDirectory:
-    """Build Stage A BEV v2 shards from an immutable raw snapshot."""
+    """Build Stage A BEV v3 shards from an immutable raw snapshot."""
     return pack_nuplan_snapshot_reactive_dataset(
         snapshot_manifest=snapshot_manifest,
         datasets_bucket=datasets_bucket,
