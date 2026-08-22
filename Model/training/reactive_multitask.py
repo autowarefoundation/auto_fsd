@@ -40,7 +40,7 @@ def reactive_model_kwargs(
         raise ValueError("num_views must be positive")
     return {
         "num_views": num_views,
-        "image_feature_size": 32,
+        "image_feature_size": 64,
         "view_fusion_kwargs": (
             AUTOE2E_NAVIGATION_GEOMETRY.camera_bev_kwargs()
         ),
