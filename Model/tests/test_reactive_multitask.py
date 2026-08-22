@@ -14,6 +14,7 @@ from data_processing.reactive_training_artifacts import (
     encode_bev_segmentation,
     encode_trajectory_xy,
 )
+from model_components.auxiliary_heads import BEVSegmentationHead
 from model_components.losses import (
     BEVSegmentationAuxiliaryLoss,
     RouteReconstructionLoss,
@@ -236,6 +237,47 @@ def test_reactive_model_contract_preserves_native_camera_resolution():
     )
 
     assert kwargs["image_feature_size"] == 64
+
+
+def test_bev_head_uses_full_residual_spatial_blocks(device):
+    head = BEVSegmentationHead(
+        embed_dim=16,
+        hidden_channels=8,
+        num_classes=3,
+        num_groups=4,
+    ).to(device)
+    spatial_convolutions = [
+        module
+        for module in head.modules()
+        if (
+            isinstance(module, torch.nn.Conv2d)
+            and module.kernel_size == (3, 3)
+        )
+    ]
+
+    assert len(spatial_convolutions) == 4
+    assert all(module.groups == 1 for module in spatial_convolutions)
+    assert head.decoder[-1].bias is not None
+
+    image_bev = torch.randn(
+        2,
+        16,
+        7,
+        5,
+        device=device,
+        requires_grad=True,
+    )
+    logits = head(image_bev)
+    logits.square().mean().backward()
+
+    assert logits.shape == (2, 3, 7, 5)
+    assert image_bev.grad is not None
+    assert torch.isfinite(image_bev.grad).all()
+    assert all(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        for parameter in head.parameters()
+    )
 
 
 def test_reactive_model_emits_both_auxiliary_heads(
