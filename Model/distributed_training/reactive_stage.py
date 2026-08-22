@@ -18,6 +18,9 @@ from urllib.parse import unquote, urlparse
 
 import numpy as np
 
+from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
+)
 from distributed_training.reactive_data import (
     RestartingIterator,
     assign_reactive_shards,
@@ -1907,7 +1910,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "training_stage": stage.value,
         "bev_pos_weights": list(bev_pos_weights),
         "bev_repeat_factors": list(bev_repeat_factors),
-        "bev_taxonomy_version": "bev_segmentation_v2",
+        "bev_taxonomy_version": BEV_SEGMENTATION_TAXONOMY_VERSION,
         "validation_sample_count": validation_sample_count,
         "validation_sample_uid_sha256": validation_sample_uid_sha256,
     }
@@ -1968,7 +1971,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "overfit_fixed_lr": overfit_fixed_lr,
         "bev_pos_weights": list(bev_pos_weights),
         "bev_repeat_factors": list(bev_repeat_factors),
-        "bev_taxonomy_version": "bev_segmentation_v2",
+        "bev_taxonomy_version": BEV_SEGMENTATION_TAXONOMY_VERSION,
         "validation_sample_count": validation_sample_count,
         "validation_sample_uid_sha256": validation_sample_uid_sha256,
     }
