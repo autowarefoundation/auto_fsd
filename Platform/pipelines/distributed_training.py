@@ -510,6 +510,9 @@ def _validated_bev_overfit_gate_dataset(
     from data_processing.reactive_training_artifacts import (
         BEV_SEGMENTATION_CLASSES,
     )
+    from distributed_training.reactive_stage import (
+        BEV_OVERFIT_MIN_POSITIVE_SAMPLES,
+    )
 
     payload = json.loads(Path(source.download()).read_text())
     metrics = payload.get("metrics")
@@ -606,6 +609,78 @@ def _validated_bev_overfit_gate_dataset(
                 raise ValueError(
                     f"BEV overfit gate {evidence_name} has wrong {name}"
                 )
+        feature_scale_weights = []
+        for index in range(4):
+            weight = float(evidence.get(
+                f"camera_feature_scale_weight_{index}",
+                float("nan"),
+            ))
+            if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} has invalid "
+                    "camera feature scale weights"
+                )
+            feature_scale_weights.append(weight)
+        if not math.isclose(
+            sum(feature_scale_weights),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                f"BEV overfit gate {evidence_name} camera feature "
+                "scale weights do not sum to one"
+            )
+        for rank in range(4):
+            allocated = int(evidence.get(
+                f"peak_cuda_allocated_bytes_rank_{rank}",
+                0,
+            ))
+            reserved = int(evidence.get(
+                f"peak_cuda_reserved_bytes_rank_{rank}",
+                0,
+            ))
+            if allocated <= 0 or reserved < allocated:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} has invalid "
+                    f"CUDA memory evidence for rank {rank}"
+                )
+        for class_name in BEV_SEGMENTATION_CLASSES:
+            support = int(evidence.get(
+                f"overfit_positive_sample_support_{class_name}",
+                0,
+            ))
+            if support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} has insufficient "
+                    f"subset support for {class_name}"
+                )
+        for range_name in ("near", "far"):
+            positive_cells = float(evidence.get(
+                "validation_bev_lane_boundary_"
+                f"{range_name}_positive_cells",
+                float("nan"),
+            ))
+            if not math.isfinite(positive_cells) or positive_cells <= 0.0:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} has no "
+                    f"{range_name} lane positives"
+                )
+            for metric_name in (
+                "average_precision",
+                "precision",
+                "recall",
+            ):
+                value = float(evidence.get(
+                    "validation_bev_lane_boundary_"
+                    f"{range_name}_{metric_name}",
+                    float("nan"),
+                ))
+                if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ValueError(
+                        f"BEV overfit gate {evidence_name} has invalid "
+                        f"{range_name} lane {metric_name}"
+                    )
 
     for name in (
         "checkpoint_sha256",
