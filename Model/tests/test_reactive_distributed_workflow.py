@@ -17,6 +17,14 @@ from flytekit.types.directory import FlyteDirectory
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_CLASSES,
 )
+from distributed_training.reactive_stage import (
+    BEV_LANE_RANGE_METRIC_PREFIX,
+    CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX,
+    MIN_OVERFIT_OPTIMIZER_STEPS,
+    OVERFIT_POSITIVE_SAMPLE_SUPPORT_METRIC_PREFIX,
+    PEAK_CUDA_ALLOCATED_BYTES_METRIC_PREFIX,
+    PEAK_CUDA_RESERVED_BYTES_METRIC_PREFIX,
+)
 from Platform.pipelines import (
     distributed_training,
     nuplan_dataset,
@@ -540,18 +548,22 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
         "world_size": 4,
     }
     metrics.update({
-        f"camera_feature_scale_weight_{index}": 0.25
+        f"{CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX}{index}": 0.25
         for index in range(4)
     })
     for rank in range(4):
-        metrics[f"peak_cuda_allocated_bytes_rank_{rank}"] = 10_000
-        metrics[f"peak_cuda_reserved_bytes_rank_{rank}"] = 20_000
+        metrics[
+            f"{PEAK_CUDA_ALLOCATED_BYTES_METRIC_PREFIX}{rank}"
+        ] = 10_000
+        metrics[
+            f"{PEAK_CUDA_RESERVED_BYTES_METRIC_PREFIX}{rank}"
+        ] = 20_000
     metrics.update({
         f"bev_pos_weight_{index}": float(index + 2)
         for index in range(len(BEV_SEGMENTATION_CLASSES))
     })
     metrics.update({
-        f"overfit_positive_sample_support_{class_name}": 8
+        f"{OVERFIT_POSITIVE_SAMPLE_SUPPORT_METRIC_PREFIX}{class_name}": 8
         for class_name in BEV_SEGMENTATION_CLASSES
     })
     metrics.update({
@@ -564,7 +576,8 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
         )
     })
     metrics.update({
-        f"validation_bev_lane_boundary_{range_name}_{suffix}": value
+        f"validation_{BEV_LANE_RANGE_METRIC_PREFIX}"
+        f"{range_name}_{suffix}": value
         for range_name in ("near", "far")
         for suffix, value in (
             ("average_precision", 0.95),
@@ -608,6 +621,19 @@ def test_bev_overfit_gate_accepts_128_sample_evidence(tmp_path):
     metadata = _bev_overfit_gate_metadata(
         tmp_path,
         overfit_sample_count=128,
+    )
+
+    assert _validate_bev_overfit_gate(metadata) == "b" * 64
+
+
+def test_bev_overfit_gate_accepts_dynamic_camera_feature_stages(tmp_path):
+    five_stage_weights = {
+        f"{CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX}{index}": 0.2
+        for index in range(5)
+    }
+    metadata = _bev_overfit_gate_metadata(
+        tmp_path,
+        **five_stage_weights,
     )
 
     assert _validate_bev_overfit_gate(metadata) == "b" * 64
@@ -715,10 +741,13 @@ def test_bev_overfit_gate_rejects_wrong_mode_and_objective(tmp_path):
 def test_bev_overfit_gate_rejects_incomplete_optimizer_budget(tmp_path):
     metadata = _bev_overfit_gate_metadata(
         tmp_path,
-        executed_optimizer_steps=4999,
+        executed_optimizer_steps=MIN_OVERFIT_OPTIMIZER_STEPS - 1,
     )
 
-    with pytest.raises(ValueError, match="fewer than 5000"):
+    with pytest.raises(
+        ValueError,
+        match=f"fewer than {MIN_OVERFIT_OPTIMIZER_STEPS}",
+    ):
         _validate_bev_overfit_gate(metadata)
 
 
