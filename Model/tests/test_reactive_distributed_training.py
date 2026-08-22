@@ -41,10 +41,12 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from distributed_training.reactive_stage import (
+    BEV_LANE_NEAR_RADIUS_M,
     BEV_OVERFIT_MIN_POSITIVE_SAMPLES,
     MIN_OVERFIT_OPTIMIZER_STEPS,
     ROUTE_VALIDATION_METRICS_VERSION,
     _all_reduce_bev_statistics,
+    _bev_lane_range_masks,
     _bev_overfit_gate_result,
     _build_reactive_scheduler,
     _checkpoint_history,
@@ -1039,6 +1041,26 @@ def test_histogram_average_precision_matches_hand_calculation():
     assert average_precision == pytest.approx(5.0 / 6.0)
 
 
+def test_lane_range_masks_partition_physical_bev():
+    torch = pytest.importorskip("torch")
+    geometry = AUTOE2E_NAVIGATION_GEOMETRY
+
+    masks = _bev_lane_range_masks(
+        geometry.height_px,
+        geometry.width_px,
+        device=torch.device("cpu"),
+    )
+    ego_row = round(geometry.ego_anchor_row)
+    ego_col = round(geometry.ego_anchor_col)
+
+    assert masks.shape == (2, geometry.height_px, geometry.width_px)
+    assert bool(masks[0, ego_row, ego_col])
+    assert not bool(masks[1, ego_row, ego_col])
+    assert not bool((masks[0] & masks[1]).any())
+    assert bool((masks[0] | masks[1]).all())
+    assert BEV_LANE_NEAR_RADIUS_M == pytest.approx(30.0)
+
+
 def test_route_validation_statistics_are_batch_and_mask_independent():
     torch = pytest.importorskip("torch")
     target = torch.zeros(2, 2, 3, 5)
@@ -1292,6 +1314,17 @@ def test_stage_a_validation_skips_disabled_route_decoder(monkeypatch):
 
     assert metrics["route_supported_samples"] == 0.0
     assert metrics["route_destination_localized_samples"] == 0.0
+    for range_name in ("near", "far"):
+        assert (
+            metrics[
+                f"bev_lane_boundary_{range_name}_average_precision"
+            ]
+            == 1.0
+        )
+        assert metrics[
+            f"bev_lane_boundary_{range_name}_precision"
+        ] == 1.0
+        assert metrics[f"bev_lane_boundary_{range_name}_recall"] == 1.0
     assert model.forward_options["return_auxiliary"] is True
     assert model.forward_options["compute_bev_segmentation"] is True
     assert model.forward_options["compute_route_reconstruction"] is False
