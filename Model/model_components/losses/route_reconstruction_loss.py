@@ -25,24 +25,29 @@ def _destination_heatmap_focal(
     logits: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
-    probabilities = logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
+    logits_fp32 = logits.float()
+    target_fp32 = target.float()
+    probabilities = logits_fp32.sigmoid()
     positive = target >= 1.0 - 1e-4
     negative = ~positive
-    negative_weights = (1.0 - target).pow(4)
+    negative_weights = (1.0 - target_fp32).pow(4)
     positive_loss = (
-        -torch.log(probabilities)
+        -F.logsigmoid(logits_fp32)
         * (1.0 - probabilities).pow(2)
         * positive
     ).sum(dim=(1, 2))
     negative_loss = (
-        -torch.log(1.0 - probabilities)
+        -F.logsigmoid(-logits_fp32)
         * probabilities.pow(2)
         * negative_weights
         * negative
     ).sum(dim=(1, 2))
-    positive_count = positive.sum(dim=(1, 2))
-    normalizer = positive_count.clamp_min(1).to(logits.dtype)
-    return (positive_loss + negative_loss) / normalizer
+    positive_count = positive.sum(dim=(1, 2)).clamp_min(1).float()
+    negative_count = negative.sum(dim=(1, 2)).clamp_min(1).float()
+    return (
+        positive_loss / positive_count
+        + negative_loss / negative_count
+    )
 
 
 class RouteReconstructionLoss(nn.Module):
