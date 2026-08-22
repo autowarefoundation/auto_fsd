@@ -37,6 +37,7 @@ from distributed_training.reactive_data import (
 )
 from distributed_training.reactive_stage import (
     MIN_OVERFIT_OPTIMIZER_STEPS,
+    ROUTE_VALIDATION_METRICS_VERSION,
     _all_reduce_bev_statistics,
     _bev_overfit_gate_result,
     _build_reactive_scheduler,
@@ -559,6 +560,7 @@ def test_resume_checkpoint_round_trips_fixed_scheduler(tmp_path):
         "corridor_pos_weight": 1.0,
         "gradient_clip_max_norm": 1.0,
         "gradient_clip_mode": "branch_v1",
+        "route_metrics_version": ROUTE_VALIDATION_METRICS_VERSION,
         "training_seed": 149,
         "scheduler_identity": "constant_v1",
         "overfit_bev_only": True,
@@ -593,6 +595,7 @@ def test_resume_checkpoint_round_trips_fixed_scheduler(tmp_path):
         ("corridor_pos_weight", 2.0),
         ("gradient_clip_max_norm", 0.5),
         ("gradient_clip_mode", "global_v1"),
+        ("route_metrics_version", "route_validation_v2"),
         ("training_seed", 150),
         ("scheduler_identity", "selection_plateau_v1"),
         ("overfit_bev_only", False),
@@ -615,6 +618,7 @@ def test_resume_checkpoint_rejects_objective_mismatch(
         "corridor_pos_weight": 1.0,
         "gradient_clip_max_norm": 1.0,
         "gradient_clip_mode": "branch_v1",
+        "route_metrics_version": ROUTE_VALIDATION_METRICS_VERSION,
         "training_seed": 149,
         "scheduler_identity": "constant_v1",
         "overfit_bev_only": True,
@@ -965,8 +969,9 @@ def test_route_validation_statistics_flags_validity_drift():
     )
 
     assert torch.equal(statistics[:14], torch.zeros(14))
-    assert statistics[14].item() == 1.0
-    assert statistics[15].item() == 0.0
+    assert torch.equal(statistics[14:18], torch.zeros(4))
+    assert statistics[18].item() == 1.0
+    assert statistics[19].item() == 0.0
 
 
 def test_route_validation_statistics_flags_nonfinite_active_values():
@@ -982,8 +987,8 @@ def test_route_validation_statistics_flags_nonfinite_active_values():
         RouteReconstructionLoss(),
     )
 
-    assert statistics[14].item() == 0.0
-    assert statistics[15].item() == 1.0
+    assert torch.equal(statistics[:19], torch.zeros(19))
+    assert statistics[19].item() == 1.0
 
 
 def test_route_validation_statistics_excludes_ambiguous_destination():
@@ -1068,6 +1073,7 @@ def test_stage_b_validation_emits_route_metrics(monkeypatch):
     assert metrics["route_destination_localized_samples"] == 1.0
     assert metrics["route_destination_ambiguous_samples"] == 0.0
     assert metrics["route_destination_logit_range"] == 40.0
+    assert metrics["route_nonfinite_samples"] == 0.0
     assert metrics["selection_score"] == 1.0
     assert "bev_loss" not in metrics
     assert model.forward_options["return_auxiliary"] is True
