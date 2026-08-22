@@ -35,6 +35,7 @@ from training.reactive_multitask import ReactiveTrainingStage
 
 SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
+MIN_OVERFIT_SAMPLE_COUNT = 64
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
 BEV_OVERFIT_MIN_POSITIVE_SAMPLES = 8
 BEV_LANE_NEAR_RADIUS_M = 30.0
@@ -134,9 +135,13 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
     if override < 0:
         raise ValueError("steps_per_epoch cannot be negative")
     overfit_sample_count = int(config.get("overfit_sample_count", 0))
-    if overfit_sample_count not in (0, *range(64, 129)):
+    if overfit_sample_count not in (
+        0,
+        *range(MIN_OVERFIT_SAMPLE_COUNT, 129),
+    ):
         raise ValueError(
-            "overfit_sample_count must be zero or between 64 and 128"
+            "overfit_sample_count must be zero or between "
+            f"{MIN_OVERFIT_SAMPLE_COUNT} and 128"
         )
     if (
         overfit_sample_count
@@ -359,7 +364,7 @@ def _select_bev_overfit_subset(
     sample_count: int,
 ) -> tuple[str, ...]:
     """Choose a deterministic class-balanced subset with exact rank quotas."""
-    if not 64 <= sample_count <= 128:
+    if not MIN_OVERFIT_SAMPLE_COUNT <= sample_count <= 128:
         raise ValueError("BEV overfit subset must contain 64 to 128 samples")
     rank_count = len(rank_summaries)
     if rank_count <= 0 or sample_count % rank_count:
