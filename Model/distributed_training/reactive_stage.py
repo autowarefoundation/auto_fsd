@@ -32,6 +32,7 @@ from training.reactive_multitask import ReactiveTrainingStage
 SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
+ROUTE_DESTINATION_LOGIT_RANGE_EPSILON = 1e-6
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
@@ -890,14 +891,21 @@ def _route_validation_statistics(
 ):
     import torch
 
+    statistics = torch.zeros(
+        16,
+        dtype=torch.float64,
+        device=route_logits.device,
+    )
     if route_logits.ndim != 4 or route_logits.shape[1] != 2:
-        raise ValueError("route logits must have shape [B,2,H,W]")
-    if route_target.shape != route_logits.shape:
-        raise ValueError("route validation target shape differs")
-    if route_channel_valid.shape != route_logits.shape[:2]:
-        raise ValueError("route channel validity shape differs")
-    if route_valid.shape != route_logits.shape[:1]:
-        raise ValueError("route sample validity shape differs")
+        statistics[14] = 1.0
+        return statistics
+    if (
+        route_target.shape != route_logits.shape
+        or route_channel_valid.shape != route_logits.shape[:2]
+        or route_valid.shape != route_logits.shape[:1]
+    ):
+        statistics[14] = 1.0
+        return statistics
 
     logits = route_logits.to(dtype=torch.float32)
     target = route_target.to(
@@ -914,16 +922,14 @@ def _route_validation_statistics(
     )
     active_samples = channel_valid.any(dim=1)
     if not torch.equal(active_samples, sample_valid):
-        raise ValueError(
-            "route_valid must equal route_channel_valid.any(dim=1)"
-        )
+        statistics[14] = 1.0
+        return statistics
     if (
         not torch.isfinite(logits[channel_valid]).all()
         or not torch.isfinite(target[channel_valid]).all()
     ):
-        raise FloatingPointError(
-            "route validation contains non-finite active values"
-        )
+        statistics[15] = 1.0
+        return statistics
 
     zero = logits.new_zeros(())
     route_loss_sum = zero
@@ -952,6 +958,9 @@ def _route_validation_statistics(
     destination_valid = channel_valid[:, 1]
     destination_count = destination_valid.sum()
     destination_error_sum = zero
+    destination_localized_count = zero
+    destination_logit_range_sum = zero
+    destination_ambiguous_count = zero
     if bool(destination_valid.any()):
         destination_focal_sum = (
             components["destination_focal"] * destination_count
@@ -959,32 +968,50 @@ def _route_validation_statistics(
         destination_logits = logits[destination_valid, 1]
         destination_target = target[destination_valid, 1]
         _, _, width = destination_logits.shape
-        predicted_index = destination_logits.flatten(1).argmax(dim=1)
-        target_index = destination_target.flatten(1).argmax(dim=1)
-        predicted_cells = torch.stack(
-            (
-                torch.div(
-                    predicted_index,
-                    width,
-                    rounding_mode="floor",
+        flattened_logits = destination_logits.flatten(1)
+        logit_range = (
+            flattened_logits.max(dim=1).values
+            - flattened_logits.min(dim=1).values
+        )
+        localized = (
+            logit_range > ROUTE_DESTINATION_LOGIT_RANGE_EPSILON
+        )
+        destination_localized_count = localized.sum()
+        destination_logit_range_sum = logit_range.sum()
+        destination_ambiguous_count = (~localized).sum()
+        if bool(localized.any()):
+            predicted_index = flattened_logits[localized].argmax(dim=1)
+            target_index = destination_target[
+                localized
+            ].flatten(1).argmax(dim=1)
+            predicted_cells = torch.stack(
+                (
+                    torch.div(
+                        predicted_index,
+                        width,
+                        rounding_mode="floor",
+                    ),
+                    predicted_index.remainder(width),
                 ),
-                predicted_index.remainder(width),
-            ),
-            dim=1,
-        ).to(torch.float64)
-        target_cells = torch.stack(
-            (
-                torch.div(target_index, width, rounding_mode="floor"),
-                target_index.remainder(width),
-            ),
-            dim=1,
-        ).to(torch.float64)
-        destination_error_sum = torch.linalg.vector_norm(
-            predicted_cells - target_cells,
-            dim=1,
-        ).sum()
+                dim=1,
+            ).to(torch.float64)
+            target_cells = torch.stack(
+                (
+                    torch.div(
+                        target_index,
+                        width,
+                        rounding_mode="floor",
+                    ),
+                    target_index.remainder(width),
+                ),
+                dim=1,
+            ).to(torch.float64)
+            destination_error_sum = torch.linalg.vector_norm(
+                predicted_cells - target_cells,
+                dim=1,
+            ).sum()
 
-    statistics = torch.stack([
+    statistics[:14] = torch.stack([
         route_loss_sum,
         active_count,
         corridor_bce_sum,
@@ -996,11 +1023,13 @@ def _route_validation_statistics(
         destination_focal_sum,
         destination_error_sum,
         destination_count,
+        destination_localized_count,
+        destination_logit_range_sum,
+        destination_ambiguous_count,
     ]).to(dtype=torch.float64)
     if not torch.isfinite(statistics).all():
-        raise FloatingPointError(
-            "route validation produced non-finite statistics"
-        )
+        statistics.zero_()
+        statistics[15] = 1.0
     return statistics
 
 
@@ -1047,7 +1076,7 @@ def _evaluate_global_reactive(
     bev_bce_sum = 0.0
     bev_dice_sum = 0.0
     bev_loss_batches = 0
-    route_values = torch.zeros(11, dtype=torch.float64, device=device)
+    route_values = torch.zeros(16, dtype=torch.float64, device=device)
     try:
         with torch.no_grad():
             for item in loader:
@@ -1074,11 +1103,16 @@ def _evaluate_global_reactive(
                     projection=projection,
                     geometry_type=geometry_type,
                     mode="infer",
-                    return_auxiliary=True,
+                    return_auxiliary=(
+                        stage is ReactiveTrainingStage.NUPLAN_FULL
+                        or objective.compute_route_reconstruction
+                    ),
                     compute_bev_segmentation=(
                         stage is ReactiveTrainingStage.NUPLAN_FULL
                     ),
-                    compute_route_reconstruction=True,
+                    compute_route_reconstruction=(
+                        objective.compute_route_reconstruction
+                    ),
                 )
                 if isinstance(output, tuple):
                     controls, auxiliary = output
@@ -1109,21 +1143,22 @@ def _evaluate_global_reactive(
                     raise ValueError(
                         "trajectory target shape differs from rollout"
                     )
-                route_logits = auxiliary.get(
-                    "route_reconstruction_logits"
-                )
-                if not torch.is_tensor(route_logits):
-                    raise RuntimeError(
-                        "Reactive validation omitted route logits"
+                if objective.compute_route_reconstruction:
+                    route_logits = auxiliary.get(
+                        "route_reconstruction_logits"
                     )
-                # Route supervision is independent of trajectory completeness.
-                route_values += _route_validation_statistics(
-                    route_logits,
-                    batch["route_mask"],
-                    batch["route_channel_valid"],
-                    batch["route_valid"],
-                    objective.route_loss,
-                )
+                    if not torch.is_tensor(route_logits):
+                        raise RuntimeError(
+                            "Reactive validation omitted route logits"
+                        )
+                    # Route supervision is independent of trajectory completeness.
+                    route_values += _route_validation_statistics(
+                        route_logits,
+                        batch["route_mask"],
+                        batch["route_channel_valid"],
+                        batch["route_valid"],
+                        objective.route_loss,
+                    )
                 complete = valid.all(dim=1)
                 if not bool(complete.any()):
                     continue
@@ -1243,6 +1278,14 @@ def _evaluate_global_reactive(
         device=device,
     )
     dist.all_reduce(bev_loss_values, op=dist.ReduceOp.SUM)
+    if float(route_values[14].item()) > 0.0:
+        raise ValueError(
+            "Reactive distributed validation has invalid route contracts"
+        )
+    if float(route_values[15].item()) > 0.0:
+        raise FloatingPointError(
+            "Reactive distributed validation has non-finite route values"
+        )
     global_count = int(values[2].item())
     if global_count <= 0:
         raise ValueError(
@@ -1269,6 +1312,11 @@ def _evaluate_global_reactive(
         destination_focal_sum,
         destination_error_sum,
         destination_supported,
+        destination_localized,
+        destination_logit_range_sum,
+        destination_ambiguous,
+        _,
+        _,
     ) = (float(value) for value in route_values.tolist())
     metrics.update({
         "route_loss": _metric_ratio(
@@ -1308,9 +1356,15 @@ def _evaluate_global_reactive(
         ),
         "route_destination_error_cells": _metric_ratio(
             destination_error_sum,
+            destination_localized,
+        ),
+        "route_destination_logit_range": _metric_ratio(
+            destination_logit_range_sum,
             destination_supported,
         ),
         "route_destination_supported_samples": destination_supported,
+        "route_destination_localized_samples": destination_localized,
+        "route_destination_ambiguous_samples": destination_ambiguous,
     })
     if stage is not ReactiveTrainingStage.NUPLAN_FULL:
         metrics["selection_score"] = trajectory_quality
