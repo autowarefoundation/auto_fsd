@@ -575,8 +575,9 @@ def test_nuplan_snapshot_pack_uses_bev_v2_cache_and_full_default():
         "pack_nuplan_snapshot_reactive_dataset"
     )
     assert node.flyte_entity.metadata.cache_version == (
-        "nuplan-snapshot-pack-v2"
+        "nuplan-snapshot-pack-v4-parallel"
     )
+    assert node.flyte_entity.metadata.retries == 1
     assert (
         bindings["limit_total_scenarios"].promise.var
         == "limit_total_scenarios"
@@ -588,6 +589,12 @@ def test_nuplan_snapshot_pack_uses_bev_v2_cache_and_full_default():
     assert 'LIMIT_TOTAL_SCENARIOS: "0"' in buildspec
     assert "Platform.pipelines.nuplan_dataset." in buildspec
     assert re.search(r"\b[0-9]{12}\b", buildspec) is None
+
+
+def test_nuplan_pack_worker_count_caps_full_and_serializes_limited():
+    assert nuplan_dataset._nuplan_pack_worker_count(2, 0) == 2
+    assert nuplan_dataset._nuplan_pack_worker_count(20, 0) == 8
+    assert nuplan_dataset._nuplan_pack_worker_count(20, 64) == 1
 
 
 def test_two_rank_canary_wires_both_stages_and_gate():
