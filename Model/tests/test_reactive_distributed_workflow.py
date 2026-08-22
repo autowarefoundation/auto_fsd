@@ -49,7 +49,13 @@ def test_distributed_workflow_import_is_path_order_independent():
             sys.executable,
             "-c",
             (
+                "import sys; "
+                "import reactive_training_contracts as contracts; "
+                "assert 'torch' not in sys.modules; "
+                "assert 'numpy' not in sys.modules; "
                 "import distributed_training as module; "
+                "assert module.BEV_OVERFIT_SAMPLE_COUNT == "
+                "contracts.MIN_OVERFIT_SAMPLE_COUNT; "
                 "print(module.BEV_OVERFIT_SAMPLE_COUNT)"
             ),
         ],
