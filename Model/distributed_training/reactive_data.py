@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
+)
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
 from training.dataset_policy import (
     L2D_DATASET_NAME,
@@ -181,9 +184,12 @@ def _validate_reactive_manifest(
     if int(manifest.get("num_views", 0)) <= 0:
         raise ValueError("Reactive DDP manifest has no camera views")
     if stage is ReactiveTrainingStage.NUPLAN_FULL:
-        if manifest.get("bev_taxonomy_version") != "bev_segmentation_v2":
+        if (
+            manifest.get("bev_taxonomy_version")
+            != BEV_SEGMENTATION_TAXONOMY_VERSION
+        ):
             raise ValueError(
-                "Stage A requires the corrected BEV v2 taxonomy"
+                "Stage A requires the current BEV taxonomy"
             )
         if int(manifest.get("bev_statistics_count", 0)) != int(
             manifest.get("total_samples", 0)
