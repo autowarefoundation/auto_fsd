@@ -474,6 +474,46 @@ def _select_bev_overfit_subset(
     return tuple(sorted(selected))
 
 
+def _bev_overfit_selected_support(
+    rank_summaries,
+    sample_uids,
+) -> tuple[int, ...]:
+    selected = set(sample_uids)
+    found: set[str] = set()
+    support = [0] * 8
+    for summaries in rank_summaries:
+        for sample_uid, positive_cell_count in summaries:
+            if sample_uid not in selected:
+                continue
+            found.add(sample_uid)
+            if len(positive_cell_count) != len(support):
+                raise ValueError("BEV overfit summary has invalid class count")
+            for class_index, cell_count in enumerate(positive_cell_count):
+                support[class_index] += int(cell_count > 0)
+    if found != selected:
+        raise ValueError("BEV overfit support omitted selected samples")
+    return tuple(support)
+
+
+def _camera_feature_scale_weights(model) -> tuple[float, ...]:
+    import torch
+
+    try:
+        scale_logits = _base_model(
+            model
+        ).Reactive_E2E.FeatureFusion.scale_logits
+    except AttributeError as error:
+        raise ValueError(
+            "Reactive model omitted camera feature scale logits"
+        ) from error
+    if scale_logits.ndim != 1 or scale_logits.numel() == 0:
+        raise ValueError("camera feature scale logits have invalid shape")
+    weights = scale_logits.detach().float().softmax(dim=0)
+    if not bool(torch.isfinite(weights).all()):
+        raise FloatingPointError("camera feature scale weights are non-finite")
+    return tuple(float(value) for value in weights.cpu().tolist())
+
+
 def _parameter_sample(model, *, sample_size: int = 2048):
     import torch
 
@@ -1809,6 +1849,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         summarize_bev_positive_samples,
         summarize_bev_training_statistics,
     )
+    from data_processing.reactive_training_artifacts import (
+        BEV_SEGMENTATION_CLASSES,
+    )
     from model_components.auto_e2e import AutoE2E
     from training.reactive_multitask import (
         ReactiveMultitaskObjective,
@@ -1882,6 +1925,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         else None
     )
     overfit_sample_uids: tuple[str, ...] | None = None
+    overfit_positive_sample_support: tuple[int, ...] | None = None
     overfit_sample_uid_sha256 = ""
     if overfit_sample_count:
         assert local_bev_records is not None
@@ -1894,6 +1938,12 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         overfit_sample_uids = _select_bev_overfit_subset(
             rank_summaries,
             sample_count=overfit_sample_count,
+        )
+        overfit_positive_sample_support = (
+            _bev_overfit_selected_support(
+                rank_summaries,
+                overfit_sample_uids,
+            )
         )
         overfit_sample_uid_sha256 = hashlib.sha256(
             "\n".join(overfit_sample_uids).encode("utf-8")
@@ -2178,8 +2228,12 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             effective_bev_statistics.metadata()
         )
     if overfit_sample_uids is not None:
+        assert overfit_positive_sample_support is not None
         model_config["bev_overfit_sample_count"] = len(
             overfit_sample_uids
+        )
+        model_config["bev_overfit_positive_sample_support"] = list(
+            overfit_positive_sample_support
         )
         model_config["bev_overfit_sample_uid_sha256"] = (
             overfit_sample_uid_sha256
@@ -2190,6 +2244,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
     started = time.perf_counter()
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
         _seed_epoch(seed, rank, epoch)
+        torch.cuda.reset_peak_memory_stats(device)
         train_loader = make_multi_dataset_loader(
             local_directories,
             batch_size=int(config["per_rank_batch_size"]),
@@ -2288,6 +2343,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "Reactive DDP replicas diverged: "
                 f"maximum_parameter_delta={maximum_delta}"
             )
+        feature_scale_weights = _camera_feature_scale_weights(model)
         rank_evidence: list[dict[str, Any] | None] = [
             None
         ] * world_size
@@ -2301,6 +2357,12 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "hostname": socket.gethostname(),
                 "loader_restarts": int(
                     train_metrics["local_loader_restarts"]
+                ),
+                "peak_cuda_allocated_bytes": int(
+                    torch.cuda.max_memory_allocated(device)
+                ),
+                "peak_cuda_reserved_bytes": int(
+                    torch.cuda.max_memory_reserved(device)
                 ),
                 "rank": rank,
                 "shards": [shard.identity for shard in rank_shards],
@@ -2327,7 +2389,31 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         if is_best:
             best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
+        diagnostic_metrics: dict[str, float | int] = {
+            f"camera_feature_scale_weight_{index}": weight
+            for index, weight in enumerate(feature_scale_weights)
+        }
+        if overfit_positive_sample_support is not None:
+            for class_name, support in zip(
+                BEV_SEGMENTATION_CLASSES,
+                overfit_positive_sample_support,
+            ):
+                diagnostic_metrics[
+                    f"overfit_positive_sample_support_{class_name}"
+                ] = support
+        for evidence in rank_evidence:
+            if not isinstance(evidence, Mapping):
+                raise RuntimeError("Reactive rank evidence is incomplete")
+            evidence_rank = int(evidence["rank"])
+            for memory_name in (
+                "peak_cuda_allocated_bytes",
+                "peak_cuda_reserved_bytes",
+            ):
+                diagnostic_metrics[
+                    f"{memory_name}_rank_{evidence_rank}"
+                ] = int(evidence[memory_name])
         checkpoint_metrics: dict[str, Any] = dict(validation)
+        checkpoint_metrics.update(diagnostic_metrics)
         checkpoint_metrics["executed_optimizer_steps"] = (
             executed_optimizer_steps
         )
@@ -2385,6 +2471,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             checkpoint_digest: list[str | None] = [checkpoint_sha256]
             dist.broadcast_object_list(checkpoint_digest, src=0)
             metrics = {
+                **diagnostic_metrics,
                 "checkpoint_sha256": str(checkpoint_digest[0]),
                 "checkpoint_selection_score": (
                     checkpoint_selection_score
