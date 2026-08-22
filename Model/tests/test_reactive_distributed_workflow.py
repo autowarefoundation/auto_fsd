@@ -69,7 +69,7 @@ def test_distributed_workflow_import_is_path_order_independent():
     assert result.stdout.strip() == "64"
 
 
-def test_reactive_pack_cache_tracks_bev_v3_contract():
+def test_shared_pack_cache_is_unchanged_by_bev_v3_taxonomy():
     assert workflows.PACK_CACHE_VERSION == "pack-v3-v1-v9-v4"
 
 
