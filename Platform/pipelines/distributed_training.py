@@ -60,7 +60,6 @@ BEV_CAPACITY_GATE_EPOCHS = 10
 BEV_CAPACITY_GATE_STEPS_PER_EPOCH = 500
 BEV_JOINT_GATE_EPOCHS = 10
 BEV_JOINT_GATE_STEPS_PER_EPOCH = 500
-BEV_OVERFIT_MIN_OPTIMIZER_STEPS = 5_000
 BEV_OVERFIT_LEARNING_RATE = 3e-4
 
 
@@ -511,7 +510,13 @@ def _validated_bev_overfit_gate_dataset(
         BEV_SEGMENTATION_CLASSES,
     )
     from distributed_training.reactive_stage import (
+        BEV_LANE_RANGE_METRIC_PREFIX,
         BEV_OVERFIT_MIN_POSITIVE_SAMPLES,
+        CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX,
+        MIN_OVERFIT_OPTIMIZER_STEPS,
+        OVERFIT_POSITIVE_SAMPLE_SUPPORT_METRIC_PREFIX,
+        PEAK_CUDA_ALLOCATED_BYTES_METRIC_PREFIX,
+        PEAK_CUDA_RESERVED_BYTES_METRIC_PREFIX,
     )
 
     payload = json.loads(Path(source.download()).read_text())
@@ -551,9 +556,10 @@ def _validated_bev_overfit_gate_dataset(
     executed_optimizer_steps = int(
         metrics.get("executed_optimizer_steps", -1)
     )
-    if executed_optimizer_steps < BEV_OVERFIT_MIN_OPTIMIZER_STEPS:
+    if executed_optimizer_steps < MIN_OVERFIT_OPTIMIZER_STEPS:
         raise ValueError(
-            "BEV overfit gate executed fewer than 5000 optimizer steps"
+            "BEV overfit gate executed fewer than "
+            f"{MIN_OVERFIT_OPTIMIZER_STEPS} optimizer steps"
         )
     if (
         int(final_history.get("executed_optimizer_steps", -1))
@@ -609,12 +615,29 @@ def _validated_bev_overfit_gate_dataset(
                 raise ValueError(
                     f"BEV overfit gate {evidence_name} has wrong {name}"
                 )
+        scale_pattern = re.compile(
+            re.escape(CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX)
+            + r"(\d+)"
+        )
+        scale_entries = sorted(
+            (
+                int(match.group(1)),
+                float(value),
+            )
+            for name, value in evidence.items()
+            if (match := scale_pattern.fullmatch(name)) is not None
+        )
+        if (
+            len(scale_entries) < 2
+            or [index for index, _ in scale_entries]
+            != list(range(len(scale_entries)))
+        ):
+            raise ValueError(
+                f"BEV overfit gate {evidence_name} has incomplete "
+                "camera feature scale weights"
+            )
         feature_scale_weights = []
-        for index in range(4):
-            weight = float(evidence.get(
-                f"camera_feature_scale_weight_{index}",
-                float("nan"),
-            ))
+        for _, weight in scale_entries:
             if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
                 raise ValueError(
                     f"BEV overfit gate {evidence_name} has invalid "
@@ -631,13 +654,14 @@ def _validated_bev_overfit_gate_dataset(
                 f"BEV overfit gate {evidence_name} camera feature "
                 "scale weights do not sum to one"
             )
-        for rank in range(4):
+        evidence_world_size = int(evidence["world_size"])
+        for rank in range(evidence_world_size):
             allocated = int(evidence.get(
-                f"peak_cuda_allocated_bytes_rank_{rank}",
+                f"{PEAK_CUDA_ALLOCATED_BYTES_METRIC_PREFIX}{rank}",
                 0,
             ))
             reserved = int(evidence.get(
-                f"peak_cuda_reserved_bytes_rank_{rank}",
+                f"{PEAK_CUDA_RESERVED_BYTES_METRIC_PREFIX}{rank}",
                 0,
             ))
             if allocated <= 0 or reserved < allocated:
@@ -647,7 +671,8 @@ def _validated_bev_overfit_gate_dataset(
                 )
         for class_name in BEV_SEGMENTATION_CLASSES:
             support = int(evidence.get(
-                f"overfit_positive_sample_support_{class_name}",
+                f"{OVERFIT_POSITIVE_SAMPLE_SUPPORT_METRIC_PREFIX}"
+                f"{class_name}",
                 0,
             ))
             if support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES:
@@ -657,7 +682,7 @@ def _validated_bev_overfit_gate_dataset(
                 )
         for range_name in ("near", "far"):
             positive_cells = float(evidence.get(
-                "validation_bev_lane_boundary_"
+                f"validation_{BEV_LANE_RANGE_METRIC_PREFIX}"
                 f"{range_name}_positive_cells",
                 float("nan"),
             ))
@@ -672,7 +697,7 @@ def _validated_bev_overfit_gate_dataset(
                 "recall",
             ):
                 value = float(evidence.get(
-                    "validation_bev_lane_boundary_"
+                    f"validation_{BEV_LANE_RANGE_METRIC_PREFIX}"
                     f"{range_name}_{metric_name}",
                     float("nan"),
                 ))
