@@ -540,8 +540,19 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
         "world_size": 4,
     }
     metrics.update({
+        f"camera_feature_scale_weight_{index}": 0.25
+        for index in range(4)
+    })
+    for rank in range(4):
+        metrics[f"peak_cuda_allocated_bytes_rank_{rank}"] = 10_000
+        metrics[f"peak_cuda_reserved_bytes_rank_{rank}"] = 20_000
+    metrics.update({
         f"bev_pos_weight_{index}": float(index + 2)
         for index in range(len(BEV_SEGMENTATION_CLASSES))
+    })
+    metrics.update({
+        f"overfit_positive_sample_support_{class_name}": 8
+        for class_name in BEV_SEGMENTATION_CLASSES
     })
     metrics.update({
         f"validation_bev_{class_name}_{suffix}": value
@@ -549,6 +560,16 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
         for suffix, value in (
             ("average_precision", 0.95),
             ("positive_cells", 10.0),
+            ("recall", 0.95),
+        )
+    })
+    metrics.update({
+        f"validation_bev_lane_boundary_{range_name}_{suffix}": value
+        for range_name in ("near", "far")
+        for suffix, value in (
+            ("average_precision", 0.95),
+            ("positive_cells", 10.0),
+            ("precision", 0.95),
             ("recall", 0.95),
         )
     })
@@ -613,6 +634,46 @@ def test_bev_overfit_gate_accepts_128_sample_evidence(tmp_path):
     ],
 )
 def test_bev_overfit_gate_rejects_weak_evidence(
+    tmp_path,
+    override_name,
+    override_value,
+    match,
+):
+    metadata = _bev_overfit_gate_metadata(
+        tmp_path,
+        **{override_name: override_value},
+    )
+
+    with pytest.raises(ValueError, match=match):
+        _validate_bev_overfit_gate(metadata)
+
+
+@pytest.mark.parametrize(
+    ("override_name", "override_value", "match"),
+    [
+        (
+            "overfit_positive_sample_support_vehicle",
+            7,
+            "subset support",
+        ),
+        (
+            "camera_feature_scale_weight_0",
+            0.5,
+            "do not sum to one",
+        ),
+        (
+            "peak_cuda_allocated_bytes_rank_2",
+            0,
+            "CUDA memory evidence",
+        ),
+        (
+            "validation_bev_lane_boundary_far_positive_cells",
+            0.0,
+            "far lane positives",
+        ),
+    ],
+)
+def test_bev_overfit_gate_rejects_missing_diagnostics(
     tmp_path,
     override_name,
     override_value,
