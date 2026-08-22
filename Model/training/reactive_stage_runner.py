@@ -212,25 +212,26 @@ def load_stage_a_parent(
         raise ValueError(
             f"Stage A parent checkpoint contract differs: {mismatches}"
         )
-    objective_values = {
-        name: config.get(name)
-        for name in (
-            "trajectory_weight",
-            "bev_weight",
-            "route_weight",
-            "corridor_pos_weight",
-        )
-    }
+    objective_names = (
+        "trajectory_weight",
+        "bev_weight",
+        "route_weight",
+        "corridor_pos_weight",
+    )
+    objective_values: dict[str, float] = {}
+    for name in objective_names:
+        value = config.get(name)
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                "Stage A parent checkpoint lacks valid objective provenance"
+            )
+        objective_values[name] = float(value)
     if (
-        any(
-            not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            for value in objective_values.values()
-        )
-        or float(objective_values["trajectory_weight"]) <= 0.0
-        or float(objective_values["bev_weight"]) <= 0.0
-        or float(objective_values["route_weight"]) < 0.0
-        or float(objective_values["corridor_pos_weight"]) < 1.0
+        any(not math.isfinite(value) for value in objective_values.values())
+        or objective_values["trajectory_weight"] <= 0.0
+        or objective_values["bev_weight"] <= 0.0
+        or objective_values["route_weight"] < 0.0
+        or objective_values["corridor_pos_weight"] < 1.0
         or not isinstance(config.get("training_seed"), int)
         or config.get("scheduler_identity")
         not in {"constant_v1", "selection_plateau_v1"}
