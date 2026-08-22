@@ -14,6 +14,7 @@ import torch
 
 from data_processing.reactive_training_artifacts import (
     BEV_SEGMENTATION_CLASSES,
+    BEV_SEGMENTATION_TAXONOMY_VERSION,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
 from training.reactive_multitask import (
@@ -201,7 +202,7 @@ def load_stage_a_parent(
         "enable_world_model": False,
         "enable_reasoning": False,
         "planner_mode": "gru",
-        "bev_taxonomy_version": "bev_segmentation_v2",
+        "bev_taxonomy_version": BEV_SEGMENTATION_TAXONOMY_VERSION,
     }
     mismatches = {
         key: (config.get(key), expected)
