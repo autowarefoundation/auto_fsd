@@ -30,7 +30,7 @@ from distributed_training.reactive_data import (
     stage_rank_reactive_shards,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
-from training.reactive_contracts import (
+from reactive_training_contracts import (
     MAX_OVERFIT_SAMPLE_COUNT,
     MIN_OVERFIT_SAMPLE_COUNT,
 )
