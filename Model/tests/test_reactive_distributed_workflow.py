@@ -63,6 +63,10 @@ def test_distributed_workflow_import_is_path_order_independent():
     assert result.stdout.strip() == "64"
 
 
+def test_reactive_pack_cache_tracks_bev_v3_contract():
+    assert workflows.PACK_CACHE_VERSION == "pack-v3-v1-v9-v4"
+
+
 def test_flyte_entrypoints_do_not_use_mutable_defaults():
     pipelines_root = Path(workflows.__file__).parent
     mutable_defaults = []
