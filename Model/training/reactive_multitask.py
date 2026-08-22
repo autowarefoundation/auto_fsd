@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -87,14 +88,31 @@ class ReactiveMultitaskObjective(nn.Module):
         stage: ReactiveTrainingStage,
         *,
         bev_pos_weight: Sequence[float] | torch.Tensor,
+        trajectory_weight: float = 1.0,
         bev_weight: float = 1.0,
         route_weight: float = 1.0,
         corridor_pos_weight: float = 1.0,
     ) -> None:
         super().__init__()
-        if bev_weight < 0.0 or route_weight < 0.0:
-            raise ValueError("auxiliary loss weights must be non-negative")
+        task_weights = {
+            "trajectory_weight": trajectory_weight,
+            "bev_weight": bev_weight,
+            "route_weight": route_weight,
+        }
+        for name, value in task_weights.items():
+            if not math.isfinite(value) or not 0.0 <= value <= 1_000.0:
+                raise ValueError(
+                    f"{name} must be finite and between zero and 1000"
+                )
+        if (
+            not math.isfinite(corridor_pos_weight)
+            or not 1.0 <= corridor_pos_weight <= 1_000.0
+        ):
+            raise ValueError(
+                "corridor_pos_weight must be finite and between one and 1000"
+            )
         self.stage = stage
+        self.trajectory_weight = float(trajectory_weight)
         self.bev_weight = float(bev_weight)
         self.route_weight = float(route_weight)
         self.trajectory_loss = TrajectoryXYImitationLoss()
@@ -109,7 +127,11 @@ class ReactiveMultitaskObjective(nn.Module):
 
     @property
     def compute_bev_segmentation(self) -> bool:
-        return self.bev_loss is not None
+        return self.bev_loss is not None and self.bev_weight > 0.0
+
+    @property
+    def compute_route_reconstruction(self) -> bool:
+        return self.route_weight > 0.0
 
     def forward(
         self,
@@ -117,22 +139,27 @@ class ReactiveMultitaskObjective(nn.Module):
         auxiliary: Mapping[str, Any],
         batch: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        trajectory = self.trajectory_loss(
-            predicted_controls,
-            batch["trajectory_xy_m"],
-            batch["trajectory_valid"],
-            batch["initial_speed_mps"],
-        )
-        route_logits = auxiliary.get("route_reconstruction_logits")
-        if not torch.is_tensor(route_logits):
-            raise ValueError(
-                "route reconstruction logits are required for both stages"
+        zero = predicted_controls.sum() * 0.0
+        trajectory = zero
+        if self.trajectory_weight > 0.0:
+            trajectory = self.trajectory_loss(
+                predicted_controls,
+                batch["trajectory_xy_m"],
+                batch["trajectory_valid"],
+                batch["initial_speed_mps"],
             )
-        route = self.route_loss(
-            route_logits,
-            batch["route_mask"].detach(),
-            batch["route_channel_valid"],
-        )
+        route = zero
+        if self.compute_route_reconstruction:
+            route_logits = auxiliary.get("route_reconstruction_logits")
+            if not torch.is_tensor(route_logits):
+                raise ValueError(
+                    "route reconstruction logits are required when enabled"
+                )
+            route = self.route_loss(
+                route_logits,
+                batch["route_mask"].detach(),
+                batch["route_channel_valid"],
+            )
         importance = batch.get("bev_sampling_importance")
         if importance is not None:
             importance = torch.as_tensor(
@@ -159,11 +186,10 @@ class ReactiveMultitaskObjective(nn.Module):
             non_bev_importance = importance.mean()
             trajectory = trajectory * non_bev_importance
             route = route * non_bev_importance
-        zero = predicted_controls.sum() * 0.0
         bev = zero
         bev_bce = zero
         bev_dice = zero
-        if self.bev_loss is not None:
+        if self.compute_bev_segmentation:
             available = batch["bev_segmentation_available"].to(
                 dtype=torch.bool
             )
@@ -185,7 +211,7 @@ class ReactiveMultitaskObjective(nn.Module):
             bev_bce = bev_components["bce"]
             bev_dice = bev_components["dice"]
         total = (
-            trajectory
+            self.trajectory_weight * trajectory
             + self.bev_weight * bev
             + self.route_weight * route
         )
