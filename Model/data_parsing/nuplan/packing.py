@@ -6,10 +6,14 @@ import dataclasses
 import hashlib
 import io
 import math
+import multiprocessing
+import os
 import pickle
+import shutil
 import sqlite3
 import tarfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +45,27 @@ NUPLAN_CAMERA_CHANNELS = (
 )
 NUPLAN_RECTIFICATION_POLICY_VERSION = "nuplan_rectified_pinhole_v1"
 NUPLAN_PACK_MANIFEST_VERSION = "nuplan_reactive_manifest_v2"
+_NUPLAN_MANIFEST_INVARIANT_KEYS = (
+    "bev_taxonomy_version",
+    "camera_order",
+    "contracts",
+    "dataset",
+    "dataset_version",
+    "geometry_type",
+    "has_bev_segmentation",
+    "has_reactive_navigation",
+    "has_route_reconstruction",
+    "has_trajectory_xy",
+    "map_context_channels",
+    "map_version",
+    "navigation_geometry",
+    "num_views",
+    "projection_scope",
+    "route_channels",
+    "schema_version",
+    "source_revision",
+    "split_policy",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +76,49 @@ class NuPlanCameraBundle:
     projection_matrices: np.ndarray
     camera_visibility: np.ndarray
     metadata: Mapping[str, object]
+
+
+@dataclasses.dataclass(frozen=True)
+class _NuPlanPackPartition:
+    index: int
+    db_files: tuple[str, ...]
+    scenario_estimate: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _NuPlanPackWorkerConfig:
+    partition: _NuPlanPackPartition
+    data_root: str
+    map_root: str
+    sensor_root: str
+    output_directory: str
+    source_revision: str
+    map_version: str
+    image_size: int
+    samples_per_shard: int
+
+
+class _NuPlanNoScenariosError(ValueError):
+    """Signal that filtering removed every scenario in one DB partition."""
+
+
+def _pin_nuplan_pack_thread_environment() -> None:
+    for variable in (
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+    ):
+        os.environ[variable] = "1"
+
+
+def _initialize_nuplan_pack_worker() -> None:
+    _pin_nuplan_pack_thread_environment()
+    try:
+        import cv2
+    except ModuleNotFoundError:
+        return
+    cv2.setNumThreads(1)
 
 
 def _quaternion_transform(
@@ -629,6 +697,336 @@ def _add_tar_member(
     archive.addfile(info, io.BytesIO(payload))
 
 
+def _nuplan_db_scenario_count(db_path: str | Path) -> int:
+    resolved = Path(db_path).resolve()
+    connection = sqlite3.connect(
+        f"{resolved.as_uri()}?mode=ro",
+        uri=True,
+    )
+    try:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM scenario_tag"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise ValueError(f"nuPlan DB has no scenario_tag count: {resolved}")
+    count = int(row[0])
+    if count < 0:
+        raise ValueError(f"nuPlan DB scenario count is invalid: {resolved}")
+    return count
+
+
+def _partition_weighted_nuplan_db_files(
+    weighted_db_files: Sequence[tuple[str | Path, int]],
+    worker_count: int,
+) -> list[_NuPlanPackPartition]:
+    if worker_count <= 0:
+        raise ValueError("nuPlan pack worker_count must be positive")
+    normalized = [
+        (str(Path(path).resolve()), int(weight))
+        for path, weight in weighted_db_files
+    ]
+    if not normalized:
+        raise ValueError("nuPlan DB partition input must not be empty")
+    paths = [path for path, _ in normalized]
+    if len(set(paths)) != len(paths):
+        raise ValueError("nuPlan DB partition input contains duplicates")
+    if any(weight < 0 for _, weight in normalized):
+        raise ValueError("nuPlan DB scenario weights must be non-negative")
+    positive_count = sum(weight > 0 for _, weight in normalized)
+    if positive_count == 0:
+        raise _NuPlanNoScenariosError(
+            "nuPlan DB files contain no tagged scenarios"
+        )
+
+    partition_count = min(worker_count, positive_count)
+    assignments: list[list[str]] = [
+        [] for _ in range(partition_count)
+    ]
+    loads = [0 for _ in range(partition_count)]
+    for path, weight in sorted(
+        normalized,
+        key=lambda item: (-item[1], item[0]),
+    ):
+        target = min(
+            range(partition_count),
+            key=lambda index: (loads[index], index),
+        )
+        assignments[target].append(path)
+        loads[target] += weight
+    return [
+        _NuPlanPackPartition(
+            index=index,
+            db_files=tuple(sorted(paths)),
+            scenario_estimate=loads[index],
+        )
+        for index, paths in enumerate(assignments)
+        if paths
+    ]
+
+
+def _pack_nuplan_partition(
+    config: _NuPlanPackWorkerConfig,
+) -> dict[str, object] | None:
+    try:
+        return pack_nuplan_local_dataset(
+            data_root=config.data_root,
+            map_root=config.map_root,
+            sensor_root=config.sensor_root,
+            db_files=config.partition.db_files,
+            output_directory=config.output_directory,
+            source_revision=config.source_revision,
+            map_version=config.map_version,
+            image_size=config.image_size,
+            samples_per_shard=config.samples_per_shard,
+            max_rejection_fraction=1.0,
+            pack_workers=1,
+            require_accepted=False,
+        )
+    except _NuPlanNoScenariosError:
+        return None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _merge_nuplan_pack_partitions(
+    *,
+    output: Path,
+    partition_root: Path,
+    partitions: Sequence[_NuPlanPackPartition],
+    manifests: Sequence[Mapping[str, object] | None],
+    max_rejection_fraction: float,
+) -> dict[str, object]:
+    if len(partitions) != len(manifests) or not manifests:
+        raise ValueError("nuPlan partition results are incomplete")
+    nonempty_manifests = [
+        manifest for manifest in manifests if manifest is not None
+    ]
+    if not nonempty_manifests:
+        raise ValueError("nuPlan parallel packing produced no scenarios")
+    reference_manifest = nonempty_manifests[0]
+    for candidate_manifest in nonempty_manifests:
+        for key in _NUPLAN_MANIFEST_INVARIANT_KEYS:
+            if (
+                key not in candidate_manifest
+                or candidate_manifest[key] != reference_manifest.get(key)
+            ):
+                raise ValueError(
+                    "nuPlan worker manifest invariant mismatch: "
+                    f"{key}"
+                )
+
+    merged_shard_names: list[str] = []
+    merged_shard_counts: dict[str, int] = {}
+    merged_shard_hashes: dict[str, str] = {}
+    merged_sample_uids: set[str] = set()
+    merged_rejections: list[object] = []
+    merged_split_group_uids: set[str] = set()
+    partition_statistics: list[dict[str, object]] = []
+    staged_shards: list[tuple[Path, str]] = []
+
+    for partition, manifest in zip(partitions, manifests):
+        worker_directory = partition_root / f"worker-{partition.index:03d}"
+        actual_tar_paths = {
+            path.resolve()
+            for path in worker_directory.rglob("*.tar")
+        } if worker_directory.is_dir() else set()
+        if manifest is None:
+            if actual_tar_paths:
+                raise ValueError(
+                    "nuPlan empty worker produced unreported shards"
+                )
+            partition_statistics.append({
+                "accepted_count": 0,
+                "db_file_count": len(partition.db_files),
+                "is_empty": True,
+                "rejected_count": 0,
+                "scenario_estimate": partition.scenario_estimate,
+            })
+            continue
+        shard_names = manifest.get("shard_names")
+        shard_counts = manifest.get("shard_sample_counts")
+        shard_hashes = manifest.get("shard_sha256")
+        if (
+            not isinstance(shard_names, list)
+            or not isinstance(shard_counts, Mapping)
+            or not isinstance(shard_hashes, Mapping)
+        ):
+            raise ValueError("nuPlan worker manifest shard contract is invalid")
+        if (
+            any(
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not name.endswith(".tar")
+                for name in shard_names
+            )
+            or len(set(shard_names)) != len(shard_names)
+            or set(shard_counts) != set(shard_names)
+            or set(shard_hashes) != set(shard_names)
+        ):
+            raise ValueError("nuPlan worker manifest shard contract is invalid")
+        worker_total_samples = manifest.get("total_samples")
+        if (
+            not isinstance(worker_total_samples, int)
+            or isinstance(worker_total_samples, bool)
+            or worker_total_samples < 0
+        ):
+            raise ValueError(
+                "nuPlan worker manifest sample count is invalid"
+            )
+        expected_tar_paths = {
+            (worker_directory / name).resolve()
+            for name in shard_names
+        }
+        if actual_tar_paths != expected_tar_paths:
+            raise ValueError(
+                "nuPlan worker manifest does not account for every shard"
+            )
+        worker_shard_total = 0
+        for worker_name in shard_names:
+            source_path = worker_directory / worker_name
+            expected_count = shard_counts[worker_name]
+            expected_hash = shard_hashes[worker_name]
+            if (
+                not isinstance(expected_count, int)
+                or isinstance(expected_count, bool)
+                or expected_count <= 0
+                or not isinstance(expected_hash, str)
+                or len(expected_hash) != 64
+            ):
+                raise ValueError(
+                    "nuPlan worker manifest shard contract is invalid"
+                )
+            actual_hash = _sha256_file(source_path)
+            if actual_hash != expected_hash:
+                raise ValueError(
+                    f"nuPlan worker shard checksum mismatch: {worker_name}"
+                )
+            with tarfile.open(source_path) as archive:
+                shard_sample_uids = {
+                    member.name.partition(".")[0]
+                    for member in archive
+                    if member.isfile()
+                }
+            if len(shard_sample_uids) != expected_count:
+                raise ValueError(
+                    "nuPlan worker shard sample count mismatch: "
+                    f"{worker_name}"
+                )
+            duplicate_uids = merged_sample_uids.intersection(
+                shard_sample_uids
+            )
+            if duplicate_uids:
+                raise ValueError(
+                    "nuPlan parallel packing produced duplicate sample UIDs"
+                )
+            merged_sample_uids.update(shard_sample_uids)
+            merged_name = (
+                f"nuplan-{len(merged_shard_names):06d}.tar"
+            )
+            merged_shard_names.append(merged_name)
+            merged_shard_counts[merged_name] = expected_count
+            merged_shard_hashes[merged_name] = actual_hash
+            staged_shards.append((source_path, merged_name))
+            worker_shard_total += expected_count
+        if worker_shard_total != worker_total_samples:
+            raise ValueError(
+                "nuPlan worker manifest total sample count mismatch"
+            )
+        rejections = manifest.get("rejected_samples")
+        if not isinstance(rejections, list):
+            raise ValueError("nuPlan worker rejection contract is invalid")
+        worker_rejection_count = manifest.get("rejection_count")
+        if (
+            not isinstance(worker_rejection_count, int)
+            or isinstance(worker_rejection_count, bool)
+            or worker_rejection_count != len(rejections)
+        ):
+            raise ValueError("nuPlan worker rejection contract is invalid")
+        merged_rejections.extend(rejections)
+        worker_split_group_count = manifest.get("split_group_count")
+        worker_split_group_uids = manifest.get("split_group_uids")
+        if (
+            not isinstance(worker_split_group_count, int)
+            or isinstance(worker_split_group_count, bool)
+            or worker_split_group_count < 0
+            or not isinstance(worker_split_group_uids, list)
+            or any(
+                not isinstance(uid, str) or not uid
+                for uid in worker_split_group_uids
+            )
+            or len(set(worker_split_group_uids))
+            != worker_split_group_count
+        ):
+            raise ValueError(
+                "nuPlan worker split group contract is invalid"
+            )
+        merged_split_group_uids.update(worker_split_group_uids)
+        partition_statistics.append({
+            "accepted_count": worker_total_samples,
+            "db_file_count": len(partition.db_files),
+            "is_empty": False,
+            "rejected_count": worker_rejection_count,
+            "scenario_estimate": partition.scenario_estimate,
+        })
+
+    accepted_count = len(merged_sample_uids)
+    rejected_count = len(merged_rejections)
+    total_count = accepted_count + rejected_count
+    if total_count == 0:
+        raise ValueError("nuPlan parallel packing produced no scenarios")
+    rejection_fraction = rejected_count / total_count
+    if (
+        accepted_count == 0
+        or rejection_fraction > max_rejection_fraction
+    ):
+        raise ValueError(
+            "nuPlan parallel packing rejection policy failed: "
+            f"accepted={accepted_count} rejected={rejected_count} "
+            f"fraction={rejection_fraction:.6f}"
+        )
+
+    for source_path, merged_name in staged_shards:
+        source_path.replace(output / merged_name)
+    if any(partition_root.rglob("*.tar")):
+        raise ValueError("nuPlan parallel merge left unconsumed shards")
+
+    merged = dict(reference_manifest)
+    merged.update({
+        "bev_segmentation_count": accepted_count,
+        "bev_statistics_count": accepted_count,
+        "packing_partitions": partition_statistics,
+        "packing_nonempty_workers": len(nonempty_manifests),
+        "packing_workers": len(partitions),
+        "rejected_samples": merged_rejections,
+        "rejection_count": rejected_count,
+        "rejection_fraction": rejection_fraction,
+        "sample_uid_digest": hashlib.sha256(
+            "\n".join(sorted(merged_sample_uids)).encode("ascii")
+        ).hexdigest(),
+        "shard_names": merged_shard_names,
+        "shard_sample_counts": merged_shard_counts,
+        "shard_sha256": merged_shard_hashes,
+        "split_group_count": len(merged_split_group_uids),
+        "split_group_uids": sorted(merged_split_group_uids),
+        "total_samples": accepted_count,
+        "trajectory_xy_count": accepted_count,
+    })
+    manifest_path = output / "manifest.json"
+    temporary_manifest_path = output / ".manifest.json.tmp"
+    temporary_manifest_path.write_bytes(canonical_json_bytes(merged))
+    temporary_manifest_path.replace(manifest_path)
+    shutil.rmtree(partition_root)
+    return merged
+
+
 def pack_nuplan_local_dataset(
     *,
     data_root: str | Path,
@@ -642,24 +1040,26 @@ def pack_nuplan_local_dataset(
     image_size: int = 256,
     samples_per_shard: int = 1000,
     max_rejection_fraction: float = 0.0,
+    pack_workers: int = 1,
+    require_accepted: bool = True,
 ) -> dict[str, object]:
     """Build and pack scenarios from one materialized nuPlan dataset."""
-    import os
-
-    from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import (
-        NuPlanScenarioBuilder,
-    )
-    from nuplan.planning.scenario_builder.scenario_filter import (
-        ScenarioFilter,
-    )
-    from nuplan.planning.utils.multithreading.worker_sequential import (
-        Sequential,
-    )
-
     if not source_revision or not map_version:
         raise ValueError("nuPlan source_revision and map_version are required")
     if limit_total_scenarios < 0:
         raise ValueError("limit_total_scenarios must be non-negative")
+    if (
+        image_size <= 0
+        or samples_per_shard <= 0
+        or not 0.0 <= max_rejection_fraction <= 1.0
+    ):
+        raise ValueError("nuPlan packing limits are invalid")
+    if pack_workers <= 0:
+        raise ValueError("nuPlan pack_workers must be positive")
+    if pack_workers > 1 and limit_total_scenarios:
+        raise ValueError(
+            "parallel nuPlan packing requires limit_total_scenarios=0"
+        )
     local_data = Path(data_root).resolve()
     local_map = Path(map_root).resolve()
     local_sensor = Path(sensor_root).resolve()
@@ -673,9 +1073,76 @@ def pack_nuplan_local_dataset(
     resolved_db_files = [Path(path).resolve() for path in db_files]
     if not resolved_db_files:
         raise ValueError("nuPlan db_files must not be empty")
+    if len(set(resolved_db_files)) != len(resolved_db_files):
+        raise ValueError("nuPlan db_files contains duplicate paths")
+    db_stems = [path.stem for path in resolved_db_files]
+    if len(set(db_stems)) != len(db_stems):
+        raise ValueError("nuPlan db_files contains duplicate log names")
     for db_path in resolved_db_files:
         if not db_path.is_file() or db_path.suffix != ".db":
             raise FileNotFoundError(f"nuPlan DB is missing: {db_path}")
+
+    if pack_workers > 1:
+        output = Path(output_directory)
+        output.mkdir(parents=True, exist_ok=True)
+        if any(output.iterdir()):
+            raise FileExistsError(
+                "nuPlan output directory must be empty"
+            )
+        partitions = _partition_weighted_nuplan_db_files(
+            [
+                (db_path, _nuplan_db_scenario_count(db_path))
+                for db_path in resolved_db_files
+            ],
+            pack_workers,
+        )
+        partition_root = output / ".partitions"
+        partition_root.mkdir()
+        configs = [
+            _NuPlanPackWorkerConfig(
+                partition=partition,
+                data_root=str(local_data),
+                map_root=str(local_map),
+                sensor_root=str(local_sensor),
+                output_directory=str(
+                    partition_root
+                    / f"worker-{partition.index:03d}"
+                ),
+                source_revision=source_revision,
+                map_version=map_version,
+                image_size=image_size,
+                samples_per_shard=samples_per_shard,
+            )
+            for partition in partitions
+        ]
+        _pin_nuplan_pack_thread_environment()
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=len(configs),
+            mp_context=context,
+            initializer=_initialize_nuplan_pack_worker,
+        ) as executor:
+            manifests = list(executor.map(
+                _pack_nuplan_partition,
+                configs,
+            ))
+        return _merge_nuplan_pack_partitions(
+            output=output,
+            partition_root=partition_root,
+            partitions=partitions,
+            manifests=manifests,
+            max_rejection_fraction=max_rejection_fraction,
+        )
+
+    from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import (
+        NuPlanScenarioBuilder,
+    )
+    from nuplan.planning.scenario_builder.scenario_filter import (
+        ScenarioFilter,
+    )
+    from nuplan.planning.utils.multithreading.worker_sequential import (
+        Sequential,
+    )
 
     os.environ["NUPLAN_DATA_STORE"] = "local"
     builder = NuPlanScenarioBuilder(
@@ -713,6 +1180,7 @@ def pack_nuplan_local_dataset(
         image_size=image_size,
         samples_per_shard=samples_per_shard,
         max_rejection_fraction=max_rejection_fraction,
+        require_accepted=require_accepted,
     )
 
 
@@ -725,6 +1193,7 @@ def pack_nuplan_reactive_scenarios(
     image_size: int = 256,
     samples_per_shard: int = 1000,
     max_rejection_fraction: float = 0.0,
+    require_accepted: bool = True,
     sample_builder: Callable[..., tuple[str, str, dict[str, bytes]]] = (
         nuplan_reactive_sample_members
     ),
@@ -732,7 +1201,7 @@ def pack_nuplan_reactive_scenarios(
     """Pack raw scenarios into immutable Reactive training shards."""
     if not source_revision or not map_version:
         raise ValueError("nuPlan source and map revisions must be pinned")
-    if samples_per_shard <= 0 or not 0.0 <= max_rejection_fraction < 1.0:
+    if samples_per_shard <= 0 or not 0.0 <= max_rejection_fraction <= 1.0:
         raise ValueError("nuPlan packing limits are invalid")
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
@@ -783,9 +1252,14 @@ def pack_nuplan_reactive_scenarios(
 
     total = len(accepted) + len(rejected)
     if total == 0:
-        raise ValueError("nuPlan scenario builder returned no scenarios")
+        raise _NuPlanNoScenariosError(
+            "nuPlan scenario builder returned no scenarios"
+        )
     rejection_fraction = len(rejected) / total
-    if not accepted or rejection_fraction > max_rejection_fraction:
+    if (
+        (require_accepted and not accepted)
+        or rejection_fraction > max_rejection_fraction
+    ):
         raise ValueError(
             "nuPlan packing rejection policy failed: "
             f"accepted={len(accepted)} rejected={len(rejected)} "
@@ -802,6 +1276,9 @@ def pack_nuplan_reactive_scenarios(
         )
         for index, name in enumerate(shard_names)
     }
+    split_group_uids = sorted({
+        group_uid for _, group_uid in accepted
+    })
     manifest: dict[str, object] = {
         "bev_segmentation_count": len(accepted),
         "bev_statistics_count": len(accepted),
@@ -836,9 +1313,8 @@ def pack_nuplan_reactive_scenarios(
         "shard_sample_counts": shard_sample_counts,
         "shard_sha256": shard_hashes,
         "source_revision": source_revision,
-        "split_group_count": len({
-            group_uid for _, group_uid in accepted
-        }),
+        "split_group_count": len(split_group_uids),
+        "split_group_uids": split_group_uids,
         "split_policy": "log_level_hash_bucket",
         "total_samples": len(accepted),
         "trajectory_xy_count": len(accepted),
