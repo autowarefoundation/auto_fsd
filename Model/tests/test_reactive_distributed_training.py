@@ -993,27 +993,44 @@ def test_overfit_subset_rejects_insufficient_rare_class_support():
         )
 
 
-def test_overfit_subset_rejects_rank_quota_limited_support():
-    rank_summaries = tuple(
-        tuple(
-            (
-                f"rank-{rank}-sample-{index:03d}",
-                tuple(
-                    int(class_index < 7 or rank == 0)
-                    for class_index in range(8)
-                ),
-            )
-            for index in range(8)
+def test_overfit_subset_reports_joint_rank_quota_conflict():
+    rank_zero = tuple(
+        (
+            f"rank-0-class-0-{index:03d}",
+            (1, 0, 1, 1, 1, 1, 1, 0),
         )
-        for rank in range(16)
+        for index in range(8)
+    ) + tuple(
+        (
+            f"rank-0-class-1-{index:03d}",
+            (0, 1, 0, 0, 0, 0, 0, 0),
+        )
+        for index in range(8)
+    ) + tuple(
+        (
+            f"rank-0-class-7-{index:03d}",
+            (0, 0, 0, 0, 0, 0, 0, 1),
+        )
+        for index in range(8)
+    )
+    filler = tuple(
+        tuple(
+            (f"rank-{rank}-filler-{index:03d}", (0,) * 8)
+            for index in range(16)
+        )
+        for rank in range(1, 4)
     )
 
     with pytest.raises(
         ValueError,
-        match=r"quota_limited_support.*4",
+        match=(
+            r"support for class 1: .*"
+            r"remaining_support_by_rank=\(3, 0, 0, 0\), .*"
+            r"remaining_capacity_by_rank=\(0, 16, 16, 16\)"
+        ),
     ):
         _select_bev_overfit_subset(
-            rank_summaries,
+            (rank_zero, *filler),
             sample_count=64,
         )
 
