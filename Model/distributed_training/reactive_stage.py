@@ -35,6 +35,7 @@ from training.reactive_multitask import ReactiveTrainingStage
 SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
+BEV_OVERFIT_MIN_POSITIVE_SAMPLES = 8
 ROUTE_DESTINATION_LOGIT_RANGE_EPSILON = 1e-6
 ROUTE_VALIDATION_METRICS_VERSION = "route_validation_v1"
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
@@ -342,7 +343,7 @@ def _select_bev_overfit_subset(
     *,
     sample_count: int,
 ) -> tuple[str, ...]:
-    """Choose a deterministic class-complete subset balanced across ranks."""
+    """Choose a deterministic class-balanced subset with exact rank quotas."""
     if not 64 <= sample_count <= 128:
         raise ValueError("BEV overfit subset must contain 64 to 128 samples")
     rank_count = len(rank_summaries)
@@ -351,18 +352,27 @@ def _select_bev_overfit_subset(
             "BEV overfit subset must divide evenly across ranks"
         )
     per_rank_count = sample_count // rank_count
-    candidates: list[tuple[str, int, frozenset[int]]] = []
+    class_count = 8
+    candidates: list[tuple[str, int, tuple[int, ...]]] = []
     for rank, summaries in enumerate(rank_summaries):
         if len(summaries) < per_rank_count:
             raise ValueError(
                 f"BEV overfit rank {rank} has fewer than "
                 f"{per_rank_count} train samples"
             )
-        for sample_uid, positive_classes in summaries:
-            classes = frozenset(int(value) for value in positive_classes)
-            if any(value < 0 or value >= 8 for value in classes):
-                raise ValueError("BEV overfit summary has invalid class index")
-            candidates.append((str(sample_uid), rank, classes))
+        for sample_uid, positive_cell_count in summaries:
+            cell_counts = tuple(
+                int(value) for value in positive_cell_count
+            )
+            if (
+                not sample_uid
+                or len(cell_counts) != class_count
+                or any(value < 0 for value in cell_counts)
+            ):
+                raise ValueError(
+                    "BEV overfit summary has invalid positive cell counts"
+                )
+            candidates.append((str(sample_uid), rank, cell_counts))
     if len(candidates) < sample_count:
         raise ValueError(
             "BEV overfit request exceeds available train samples"
@@ -371,33 +381,69 @@ def _select_bev_overfit_subset(
     if len(set(identities)) != len(identities):
         raise ValueError("BEV overfit candidates contain duplicate samples")
 
-    selected: dict[str, tuple[str, int, frozenset[int]]] = {}
+    available_support = [
+        sum(candidate[2][class_index] > 0 for candidate in candidates)
+        for class_index in range(class_count)
+    ]
+    insufficient = {
+        class_index: support
+        for class_index, support in enumerate(available_support)
+        if support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES
+    }
+    if insufficient:
+        raise ValueError(
+            "BEV overfit candidates have insufficient positive sample "
+            f"support: {insufficient}"
+        )
+
+    selected: dict[str, tuple[str, int, tuple[int, ...]]] = {}
     selected_per_rank = [0] * rank_count
-    covered: set[int] = set()
-    while covered != set(range(8)):
-        remaining_classes = set(range(8)) - covered
+    selected_support = [0] * class_count
+    while any(
+        support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES
+        for support in selected_support
+    ):
+        under_supported = [
+            class_index
+            for class_index, support in enumerate(selected_support)
+            if support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES
+        ]
+        target_class = min(
+            under_supported,
+            key=lambda class_index: (
+                available_support[class_index],
+                selected_support[class_index],
+                class_index,
+            ),
+        )
         eligible = [
             candidate
             for candidate in candidates
             if candidate[0] not in selected
-            and candidate[2].intersection(remaining_classes)
+            and candidate[2][target_class] > 0
             and selected_per_rank[candidate[1]] < per_rank_count
         ]
         if not eligible:
             raise ValueError(
-                "BEV overfit candidates do not cover every class"
+                "BEV overfit rank quotas cannot satisfy positive sample "
+                f"support for class {target_class}"
             )
         chosen = min(
             eligible,
             key=lambda candidate: (
-                -len(candidate[2].intersection(remaining_classes)),
+                -sum(
+                    candidate[2][class_index] > 0
+                    for class_index in under_supported
+                ),
+                -candidate[2][target_class],
                 selected_per_rank[candidate[1]],
                 candidate[0],
             ),
         )
         selected[chosen[0]] = chosen
         selected_per_rank[chosen[1]] += 1
-        covered.update(chosen[2])
+        for class_index, cell_count in enumerate(chosen[2]):
+            selected_support[class_index] += int(cell_count > 0)
 
     for rank in range(rank_count):
         for candidate in sorted(
@@ -418,6 +464,11 @@ def _select_bev_overfit_subset(
         raise ValueError("BEV overfit subset construction is incomplete")
     if selected_per_rank != [per_rank_count] * rank_count:
         raise ValueError("BEV overfit subset is not rank balanced")
+    if any(
+        support < BEV_OVERFIT_MIN_POSITIVE_SAMPLES
+        for support in selected_support
+    ):
+        raise ValueError("BEV overfit subset lacks class support")
     return tuple(sorted(selected))
 
 
