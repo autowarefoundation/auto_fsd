@@ -261,6 +261,30 @@ def test_reactive_ray_cpu_contract_has_one_source_of_truth():
         )
 
 
+def test_capacity_and_joint_gates_use_distinct_run_names():
+    common = {
+        "execution_name": "execution.with.unsupported.characters",
+        "stage": "nuplan_full",
+        "num_workers": 4,
+        "overfit_sample_count": 64,
+    }
+
+    capacity = distributed_training._reactive_run_name(
+        **common,
+        overfit_bev_only=True,
+    )
+    joint = distributed_training._reactive_run_name(
+        **common,
+        overfit_bev_only=False,
+    )
+
+    assert capacity.endswith("-capacity-overfit-64")
+    assert joint.endswith("-joint-overfit-64")
+    assert capacity != joint
+    assert "." not in capacity
+    assert "." not in joint
+
+
 def test_ray_tasks_serialize_the_resolved_storage_path():
     expected_environment = {
         "AWS_DEFAULT_REGION": "us-west-2",
@@ -329,6 +353,9 @@ def test_distributed_program_passes_stage_a_checkpoint_to_stage_b():
     capacity_metadata = joint_bindings["gate_metadata"].promise
     assert capacity_metadata.node_id == capacity.id
     assert capacity_metadata.var == "metadata"
+    assert joint_bindings["epochs"].scalar.primitive.integer == 10
+    assert joint_bindings["steps_per_epoch"].scalar.primitive.integer == 500
+    assert joint_bindings["weight_decay"].scalar.primitive.float_value == 0.0
     assert not joint_bindings[
         "overfit_bev_only"
     ].scalar.primitive.boolean
@@ -439,6 +466,9 @@ def test_four_rank_training_requires_capacity_then_joint_gate():
     assert joint_bindings[
         "overfit_sample_count"
     ].scalar.primitive.integer == 64
+    assert joint_bindings["epochs"].scalar.primitive.integer == 10
+    assert joint_bindings["steps_per_epoch"].scalar.primitive.integer == 500
+    assert joint_bindings["weight_decay"].scalar.primitive.float_value == 0.0
     assert not joint_bindings[
         "overfit_bev_only"
     ].scalar.primitive.boolean
@@ -495,11 +525,13 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
         "dataset_manifest_sha256": "b" * 64,
         "bev_weight": 1.0,
         "corridor_pos_weight": 1.0,
+        "executed_optimizer_steps": 5000,
         "overfit_bev_only": False,
         "overfit_fixed_lr": True,
         "overfit_gate_pass": 1,
         "overfit_sample_count": 64,
         "overfit_sample_uid_sha256": "c" * 64,
+        "overfit_thresholds_pass": 1,
         "route_weight": 1.0,
         "scheduler_identity": "constant_v1",
         "training_seed": 149,
@@ -617,6 +649,16 @@ def test_bev_overfit_gate_rejects_wrong_mode_and_objective(tmp_path):
             joint_metadata,
             expected_bev_weight=0.5,
         )
+
+
+def test_bev_overfit_gate_rejects_incomplete_optimizer_budget(tmp_path):
+    metadata = _bev_overfit_gate_metadata(
+        tmp_path,
+        executed_optimizer_steps=4999,
+    )
+
+    with pytest.raises(ValueError, match="fewer than 5000"):
+        _validate_bev_overfit_gate(metadata)
 
 
 def test_bev_overfit_gate_rejects_unit_weights_and_history_tampering(
