@@ -571,6 +571,7 @@ def test_ray_actor_cpu_reservation_matches_worker_config(
         "CPU": 3,
         "GPU": 1,
     }
+    assert captured["run_config"].checkpoint_config.num_to_keep is None
     assert result["selected_epoch"] == 1
     assert result["metrics"]["checkpoint_sha256"] == "a" * 64
 
