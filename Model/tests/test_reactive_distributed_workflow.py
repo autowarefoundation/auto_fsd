@@ -493,9 +493,17 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
     metrics = {
         "checkpoint_sha256": "a" * 64,
         "dataset_manifest_sha256": "b" * 64,
+        "bev_weight": 1.0,
+        "corridor_pos_weight": 1.0,
+        "overfit_bev_only": False,
+        "overfit_fixed_lr": True,
         "overfit_gate_pass": 1,
         "overfit_sample_count": 64,
         "overfit_sample_uid_sha256": "c" * 64,
+        "route_weight": 1.0,
+        "scheduler_identity": "constant_v1",
+        "training_seed": 149,
+        "trajectory_weight": 1.0,
         "validation_bev_dynamic_macro_average_precision": 0.95,
         "world_size": 4,
     }
@@ -521,12 +529,26 @@ def _bev_overfit_gate_metadata(tmp_path, **overrides):
     return distributed_training.FlyteFile(str(path))
 
 
+def _validate_bev_overfit_gate(metadata, **overrides):
+    expected = {
+        "expected_bev_only": False,
+        "expected_trajectory_weight": 1.0,
+        "expected_bev_weight": 1.0,
+        "expected_route_weight": 1.0,
+        "expected_corridor_pos_weight": 1.0,
+        "expected_training_seed": 149,
+    }
+    expected.update(overrides)
+    return distributed_training._validated_bev_overfit_gate_dataset(
+        metadata,
+        **expected,
+    )
+
+
 def test_bev_overfit_gate_validates_final_evidence(tmp_path):
     metadata = _bev_overfit_gate_metadata(tmp_path)
 
-    assert distributed_training._validated_bev_overfit_gate_dataset(
-        metadata
-    ) == "b" * 64
+    assert _validate_bev_overfit_gate(metadata) == "b" * 64
 
 
 def test_bev_overfit_gate_accepts_128_sample_evidence(tmp_path):
@@ -535,9 +557,7 @@ def test_bev_overfit_gate_accepts_128_sample_evidence(tmp_path):
         overfit_sample_count=128,
     )
 
-    assert distributed_training._validated_bev_overfit_gate_dataset(
-        metadata
-    ) == "b" * 64
+    assert _validate_bev_overfit_gate(metadata) == "b" * 64
 
 
 @pytest.mark.parametrize(
@@ -572,8 +592,30 @@ def test_bev_overfit_gate_rejects_weak_evidence(
     )
 
     with pytest.raises(ValueError, match=match):
-        distributed_training._validated_bev_overfit_gate_dataset(
-            metadata
+        _validate_bev_overfit_gate(metadata)
+
+
+def test_bev_overfit_gate_rejects_wrong_mode_and_objective(tmp_path):
+    capacity_metadata = _bev_overfit_gate_metadata(
+        tmp_path,
+        overfit_bev_only=True,
+        trajectory_weight=0.0,
+        route_weight=0.0,
+    )
+    assert _validate_bev_overfit_gate(
+        capacity_metadata,
+        expected_bev_only=True,
+        expected_trajectory_weight=0.0,
+        expected_route_weight=0.0,
+    ) == "b" * 64
+    with pytest.raises(ValueError, match="wrong mode"):
+        _validate_bev_overfit_gate(capacity_metadata)
+
+    joint_metadata = _bev_overfit_gate_metadata(tmp_path)
+    with pytest.raises(ValueError, match="wrong bev_weight"):
+        _validate_bev_overfit_gate(
+            joint_metadata,
+            expected_bev_weight=0.5,
         )
 
 
@@ -586,9 +628,7 @@ def test_bev_overfit_gate_rejects_unit_weights_and_history_tampering(
     }
     metadata = _bev_overfit_gate_metadata(tmp_path, **unit_weights)
     with pytest.raises(ValueError, match="unit pos weights"):
-        distributed_training._validated_bev_overfit_gate_dataset(
-            metadata
-        )
+        _validate_bev_overfit_gate(metadata)
 
     metadata = _bev_overfit_gate_metadata(tmp_path)
     path = Path(metadata.path)
@@ -596,9 +636,15 @@ def test_bev_overfit_gate_rejects_unit_weights_and_history_tampering(
     payload["history"][-1]["dataset_manifest_sha256"] = "d" * 64
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="history disagrees"):
-        distributed_training._validated_bev_overfit_gate_dataset(
-            metadata
-        )
+        _validate_bev_overfit_gate(metadata)
+
+    metadata = _bev_overfit_gate_metadata(tmp_path)
+    path = Path(metadata.path)
+    payload = json.loads(path.read_text())
+    payload["history"][-1]["route_weight"] = 0.5
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="history has wrong route_weight"):
+        _validate_bev_overfit_gate(metadata)
 
 
 def test_four_rank_full_task_rejects_direct_ungated_call():
