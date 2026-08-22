@@ -688,6 +688,11 @@ def test_bev_overfit_gate_rejects_weak_evidence(
             "do not sum to one",
         ),
         (
+            "camera_feature_scale_weight_0",
+            "invalid",
+            "invalid camera feature scale weights",
+        ),
+        (
             "peak_cuda_allocated_bytes_rank_2",
             0,
             "CUDA memory evidence",
