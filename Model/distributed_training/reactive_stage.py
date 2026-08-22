@@ -29,6 +29,7 @@ from distributed_training.reactive_data import (
     reactive_assignment_sha256,
     stage_rank_reactive_shards,
 )
+from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
 from training.reactive_multitask import ReactiveTrainingStage
 
 
@@ -36,6 +37,7 @@ SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
 BEV_OVERFIT_MIN_POSITIVE_SAMPLES = 8
+BEV_LANE_NEAR_RADIUS_M = 30.0
 ROUTE_DESTINATION_LOGIT_RANGE_EPSILON = 1e-6
 ROUTE_VALIDATION_METRICS_VERSION = "route_validation_v1"
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
@@ -933,6 +935,36 @@ def _histogram_average_precision(
     return float((recall_delta * precision).sum().item())
 
 
+def _bev_lane_range_masks(
+    height: int,
+    width: int,
+    *,
+    device,
+):
+    import torch
+
+    if height <= 0 or width <= 0:
+        raise ValueError("BEV lane range mask dimensions must be positive")
+    geometry = AUTOE2E_NAVIGATION_GEOMETRY
+    rows = (
+        torch.arange(height, device=device, dtype=torch.float64) + 0.5
+    ) / height
+    cols = (
+        torch.arange(width, device=device, dtype=torch.float64) + 0.5
+    ) / width
+    x_forward = geometry.x_max_m - rows * (
+        geometry.x_max_m - geometry.x_min_m
+    )
+    y_left = geometry.y_max_m - cols * (
+        geometry.y_max_m - geometry.y_min_m
+    )
+    distance_squared = (
+        x_forward[:, None].square() + y_left[None, :].square()
+    )
+    near = distance_squared <= BEV_LANE_NEAR_RADIUS_M**2
+    return torch.stack((near, ~near))
+
+
 def _metric_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator > 0.0 else 0.0
 
@@ -1135,6 +1167,20 @@ def _evaluate_global_reactive(
         device=device,
     )
     negative_histogram = torch.zeros_like(positive_histogram)
+    lane_range_counts = torch.zeros(
+        (2, 5),
+        dtype=torch.float64,
+        device=device,
+    )
+    lane_range_positive_histogram = torch.zeros(
+        (2, probability_bins),
+        dtype=torch.float64,
+        device=device,
+    )
+    lane_range_negative_histogram = torch.zeros_like(
+        lane_range_positive_histogram
+    )
+    lane_range_masks = None
     bev_loss_sum = 0.0
     bev_bce_sum = 0.0
     bev_dice_sum = 0.0
@@ -1317,6 +1363,68 @@ def _evaluate_global_reactive(
                                 minlength=probability_bins,
                             )
                         )
+                    lane_class_index = BEV_SEGMENTATION_CLASSES.index(
+                        "lane_boundary"
+                    )
+                    if lane_range_masks is None:
+                        lane_range_masks = _bev_lane_range_masks(
+                            target.shape[-2],
+                            target.shape[-1],
+                            device=device,
+                        )
+                    elif lane_range_masks.shape[-2:] != target.shape[-2:]:
+                        raise ValueError(
+                            "BEV validation lane range shape changed"
+                        )
+                    for range_index in range(2):
+                        lane_valid = (
+                            valid_mask[:, lane_class_index]
+                            & lane_range_masks[range_index][None]
+                        )
+                        if not bool(lane_valid.any()):
+                            continue
+                        lane_target = binary_target[
+                            :, lane_class_index
+                        ][lane_valid]
+                        lane_prediction = binary_prediction[
+                            :, lane_class_index
+                        ][lane_valid]
+                        lane_probability = probability[
+                            :, lane_class_index
+                        ][lane_valid]
+                        lane_range_counts[range_index, 0] += (
+                            lane_prediction & lane_target
+                        ).sum()
+                        lane_range_counts[range_index, 1] += (
+                            lane_prediction & ~lane_target
+                        ).sum()
+                        lane_range_counts[range_index, 2] += (
+                            ~lane_prediction & lane_target
+                        ).sum()
+                        lane_range_counts[range_index, 3] += (
+                            lane_target.sum()
+                        )
+                        lane_range_counts[range_index, 4] += (
+                            lane_valid.sum()
+                        )
+                        bins = torch.clamp(
+                            (
+                                lane_probability * probability_bins
+                            ).to(torch.int64),
+                            max=probability_bins - 1,
+                        )
+                        lane_range_positive_histogram[range_index] += (
+                            torch.bincount(
+                                bins[lane_target],
+                                minlength=probability_bins,
+                            )
+                        )
+                        lane_range_negative_histogram[range_index] += (
+                            torch.bincount(
+                                bins[~lane_target],
+                                minlength=probability_bins,
+                            )
+                        )
     finally:
         base.train(was_training)
 
@@ -1329,6 +1437,15 @@ def _evaluate_global_reactive(
     dist.all_reduce(bev_counts, op=dist.ReduceOp.SUM)
     dist.all_reduce(positive_histogram, op=dist.ReduceOp.SUM)
     dist.all_reduce(negative_histogram, op=dist.ReduceOp.SUM)
+    dist.all_reduce(lane_range_counts, op=dist.ReduceOp.SUM)
+    dist.all_reduce(
+        lane_range_positive_histogram,
+        op=dist.ReduceOp.SUM,
+    )
+    dist.all_reduce(
+        lane_range_negative_histogram,
+        op=dist.ReduceOp.SUM,
+    )
     dist.all_reduce(route_values, op=dist.ReduceOp.SUM)
     bev_loss_values = torch.tensor(
         [
@@ -1498,6 +1615,32 @@ def _evaluate_global_reactive(
         metrics[f"{prefix}_average_precision"] = average_precision
         metrics[f"{prefix}_ap_lift"] = ap_lift
         metrics[f"{prefix}_positive_prevalence"] = prevalence
+        metrics[f"{prefix}_positive_cells"] = positive
+        metrics[f"{prefix}_supported"] = float(supported)
+        metrics[f"{prefix}_valid_cells"] = valid
+
+    for range_index, range_name in enumerate(("near", "far")):
+        true_positive, false_positive, false_negative, positive, valid = (
+            float(value)
+            for value in lane_range_counts[range_index].tolist()
+        )
+        supported = positive > 0.0 and valid > 0.0
+        average_precision = 0.0
+        if supported:
+            average_precision = _histogram_average_precision(
+                lane_range_positive_histogram[range_index],
+                lane_range_negative_histogram[range_index],
+            )
+        prefix = f"bev_lane_boundary_{range_name}"
+        metrics[f"{prefix}_average_precision"] = average_precision
+        metrics[f"{prefix}_precision"] = _metric_ratio(
+            true_positive,
+            true_positive + false_positive,
+        )
+        metrics[f"{prefix}_recall"] = _metric_ratio(
+            true_positive,
+            true_positive + false_negative,
+        )
         metrics[f"{prefix}_positive_cells"] = positive
         metrics[f"{prefix}_supported"] = float(supported)
         metrics[f"{prefix}_valid_cells"] = valid
