@@ -20,6 +20,34 @@ def _validate_channels(
         )
 
 
+class _ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int, num_groups: int) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(num_groups, channels),
+            nn.SiLU(),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(num_groups, channels),
+        )
+        self.activation = nn.SiLU()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.activation(inputs + self.layers(inputs))
+
+
 class BEVSegmentationHead(nn.Module):
     """Decode independent semantic occupancy logits from camera-only BEV."""
 
@@ -41,16 +69,8 @@ class BEVSegmentationHead(nn.Module):
             nn.Conv2d(embed_dim, hidden_channels, kernel_size=1, bias=False),
             nn.GroupNorm(num_groups, hidden_channels),
             nn.SiLU(),
-            nn.Conv2d(
-                hidden_channels,
-                hidden_channels,
-                kernel_size=3,
-                padding=1,
-                groups=hidden_channels,
-                bias=False,
-            ),
-            nn.GroupNorm(num_groups, hidden_channels),
-            nn.SiLU(),
+            _ResidualConvBlock(hidden_channels, num_groups),
+            _ResidualConvBlock(hidden_channels, num_groups),
             nn.Conv2d(hidden_channels, num_classes, kernel_size=1),
         )
 
