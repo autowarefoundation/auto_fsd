@@ -33,6 +33,7 @@ SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
 MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
 ROUTE_DESTINATION_LOGIT_RANGE_EPSILON = 1e-6
+ROUTE_VALIDATION_METRICS_VERSION = "route_validation_v1"
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
@@ -892,19 +893,21 @@ def _route_validation_statistics(
     import torch
 
     statistics = torch.zeros(
-        16,
+        20,
         dtype=torch.float64,
         device=route_logits.device,
     )
     if route_logits.ndim != 4 or route_logits.shape[1] != 2:
         statistics[14] = 1.0
         return statistics
-    if (
-        route_target.shape != route_logits.shape
-        or route_channel_valid.shape != route_logits.shape[:2]
-        or route_valid.shape != route_logits.shape[:1]
-    ):
-        statistics[14] = 1.0
+    if route_target.shape != route_logits.shape:
+        statistics[15] = 1.0
+        return statistics
+    if route_channel_valid.shape != route_logits.shape[:2]:
+        statistics[16] = 1.0
+        return statistics
+    if route_valid.shape != route_logits.shape[:1]:
+        statistics[17] = 1.0
         return statistics
 
     logits = route_logits.to(dtype=torch.float32)
@@ -922,14 +925,19 @@ def _route_validation_statistics(
     )
     active_samples = channel_valid.any(dim=1)
     if not torch.equal(active_samples, sample_valid):
-        statistics[14] = 1.0
+        statistics[18] = 1.0
         return statistics
-    if (
-        not torch.isfinite(logits[channel_valid]).all()
-        or not torch.isfinite(target[channel_valid]).all()
-    ):
-        statistics[15] = 1.0
-        return statistics
+    active_values = channel_valid[:, :, None, None]
+    nonfinite_samples = (
+        (
+            (~torch.isfinite(logits) | ~torch.isfinite(target))
+            & active_values
+        )
+        .any(dim=(1, 2, 3))
+    )
+    statistics[19] = nonfinite_samples.sum()
+    channel_valid = channel_valid & ~nonfinite_samples[:, None]
+    active_samples = channel_valid.any(dim=1)
 
     zero = logits.new_zeros(())
     route_loss_sum = zero
@@ -1027,9 +1035,10 @@ def _route_validation_statistics(
         destination_logit_range_sum,
         destination_ambiguous_count,
     ]).to(dtype=torch.float64)
-    if not torch.isfinite(statistics).all():
-        statistics.zero_()
-        statistics[15] = 1.0
+    if not torch.isfinite(statistics[:14]).all():
+        failed_count = active_samples.sum()
+        statistics[:14].zero_()
+        statistics[19] += failed_count
     return statistics
 
 
@@ -1076,7 +1085,7 @@ def _evaluate_global_reactive(
     bev_bce_sum = 0.0
     bev_dice_sum = 0.0
     bev_loss_batches = 0
-    route_values = torch.zeros(16, dtype=torch.float64, device=device)
+    route_values = torch.zeros(20, dtype=torch.float64, device=device)
     try:
         with torch.no_grad():
             for item in loader:
@@ -1278,13 +1287,22 @@ def _evaluate_global_reactive(
         device=device,
     )
     dist.all_reduce(bev_loss_values, op=dist.ReduceOp.SUM)
-    if float(route_values[14].item()) > 0.0:
+    route_contract_names = (
+        "logit_shape",
+        "target_shape",
+        "channel_valid_shape",
+        "sample_valid_shape",
+        "sample_channel_validity_drift",
+    )
+    route_contract_violations = {
+        name: int(route_values[14 + index].item())
+        for index, name in enumerate(route_contract_names)
+        if float(route_values[14 + index].item()) > 0.0
+    }
+    if route_contract_violations:
         raise ValueError(
-            "Reactive distributed validation has invalid route contracts"
-        )
-    if float(route_values[15].item()) > 0.0:
-        raise FloatingPointError(
-            "Reactive distributed validation has non-finite route values"
+            "Reactive distributed validation has invalid route contracts: "
+            f"{route_contract_violations}"
         )
     global_count = int(values[2].item())
     if global_count <= 0:
@@ -1315,9 +1333,8 @@ def _evaluate_global_reactive(
         destination_localized,
         destination_logit_range_sum,
         destination_ambiguous,
-        _,
-        _,
-    ) = (float(value) for value in route_values.tolist())
+    ) = (float(value) for value in route_values[:14].tolist())
+    route_nonfinite_samples = float(route_values[19].item())
     metrics.update({
         "route_loss": _metric_ratio(
             route_loss_sum,
@@ -1365,6 +1382,7 @@ def _evaluate_global_reactive(
         "route_destination_supported_samples": destination_supported,
         "route_destination_localized_samples": destination_localized,
         "route_destination_ambiguous_samples": destination_ambiguous,
+        "route_nonfinite_samples": route_nonfinite_samples,
     })
     if stage is not ReactiveTrainingStage.NUPLAN_FULL:
         metrics["selection_score"] = trajectory_quality
@@ -1877,6 +1895,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_world_size": world_size,
         "gradient_clip_max_norm": float(config["grad_clip"]),
         "gradient_clip_mode": "branch_v1",
+        "route_metrics_version": ROUTE_VALIDATION_METRICS_VERSION,
         "trajectory_weight": float(config["trajectory_weight"]),
         "bev_weight": float(config["bev_weight"]),
         "route_weight": float(config["route_weight"]),
@@ -1938,6 +1957,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
         "distributed_world_size": world_size,
         "gradient_clip_max_norm": float(config["grad_clip"]),
         "gradient_clip_mode": "branch_v1",
+        "route_metrics_version": ROUTE_VALIDATION_METRICS_VERSION,
         "trajectory_weight": float(config["trajectory_weight"]),
         "bev_weight": float(config["bev_weight"]),
         "route_weight": float(config["route_weight"]),
@@ -2187,6 +2207,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "executed_optimizer_steps": executed_optimizer_steps,
                 "gradient_clip_max_norm": float(config["grad_clip"]),
                 "gradient_clip_mode": "branch_v1",
+                "route_metrics_version": (
+                    ROUTE_VALIDATION_METRICS_VERSION
+                ),
                 "is_best": int(is_best),
                 "learning_rate": float(
                     optimizer.param_groups[0]["lr"]
