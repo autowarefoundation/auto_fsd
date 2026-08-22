@@ -20,6 +20,7 @@ from data_parsing.pre_extracted import (
     passthrough_nodesplitter,
 )
 from data_processing.reactive_training_artifacts import (
+    BEV_SEGMENTATION_CLASSES,
     BEV_SEGMENTATION_STATS_MEMBER,
     encode_bev_segmentation_stats,
 )
@@ -36,11 +37,13 @@ from distributed_training.reactive_data import (
 )
 from distributed_training.reactive_stage import (
     _all_reduce_bev_statistics,
+    _bev_overfit_gate_result,
     _build_reactive_scheduler,
     _checkpoint_history,
     _histogram_average_precision,
     _select_bev_overfit_subset,
     _select_result_checkpoint,
+    _report_reactive_epoch,
     clip_finite_gradients_float64,
     normalize_ray_checkpoint_uri,
     reactive_gradient_parameter_groups,
@@ -737,6 +740,51 @@ def test_histogram_average_precision_matches_hand_calculation():
     )
 
     assert average_precision == pytest.approx(5.0 / 6.0)
+
+
+def test_bev_overfit_gate_result_reports_weakest_classes():
+    validation = {
+        f"bev_{class_name}_{suffix}": 0.95
+        for class_name in BEV_SEGMENTATION_CLASSES
+        for suffix in ("average_precision", "recall")
+    }
+    validation["bev_vehicle_average_precision"] = 0.72
+    validation["bev_vulnerable_road_user_recall"] = 0.61
+
+    result = _bev_overfit_gate_result(
+        validation,
+        minimum_ap=0.9,
+        minimum_recall=0.9,
+    )
+
+    assert not result["passed"]
+    assert result["minimum_ap"] == pytest.approx(0.72)
+    assert result["minimum_ap_class"] == "vehicle"
+    assert result["minimum_recall"] == pytest.approx(0.61)
+    assert result["minimum_recall_class"] == "vulnerable_road_user"
+
+
+def test_reactive_epoch_reports_checkpoint_before_gate_failure():
+    reported = []
+    checkpoint = object()
+    metrics = {
+        "epoch": 10,
+        "overfit_gate_pass": 0,
+        "overfit_minimum_ap": 0.2,
+    }
+
+    def report(values, *, checkpoint):
+        reported.append((values, checkpoint))
+
+    with pytest.raises(RuntimeError, match="gate failed"):
+        _report_reactive_epoch(
+            report,
+            metrics,
+            checkpoint=checkpoint,
+            failure_message="gate failed",
+        )
+
+    assert reported == [(metrics, checkpoint)]
 
 
 def test_result_checkpoint_selection_honors_ade_guard(tmp_path):
