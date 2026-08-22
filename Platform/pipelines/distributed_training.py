@@ -475,6 +475,13 @@ def _run_reactive_stage_task(
 
 def _validated_bev_overfit_gate_dataset(
     source: FlyteFile,
+    *,
+    expected_bev_only: bool,
+    expected_trajectory_weight: float,
+    expected_bev_weight: float,
+    expected_route_weight: float,
+    expected_corridor_pos_weight: float,
+    expected_training_seed: int,
 ) -> str:
     """Return the gated dataset digest after validating all overfit evidence."""
     import math
@@ -516,6 +523,44 @@ def _validated_bev_overfit_gate_dataset(
         raise ValueError(
             "BEV overfit gate history has invalid overfit_sample_count"
         )
+
+    objective_contract = {
+        "trajectory_weight": expected_trajectory_weight,
+        "bev_weight": expected_bev_weight,
+        "route_weight": expected_route_weight,
+        "corridor_pos_weight": expected_corridor_pos_weight,
+    }
+    for evidence_name, evidence in (
+        ("final metrics", metrics),
+        ("history", final_history),
+    ):
+        if evidence.get("overfit_bev_only") is not expected_bev_only:
+            raise ValueError(
+                f"BEV overfit gate {evidence_name} has wrong mode"
+            )
+        if evidence.get("overfit_fixed_lr") is not True:
+            raise ValueError(
+                f"BEV overfit gate {evidence_name} did not use fixed LR"
+            )
+        if str(evidence.get("scheduler_identity", "")) != "constant_v1":
+            raise ValueError(
+                f"BEV overfit gate {evidence_name} has wrong scheduler"
+            )
+        if int(evidence.get("training_seed", -1)) != expected_training_seed:
+            raise ValueError(
+                f"BEV overfit gate {evidence_name} has wrong seed"
+            )
+        for name, expected in objective_contract.items():
+            try:
+                actual = float(evidence[name])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} omitted {name}"
+                ) from error
+            if not math.isfinite(actual) or actual != expected:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} has wrong {name}"
+                )
 
     for name in (
         "checkpoint_sha256",
@@ -879,7 +924,13 @@ def train_reactive_stage_ray_4(
                     "joint overfit gates require capacity gate metadata"
                 )
             required_gate_dataset = _validated_bev_overfit_gate_dataset(
-                gate_metadata
+                gate_metadata,
+                expected_bev_only=True,
+                expected_trajectory_weight=0.0,
+                expected_bev_weight=1.0,
+                expected_route_weight=0.0,
+                expected_corridor_pos_weight=1.0,
+                expected_training_seed=training_seed,
             )
     else:
         if gate_metadata is None:
@@ -887,7 +938,13 @@ def train_reactive_stage_ray_4(
                 "four-rank full training requires joint gate metadata"
             )
         required_gate_dataset = _validated_bev_overfit_gate_dataset(
-            gate_metadata
+            gate_metadata,
+            expected_bev_only=False,
+            expected_trajectory_weight=trajectory_weight,
+            expected_bev_weight=bev_weight,
+            expected_route_weight=route_weight,
+            expected_corridor_pos_weight=corridor_pos_weight,
+            expected_training_seed=training_seed,
         )
     return _run_reactive_stage_task(
         shards=shards,
@@ -973,7 +1030,13 @@ def train_reactive_stage_ray_8(
                 "eight-rank Stage A requires BEV overfit gate metadata"
             )
         required_gate_dataset = _validated_bev_overfit_gate_dataset(
-            gate_metadata
+            gate_metadata,
+            expected_bev_only=False,
+            expected_trajectory_weight=trajectory_weight,
+            expected_bev_weight=bev_weight,
+            expected_route_weight=route_weight,
+            expected_corridor_pos_weight=corridor_pos_weight,
+            expected_training_seed=training_seed,
         )
     else:
         if gate_metadata is not None:
