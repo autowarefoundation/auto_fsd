@@ -562,6 +562,60 @@ def clip_finite_gradients_float64(
     return gradient_norm, finite
 
 
+def reactive_gradient_parameter_groups(model) -> dict[str, list[Any]]:
+    """Partition every trainable parameter into one clipping group."""
+    base = _base_model(model)
+    try:
+        reactive = base.Reactive_E2E
+    except AttributeError as error:
+        raise ValueError("Reactive model is missing Reactive_E2E") from error
+    grouped_modules = {
+        "camera": (
+            reactive.Backbone,
+            reactive.FeatureFusion,
+            reactive.BEVSegmentationHead,
+        ),
+        "navigation": (
+            reactive.NavigationEncoder,
+            reactive.MapBEVFusion,
+            reactive.RouteReconstructionHead,
+        ),
+    }
+    groups: dict[str, list[Any]] = {
+        "camera": [],
+        "navigation": [],
+        "planner": [],
+    }
+    assigned: set[int] = set()
+    for group_name, modules in grouped_modules.items():
+        for module in modules:
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                if not parameter.requires_grad:
+                    continue
+                identity = id(parameter)
+                if identity in assigned:
+                    raise ValueError(
+                        "Reactive gradient parameter groups overlap"
+                    )
+                assigned.add(identity)
+                groups[group_name].append(parameter)
+    for parameter in base.parameters():
+        if not parameter.requires_grad:
+            continue
+        identity = id(parameter)
+        if identity not in assigned:
+            assigned.add(identity)
+            groups["planner"].append(parameter)
+    trainable_count = sum(
+        1 for parameter in base.parameters() if parameter.requires_grad
+    )
+    if len(assigned) != trainable_count:
+        raise ValueError("Reactive gradient parameter grouping is incomplete")
+    return groups
+
+
 def _build_reactive_scheduler(optimizer, *, fixed_lr: bool):
     import torch
 
@@ -619,6 +673,13 @@ def _train_fixed_steps(
     )
     totals = torch.zeros(
         len(term_names),
+        dtype=torch.float64,
+        device=device,
+    )
+    gradient_group_names = ("camera", "navigation", "planner")
+    gradient_groups = reactive_gradient_parameter_groups(model)
+    gradient_totals = torch.zeros(
+        len(gradient_group_names) * 2,
         dtype=torch.float64,
         device=device,
     )
@@ -697,16 +758,50 @@ def _train_fixed_steps(
                 for name in term_names
             ])
 
-        trainable = [
-            parameter
-            for parameter in model.parameters()
-            if parameter.requires_grad
-        ]
-        gradient_norm, finite_gradient = clip_finite_gradients_float64(
-            trainable,
-            grad_clip,
-        )
-        finite_step.logical_and_(finite_gradient)
+        for group_index, group_name in enumerate(gradient_group_names):
+            parameters = gradient_groups[group_name]
+            if parameters:
+                gradient_norm, finite_gradient = (
+                    clip_finite_gradients_float64(
+                        parameters,
+                        grad_clip,
+                    )
+                )
+                clip_scale = torch.clamp(
+                    torch.as_tensor(
+                        grad_clip,
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                    / gradient_norm.clamp_min(
+                        torch.finfo(torch.float64).tiny
+                    ),
+                    max=1.0,
+                )
+                clip_scale = torch.where(
+                    finite_gradient,
+                    clip_scale,
+                    torch.ones_like(clip_scale),
+                )
+            else:
+                gradient_norm = torch.zeros(
+                    (),
+                    dtype=torch.float64,
+                    device=device,
+                )
+                finite_gradient = torch.ones(
+                    (),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                clip_scale = torch.ones(
+                    (),
+                    dtype=torch.float64,
+                    device=device,
+                )
+            finite_step.logical_and_(finite_gradient)
+            gradient_totals[group_index * 2] += gradient_norm
+            gradient_totals[group_index * 2 + 1] += clip_scale
         if not _collective_true(finite_step, device):
             raise FloatingPointError(
                 "a Reactive DDP rank produced non-finite loss or gradients"
@@ -715,6 +810,7 @@ def _train_fixed_steps(
 
     packed = torch.cat([
         totals,
+        gradient_totals,
         torch.tensor(
             [float(consumed_samples), float(iterator.restarts)],
             dtype=torch.float64,
@@ -723,7 +819,8 @@ def _train_fixed_steps(
     ])
     dist.all_reduce(packed, op=dist.ReduceOp.SUM)
     denominator = dist.get_world_size() * micro_steps
-    return {
+    gradient_denominator = dist.get_world_size() * optimizer_steps
+    metrics = {
         "total": float(packed[0].item() / denominator),
         "trajectory": float(packed[1].item() / denominator),
         "bev_segmentation": float(packed[2].item() / denominator),
@@ -736,11 +833,19 @@ def _train_fixed_steps(
         "route_reconstruction": float(
             packed[5].item() / denominator
         ),
-        "consumed_samples": float(packed[6].item()),
-        "loader_restarts": float(packed[7].item()),
+        "consumed_samples": float(packed[12].item()),
+        "loader_restarts": float(packed[13].item()),
         "local_consumed_samples": float(consumed_samples),
         "local_loader_restarts": float(iterator.restarts),
     }
+    for group_index, group_name in enumerate(gradient_group_names):
+        metrics[f"gradient_{group_name}_pre_clip_norm"] = float(
+            packed[6 + group_index * 2].item() / gradient_denominator
+        )
+        metrics[f"gradient_{group_name}_clip_scale"] = float(
+            packed[7 + group_index * 2].item() / gradient_denominator
+        )
+    return metrics
 
 
 def _histogram_average_precision(
@@ -1796,6 +1901,17 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 metrics[f"bev_pos_weight_{class_index}"] = value
                 metrics[f"bev_repeat_factor_{class_index}"] = (
                     bev_repeat_factors[class_index]
+                )
+            for group_name in ("camera", "navigation", "planner"):
+                metrics[
+                    f"train_gradient_{group_name}_pre_clip_norm"
+                ] = train_metrics[
+                    f"gradient_{group_name}_pre_clip_norm"
+                ]
+                metrics[f"train_gradient_{group_name}_clip_scale"] = (
+                    train_metrics[
+                        f"gradient_{group_name}_clip_scale"
+                    ]
                 )
             epoch_history.append(metrics)
             if rank == 0:
