@@ -21,6 +21,10 @@ ever enters a cached task's input signature.
 Source revision (HF commit), teacher model revision, and the prompt body hash are
 NOT constants here — they are resolved at run time (from HF / teacher config /
 prompt text) and threaded through as inputs; see DatasetSnapshot (§3.4a).
+
+nuPlan BEV class semantics are versioned separately by
+`BEV_SEGMENTATION_TAXONOMY_VERSION` and the nuPlan pack task cache. A semantic
+target change must bump both without changing the stable NPZ encoding version.
 """
 
 from __future__ import annotations
