@@ -21,7 +21,7 @@ from navigation.geometry import (
 
 TRAJECTORY_XY_ARTIFACT_VERSION: Final = "trajectory_xy_v1"
 BEV_SEGMENTATION_ARTIFACT_VERSION: Final = "bev_segmentation_v2"
-BEV_SEGMENTATION_TAXONOMY_VERSION: Final = "bev_segmentation_v2"
+BEV_SEGMENTATION_TAXONOMY_VERSION: Final = "bev_segmentation_v3"
 BEV_SEGMENTATION_STATS_VERSION: Final = "bev_segmentation_stats_v1"
 REACTIVE_NAVIGATION_ARTIFACT_VERSION: Final = "sample_navigation_v3"
 TRAJECTORY_XY_MEMBER: Final = "trajectory_xy.npz"
