@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,6 +31,36 @@ from Platform.pipelines import (
     nuplan_dataset,
     workflows,
 )
+
+
+def test_distributed_workflow_import_is_path_order_independent():
+    repository_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    python_paths = [
+        str(repository_root / "Model"),
+        str(repository_root),
+    ]
+    if environment.get("PYTHONPATH"):
+        python_paths.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import distributed_training as module; "
+                "print(module.BEV_OVERFIT_SAMPLE_COUNT)"
+            ),
+        ],
+        cwd=repository_root / "Platform" / "pipelines",
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "64"
 
 
 def test_flyte_entrypoints_do_not_use_mutable_defaults():
