@@ -38,6 +38,17 @@ def _data_prep_pod_template() -> PodTemplate:
     )
 
 
+def _nuplan_pack_worker_count(
+    db_file_count: int,
+    limit_total_scenarios: int,
+) -> int:
+    if db_file_count <= 0:
+        raise ValueError("nuPlan pack requires at least one DB file")
+    if limit_total_scenarios < 0:
+        raise ValueError("limit_total_scenarios must be non-negative")
+    return 1 if limit_total_scenarios else min(8, db_file_count)
+
+
 @task(
     container_image=DATA_PREP_IMAGE,
     pod_template=_data_prep_pod_template(),
@@ -576,7 +587,8 @@ def wf_acquire_nuplan_raw_snapshot(
         ephemeral_storage="500Gi",
     ),
     cache=True,
-    cache_version="nuplan-snapshot-pack-v2",
+    cache_version="nuplan-snapshot-pack-v4-parallel",
+    retries=1,
 )
 def pack_nuplan_snapshot_reactive_dataset(
     snapshot_manifest: FlyteFile,
@@ -678,6 +690,10 @@ def pack_nuplan_snapshot_reactive_dataset(
         })
 
     materialized = discover_materialized_nuplan(dataset_root)
+    pack_workers = _nuplan_pack_worker_count(
+        len(materialized.db_files),
+        limit_total_scenarios,
+    )
     packed = pack_nuplan_local_dataset(
         data_root=materialized.data_root,
         map_root=materialized.map_root,
@@ -690,13 +706,20 @@ def pack_nuplan_snapshot_reactive_dataset(
         image_size=image_size,
         samples_per_shard=samples_per_shard,
         max_rejection_fraction=max_rejection_fraction,
+        pack_workers=pack_workers,
     )
     if packed.get("bev_taxonomy_version") != "bev_segmentation_v2":
         raise ValueError("nuPlan packer did not emit BEV schema v2")
+    if packed.get("schema_version") != "nuplan_reactive_manifest_v2":
+        raise ValueError("nuPlan packer did not emit manifest schema v2")
     if int(packed.get("bev_statistics_count", 0)) != int(
         packed.get("total_samples", -1)
     ):
         raise ValueError("nuPlan packer omitted BEV v2 sample statistics")
+    if int(packed.get("bev_segmentation_count", 0)) != int(
+        packed.get("total_samples", -1)
+    ):
+        raise ValueError("nuPlan packer omitted BEV segmentation samples")
 
     packed.update({
         "raw_archive_ids": [
