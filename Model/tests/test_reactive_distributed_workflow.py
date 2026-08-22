@@ -10,8 +10,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-pytest.importorskip("flytekit")
-
 from flytekit.types.directory import FlyteDirectory
 
 from data_processing.reactive_training_artifacts import (
