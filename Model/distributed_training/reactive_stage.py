@@ -31,6 +31,7 @@ from training.reactive_multitask import ReactiveTrainingStage
 
 SUPPORTED_WORLD_SIZES = frozenset({2, 4, 8})
 SUPPORTED_PRECISIONS = frozenset({"fp32", "bf16"})
+MIN_OVERFIT_OPTIMIZER_STEPS = 5_000
 _RUN_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
@@ -139,6 +140,15 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
         )
     if overfit_sample_count and not overfit_fixed_lr:
         raise ValueError("BEV overfit gates require a fixed learning rate")
+    if (
+        overfit_sample_count
+        and int(config["epochs"]) * override
+        < MIN_OVERFIT_OPTIMIZER_STEPS
+    ):
+        raise ValueError(
+            "BEV overfit gates require at least "
+            f"{MIN_OVERFIT_OPTIMIZER_STEPS} optimizer steps"
+        )
     if overfit_bev_only:
         expected_weights = {
             "trajectory_weight": 0.0,
@@ -156,14 +166,6 @@ def validate_reactive_stage_config(config: Mapping[str, Any]) -> None:
             )
         if float(config["weight_decay"]) != 0.0:
             raise ValueError("BEV-only capacity probes require weight_decay=0")
-        capacity_steps = (
-            int(config["epochs"]) * int(config.get("steps_per_epoch", 0))
-        )
-        if capacity_steps < 5_000:
-            raise ValueError(
-                "BEV-only capacity probes require at least 5000 "
-                "optimizer steps"
-            )
     overfit_shard_limit = int(config.get("overfit_shard_limit", 0))
     if overfit_shard_limit and overfit_shard_limit < world_size:
         raise ValueError(
@@ -1768,14 +1770,21 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             scheduler.step(validation["selection_score"])
         overfit_gate = None
         overfit_gate_pass = False
+        overfit_thresholds_pass = False
         overfit_failure_message = None
+        executed_optimizer_steps = epoch * optimizer_steps
         if overfit_sample_count:
             overfit_gate = _bev_overfit_gate_result(
                 validation,
                 minimum_ap=float(config["overfit_min_ap"]),
                 minimum_recall=float(config["overfit_min_recall"]),
             )
-            overfit_gate_pass = bool(overfit_gate["passed"])
+            overfit_thresholds_pass = bool(overfit_gate["passed"])
+            overfit_gate_pass = (
+                overfit_thresholds_pass
+                and executed_optimizer_steps
+                >= MIN_OVERFIT_OPTIMIZER_STEPS
+            )
             if (
                 epoch == int(config["epochs"])
                 and not overfit_gate_pass
@@ -1786,7 +1795,11 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                     f"class={overfit_gate['minimum_ap_class']} "
                     "minimum_recall="
                     f"{overfit_gate['minimum_recall']:.6f} "
-                    f"class={overfit_gate['minimum_recall_class']}"
+                    f"class={overfit_gate['minimum_recall_class']} "
+                    "executed_optimizer_steps="
+                    f"{executed_optimizer_steps} evidence_uri="
+                    f"{str(config['storage_path']).rstrip('/')}/"
+                    f"{config['run_name']}"
                 )
         maximum_delta = _maximum_parameter_delta(
             model,
@@ -1837,8 +1850,14 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
             best_selection_score = validation["selection_score"]
         best_ade = min(best_ade, validation["ade_6p4s_m"])
         checkpoint_metrics: dict[str, Any] = dict(validation)
+        checkpoint_metrics["executed_optimizer_steps"] = (
+            executed_optimizer_steps
+        )
         checkpoint_metrics["overfit_gate_pass"] = int(
             overfit_gate_pass
+        )
+        checkpoint_metrics["overfit_thresholds_pass"] = int(
+            overfit_thresholds_pass
         )
         if overfit_gate is not None:
             checkpoint_metrics.update({
@@ -1904,6 +1923,7 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 ),
                 "elapsed_seconds": time.perf_counter() - started,
                 "epoch": epoch,
+                "executed_optimizer_steps": executed_optimizer_steps,
                 "is_best": int(is_best),
                 "learning_rate": float(
                     optimizer.param_groups[0]["lr"]
@@ -1916,6 +1936,9 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "overfit_sample_count": overfit_sample_count,
                 "overfit_sample_uid_sha256": (
                     overfit_sample_uid_sha256
+                ),
+                "overfit_thresholds_pass": int(
+                    overfit_thresholds_pass
                 ),
                 "route_weight": float(config["route_weight"]),
                 "scheduler_identity": scheduler_identity,
