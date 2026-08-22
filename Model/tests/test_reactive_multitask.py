@@ -903,6 +903,14 @@ def test_stage_a_to_stage_b_to_semantic_artifact_smoke(
         epoch=1,
         model_config={
             "num_views": 8,
+            "trajectory_weight": 1.0,
+            "bev_weight": 0.1,
+            "route_weight": 0.01,
+            "corridor_pos_weight": 1.0,
+            "training_seed": 149,
+            "scheduler_identity": "selection_plateau_v1",
+            "overfit_bev_only": False,
+            "overfit_fixed_lr": False,
             "bev_pos_weights": [1.0] * 8,
             "bev_repeat_factors": [1] * 8,
             "bev_taxonomy_version": "bev_segmentation_v2",
@@ -1137,4 +1145,36 @@ def test_stage_b_rejects_stage_a_without_bev_v2_lineage(
         ValueError,
         match="Stage A parent checkpoint contract differs",
     ):
+        load_stage_a_parent(model, checkpoint_path)
+
+
+def test_stage_b_rejects_stage_a_that_did_not_optimize_bev(
+    build_mock_model,
+    device,
+    tmp_path,
+):
+    model = _model(build_mock_model, device)
+    checkpoint_path = tmp_path / "bev-disabled-stage-a.pt"
+    save_reactive_checkpoint(
+        checkpoint_path,
+        model,
+        stage=ReactiveTrainingStage.NUPLAN_FULL,
+        dataset_manifest_sha256="a" * 64,
+        epoch=1,
+        model_config={
+            "trajectory_weight": 1.0,
+            "bev_weight": 0.0,
+            "route_weight": 1.0,
+            "corridor_pos_weight": 1.0,
+            "training_seed": 149,
+            "scheduler_identity": "selection_plateau_v1",
+            "overfit_bev_only": False,
+            "overfit_fixed_lr": False,
+            "bev_pos_weights": [2.0] * 8,
+            "bev_repeat_factors": [1] * 8,
+            "bev_taxonomy_version": "bev_segmentation_v2",
+        },
+    )
+
+    with pytest.raises(ValueError, match="objective provenance"):
         load_stage_a_parent(model, checkpoint_path)
