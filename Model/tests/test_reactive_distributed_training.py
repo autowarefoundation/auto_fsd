@@ -41,6 +41,7 @@ from distributed_training.reactive_stage import (
     _build_reactive_scheduler,
     _checkpoint_history,
     _histogram_average_precision,
+    _load_resume_checkpoint,
     _select_bev_overfit_subset,
     _select_result_checkpoint,
     _report_reactive_epoch,
@@ -494,6 +495,120 @@ def test_fixed_overfit_scheduler_preserves_lr_and_state():
     assert identity == restored_identity == "constant_v1"
     assert optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
     assert restored_scheduler.state_dict() == scheduler.state_dict()
+
+
+def _write_resume_checkpoint(
+    directory,
+    *,
+    config,
+    model,
+    optimizer,
+    scheduler,
+):
+    torch = pytest.importorskip("torch")
+    directory.mkdir()
+    torch.save(
+        {
+            "config": config,
+            "epoch": 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "training_state": {
+                "best_ade_6p4s_m": 2.0,
+                "best_selection_score": 0.5,
+            },
+        },
+        directory / "checkpoint.pt",
+    )
+    (directory / "history.json").write_text(json.dumps([{"epoch": 1}]))
+
+
+def test_resume_checkpoint_round_trips_fixed_scheduler(tmp_path):
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    _, scheduler = _build_reactive_scheduler(optimizer, fixed_lr=True)
+    expected = {
+        "trajectory_weight": 0.0,
+        "bev_weight": 1.0,
+        "route_weight": 0.0,
+        "corridor_pos_weight": 1.0,
+        "training_seed": 149,
+        "scheduler_identity": "constant_v1",
+        "overfit_bev_only": True,
+        "overfit_fixed_lr": True,
+    }
+    checkpoint = tmp_path / "checkpoint"
+    _write_resume_checkpoint(
+        checkpoint,
+        config=expected,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+
+    restored = _load_resume_checkpoint(
+        str(checkpoint),
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        expected=expected,
+    )
+
+    assert restored == (2, 0.5, 2.0, [{"epoch": 1}])
+
+
+@pytest.mark.parametrize(
+    ("field", "different_value"),
+    [
+        ("trajectory_weight", 0.5),
+        ("bev_weight", 2.0),
+        ("route_weight", 0.25),
+        ("corridor_pos_weight", 2.0),
+        ("training_seed", 150),
+        ("scheduler_identity", "selection_plateau_v1"),
+        ("overfit_bev_only", False),
+        ("overfit_fixed_lr", False),
+    ],
+)
+def test_resume_checkpoint_rejects_objective_mismatch(
+    tmp_path,
+    field,
+    different_value,
+):
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    _, scheduler = _build_reactive_scheduler(optimizer, fixed_lr=True)
+    checkpoint_config = {
+        "trajectory_weight": 0.0,
+        "bev_weight": 1.0,
+        "route_weight": 0.0,
+        "corridor_pos_weight": 1.0,
+        "training_seed": 149,
+        "scheduler_identity": "constant_v1",
+        "overfit_bev_only": True,
+        "overfit_fixed_lr": True,
+    }
+    checkpoint = tmp_path / "checkpoint"
+    _write_resume_checkpoint(
+        checkpoint,
+        config=checkpoint_config,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+    expected = {**checkpoint_config, field: different_value}
+
+    with pytest.raises(ValueError, match=field):
+        _load_resume_checkpoint(
+            str(checkpoint),
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected=expected,
+        )
 
 
 def test_ray_actor_cpu_reservation_matches_worker_config(
