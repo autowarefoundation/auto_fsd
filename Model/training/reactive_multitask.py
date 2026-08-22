@@ -63,8 +63,12 @@ def reactive_model_kwargs(
 def configure_model_for_stage(
     model: nn.Module,
     stage: ReactiveTrainingStage,
+    *,
+    bev_only: bool = False,
 ) -> None:
     """Apply trainability rules after loading the stage checkpoint."""
+    if bev_only and stage is not ReactiveTrainingStage.NUPLAN_FULL:
+        raise ValueError("BEV-only training is valid only for Stage A")
     try:
         reactive = getattr(model, "Reactive_E2E")
         bev_head = getattr(reactive, "BEVSegmentationHead")
@@ -74,6 +78,18 @@ def configure_model_for_stage(
         ) from exc
     if not isinstance(bev_head, nn.Module):
         raise ValueError("multi-stage training requires the BEV head")
+    if bev_only:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for module in (
+            reactive.Backbone,
+            reactive.FeatureFusion,
+            bev_head,
+        ):
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
+            module.train()
+        return
     train_bev = stage is ReactiveTrainingStage.NUPLAN_FULL
     for parameter in bev_head.parameters():
         parameter.requires_grad_(train_bev)
