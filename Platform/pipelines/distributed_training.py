@@ -39,7 +39,10 @@ from kubernetes.client import (
     V1VolumeMount,
 )
 
-from distributed_training.reactive_stage import MIN_OVERFIT_SAMPLE_COUNT
+from training.reactive_contracts import (
+    MAX_OVERFIT_SAMPLE_COUNT,
+    MIN_OVERFIT_SAMPLE_COUNT,
+)
 
 
 TRAINING_IMAGE = os.environ.get(
@@ -547,9 +550,15 @@ def _validated_bev_overfit_gate_dataset(
                 f"BEV overfit gate history has invalid {name}"
             )
     sample_count = int(metrics.get("overfit_sample_count", -1))
-    if not BEV_OVERFIT_SAMPLE_COUNT <= sample_count <= 128:
+    if not (
+        BEV_OVERFIT_SAMPLE_COUNT
+        <= sample_count
+        <= MAX_OVERFIT_SAMPLE_COUNT
+    ):
         raise ValueError(
-            "BEV overfit gate sample count must be between 64 and 128"
+            "BEV overfit gate sample count must be between "
+            f"{BEV_OVERFIT_SAMPLE_COUNT} and "
+            f"{MAX_OVERFIT_SAMPLE_COUNT}"
         )
     if int(final_history.get("overfit_sample_count", -1)) != sample_count:
         raise ValueError(
