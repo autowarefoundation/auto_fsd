@@ -621,14 +621,20 @@ def _validated_bev_overfit_gate_dataset(
             re.escape(CAMERA_FEATURE_SCALE_WEIGHT_METRIC_PREFIX)
             + r"(\d+)"
         )
-        scale_entries = sorted(
-            (
-                int(match.group(1)),
-                float(value),
-            )
-            for name, value in evidence.items()
-            if (match := scale_pattern.fullmatch(name)) is not None
-        )
+        scale_entries = []
+        for name, value in evidence.items():
+            match = scale_pattern.fullmatch(name)
+            if match is None:
+                continue
+            try:
+                weight = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"BEV overfit gate {evidence_name} has invalid "
+                    "camera feature scale weights"
+                ) from error
+            scale_entries.append((int(match.group(1)), weight))
+        scale_entries.sort()
         if (
             len(scale_entries) < 2
             or [index for index, _ in scale_entries]
