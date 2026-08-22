@@ -1895,6 +1895,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "checkpoint_retention_score": (
                     checkpoint_retention_score
                 ),
+                "bev_weight": float(config["bev_weight"]),
+                "corridor_pos_weight": float(
+                    config["corridor_pos_weight"]
+                ),
                 "dataset_manifest_sha256": (
                     plan.dataset_manifest_sha256
                 ),
@@ -1906,11 +1910,15 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 ),
                 "maximum_parameter_delta": maximum_delta,
                 "optimizer_steps_per_epoch": optimizer_steps,
+                "overfit_bev_only": overfit_bev_only,
+                "overfit_fixed_lr": overfit_fixed_lr,
                 "overfit_gate_pass": int(overfit_gate_pass),
                 "overfit_sample_count": overfit_sample_count,
                 "overfit_sample_uid_sha256": (
                     overfit_sample_uid_sha256
                 ),
+                "route_weight": float(config["route_weight"]),
+                "scheduler_identity": scheduler_identity,
                 "train_bev_segmentation": train_metrics[
                     "bev_segmentation"
                 ],
@@ -1939,6 +1947,10 @@ def train_loop_per_worker(config: dict[str, Any]) -> None:
                 "validation_sample_count": validation_sample_count,
                 "validation_sample_uid_sha256": (
                     validation_sample_uid_sha256
+                ),
+                "training_seed": seed,
+                "trajectory_weight": float(
+                    config["trajectory_weight"]
                 ),
                 "world_size": world_size,
             }
