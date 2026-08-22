@@ -56,7 +56,10 @@ from distributed_training.reactive_stage import (
     validate_reactive_stage_config,
 )
 from navigation.geometry import AUTOE2E_NAVIGATION_GEOMETRY
-from model_components.losses import RouteReconstructionLoss
+from model_components.losses import (
+    BEVSegmentationAuxiliaryLoss,
+    RouteReconstructionLoss,
+)
 from training.reactive_multitask import ReactiveTrainingStage
 
 
@@ -950,17 +953,57 @@ def test_route_validation_statistics_empty_case_is_finite():
     json.dumps(statistics.tolist(), allow_nan=False)
 
 
-def test_route_validation_statistics_reject_validity_drift():
+def test_route_validation_statistics_flags_validity_drift():
     torch = pytest.importorskip("torch")
 
-    with pytest.raises(ValueError, match="route_valid must equal"):
-        _route_validation_statistics(
-            torch.zeros(1, 2, 3, 5),
-            torch.zeros(1, 2, 3, 5),
-            torch.tensor([[True, False]]),
-            torch.tensor([False]),
-            RouteReconstructionLoss(),
-        )
+    statistics = _route_validation_statistics(
+        torch.zeros(1, 2, 3, 5),
+        torch.zeros(1, 2, 3, 5),
+        torch.tensor([[True, False]]),
+        torch.tensor([False]),
+        RouteReconstructionLoss(),
+    )
+
+    assert torch.equal(statistics[:14], torch.zeros(14))
+    assert statistics[14].item() == 1.0
+    assert statistics[15].item() == 0.0
+
+
+def test_route_validation_statistics_flags_nonfinite_active_values():
+    torch = pytest.importorskip("torch")
+    logits = torch.zeros(1, 2, 3, 5)
+    logits[0, 0, 1, 2] = float("nan")
+
+    statistics = _route_validation_statistics(
+        logits,
+        torch.zeros_like(logits),
+        torch.tensor([[True, False]]),
+        torch.tensor([True]),
+        RouteReconstructionLoss(),
+    )
+
+    assert statistics[14].item() == 0.0
+    assert statistics[15].item() == 1.0
+
+
+def test_route_validation_statistics_excludes_ambiguous_destination():
+    torch = pytest.importorskip("torch")
+    target = torch.zeros(1, 2, 3, 5)
+    target[0, 1, 2, 4] = 1.0
+
+    statistics = _route_validation_statistics(
+        torch.zeros_like(target),
+        target,
+        torch.tensor([[False, True]]),
+        torch.tensor([True]),
+        RouteReconstructionLoss(),
+    )
+
+    assert statistics[9].item() == 0.0
+    assert statistics[10].item() == 1.0
+    assert statistics[11].item() == 0.0
+    assert statistics[12].item() == 0.0
+    assert statistics[13].item() == 1.0
 
 
 def test_stage_b_validation_emits_route_metrics(monkeypatch):
@@ -972,7 +1015,7 @@ def test_stage_b_validation_emits_route_metrics(monkeypatch):
     target[0, 1, 2, 4] = 1.0
     logits = torch.full_like(target, -20.0)
     logits[0, 0, 1, 1:4] = 20.0
-    logits[0, 1, 0, 1] = 20.0
+    logits[0, 1, 2, 4] = 20.0
 
     class RouteValidationModel(torch.nn.Module):
         def __init__(self):
@@ -1004,6 +1047,7 @@ def test_stage_b_validation_emits_route_metrics(monkeypatch):
         "initial_speed_mps": torch.zeros(1),
     }
     objective = SimpleNamespace(
+        compute_route_reconstruction=True,
         route_loss=RouteReconstructionLoss(),
     )
     monkeypatch.setattr(dist, "all_reduce", lambda *_args, **_kwargs: None)
@@ -1019,15 +1063,84 @@ def test_stage_b_validation_emits_route_metrics(monkeypatch):
     )
 
     assert metrics["route_corridor_iou"] == 1.0
-    assert metrics["route_destination_error_cells"] == pytest.approx(
-        13**0.5
-    )
+    assert metrics["route_destination_error_cells"] == 0.0
     assert metrics["route_supported_samples"] == 1.0
+    assert metrics["route_destination_localized_samples"] == 1.0
+    assert metrics["route_destination_ambiguous_samples"] == 0.0
+    assert metrics["route_destination_logit_range"] == 40.0
     assert metrics["selection_score"] == 1.0
     assert "bev_loss" not in metrics
     assert model.forward_options["return_auxiliary"] is True
     assert model.forward_options["compute_bev_segmentation"] is False
     assert model.forward_options["compute_route_reconstruction"] is True
+
+
+def test_stage_a_validation_skips_disabled_route_decoder(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    class CapacityValidationModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_options = None
+
+        def forward(self, visual_tiles, *args, **kwargs):
+            self.forward_options = kwargs
+            controls = visual_tiles.new_zeros(
+                visual_tiles.shape[0],
+                128,
+            )
+            return controls, {
+                "bev_segmentation_logits": visual_tiles.new_full(
+                    (visual_tiles.shape[0], 8, 3, 5),
+                    20.0,
+                ),
+            }
+
+    model = CapacityValidationModel()
+    batch = {
+        "visual_tiles": torch.zeros(1, 1, 3, 2, 2),
+        "map_context": torch.zeros(1, 14, 3, 5),
+        "visual_history": torch.zeros(1, 1),
+        "egomotion_history": torch.zeros(1, 1),
+        "route_mask": torch.zeros(1, 2, 3, 5),
+        "map_valid": torch.ones(1, dtype=torch.bool),
+        "route_valid": torch.ones(1, dtype=torch.bool),
+        "route_channel_valid": torch.ones(1, 2, dtype=torch.bool),
+        "trajectory_xy_m": torch.zeros(1, 64, 2),
+        "trajectory_valid": torch.ones(1, 64, dtype=torch.bool),
+        "initial_speed_mps": torch.zeros(1),
+        "bev_segmentation_target": torch.ones(1, 8, 3, 5),
+        "bev_segmentation_valid": torch.ones(
+            1,
+            8,
+            3,
+            5,
+            dtype=torch.bool,
+        ),
+    }
+    objective = SimpleNamespace(
+        compute_route_reconstruction=False,
+        route_loss=RouteReconstructionLoss(),
+        bev_loss=BEVSegmentationAuxiliaryLoss([1.0] * 8),
+    )
+    monkeypatch.setattr(dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    metrics = _evaluate_global_reactive(
+        model,
+        [batch],
+        objective,
+        stage=ReactiveTrainingStage.NUPLAN_FULL,
+        device=torch.device("cpu"),
+        probability_bins=8,
+        ade_scale_m=5.0,
+    )
+
+    assert metrics["route_supported_samples"] == 0.0
+    assert metrics["route_destination_localized_samples"] == 0.0
+    assert model.forward_options["return_auxiliary"] is True
+    assert model.forward_options["compute_bev_segmentation"] is True
+    assert model.forward_options["compute_route_reconstruction"] is False
 
 
 def test_bev_overfit_gate_result_reports_weakest_classes():
