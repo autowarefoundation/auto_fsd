@@ -48,7 +48,7 @@ class TestFeatureFusionWithSwinChannels:
             num_views=8,
             backbone_channels=backbone_channels,
             fusion_mode="bev",
-            image_feature_size=32,
+            image_feature_size=64,
             view_fusion_kwargs={"bev_h": 8, "bev_w": 8},
         ).to(device)
         observed = {}
@@ -72,5 +72,5 @@ class TestFeatureFusionWithSwinChannels:
         finally:
             handle.remove()
         assert out.shape == (2, 256, 8, 8)
-        assert observed["shape"] == (16, 256, 32, 32)
+        assert observed["shape"] == (16, 256, 64, 64)
         assert torch.isfinite(out).all()
